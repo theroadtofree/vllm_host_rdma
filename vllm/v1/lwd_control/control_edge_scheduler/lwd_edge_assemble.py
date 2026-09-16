@@ -32,9 +32,6 @@ LWD_POST_OUT_PORT_DEFAULT = LWD_PRE_OUT_PORT_DEFAULT + 1
 # capture)完成后才发出,预算须覆盖云的全量启动时长(边不开图、
 # 云开图是本场景固定形态),默认 600s;部署可经 hello_timeout_s/env 覆盖
 LWD_HELLO_TIMEOUT_S_DEFAULT = 600.0
-# 传输模式:full_duplex(默认,ROUTER/DEALER 多实例,复用 pre_out_port 作为
-# 单连接端口)/ push_pull(单实例双向对)
-LWD_ZMQ_MODE_DEFAULT = "full_duplex"
 
 _LWD_CONFIG_SECTION = "lwd_config"
 # 传输层字段(pre_out_host 等)的历史段名;仅作兼容回退
@@ -51,7 +48,6 @@ class LwdConfig:
     pre_out_port: int = LWD_PRE_OUT_PORT_DEFAULT
     post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
     post_out_bind: str = "*"
-    zmq_mode: str = LWD_ZMQ_MODE_DEFAULT
     hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
@@ -79,7 +75,6 @@ class LwdConfig:
             pre_out_port=int(section.get("pre_out_port", LWD_PRE_OUT_PORT_DEFAULT)),
             post_out_port=int(section.get("post_out_port", LWD_POST_OUT_PORT_DEFAULT)),
             post_out_bind=str(section.get("post_out_bind", "*")),
-            zmq_mode=str(section.get("zmq_mode", LWD_ZMQ_MODE_DEFAULT)),
             hello_timeout_s=float(
                 section.get("hello_timeout_s", LWD_HELLO_TIMEOUT_S_DEFAULT)
             ),
@@ -121,7 +116,6 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
     port = _lwd_read_env_int("PRE_OUT_PORT")
     post_port = _lwd_read_env_int("POST_OUT_PORT")
     post_bind = os.getenv(_LWD_ENV_PREFIX + "POST_OUT_BIND")
-    zmq_mode = os.getenv(_LWD_ENV_PREFIX + "ZMQ_MODE")
     hello_timeout = _lwd_read_env_float("HELLO_TIMEOUT_S")
     debug = os.getenv(_LWD_ENV_PREFIX + "DEBUG")
     return LwdConfig(
@@ -130,7 +124,6 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         pre_out_port=port if port is not None else config.pre_out_port,
         post_out_port=post_port if post_port is not None else config.post_out_port,
         post_out_bind=post_bind if post_bind else config.post_out_bind,
-        zmq_mode=zmq_mode if zmq_mode else config.zmq_mode,
         hello_timeout_s=(
             hello_timeout if hello_timeout is not None else config.hello_timeout_s
         ),
