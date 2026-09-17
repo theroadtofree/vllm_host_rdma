@@ -23,6 +23,7 @@ decode 分支不可达。
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -53,6 +54,31 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# 边调度器需要按实例隔离的状态:请求队列/登记表、每实例 seqno 空间、
+# 待云结果 awaiting 台账。KV cache manager 跨实例共享(边云目标是
+# embedding-only,不按实例切 KV 池)。
+_LWD_INSTANCE_DOMAIN_ATTRS = (
+    "waiting",
+    "skipped_waiting",
+    "running",
+    "requests",
+    "finished_req_ids",
+    "_lwd_seqno",
+    "_lwd_awaiting",
+)
+
+# 需经策略工厂重建的队列属性(其余属性按类型造空值)。
+_LWD_INSTANCE_QUEUE_ATTRS = ("waiting", "skipped_waiting")
+
+
+def _fresh_instance_value(value):
+    """新实例桶某属性的空值。"""
+    if isinstance(value, int):
+        return 0
+    if isinstance(value, (dict, set, list)):
+        return type(value)()
+    return None
 
 # add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
@@ -86,6 +112,104 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        self._init_instance_buckets()
+
+    # ------------------------------------------------------------------ #
+    # Multi-instance queue buckets                                          #
+    # ------------------------------------------------------------------ #
+    def _init_instance_buckets(self) -> None:
+        """按 instance_parallel_size 建 per-instance 队列桶。
+
+        N<=1 退化为单桶(当前 self.* 即 instance 0 状态,不切换)。
+        N>1 时 bucket0 复用当前属性,其余桶重建队列/空值;请求 id 全局
+        唯一且终生 pin 一个实例,故用普通 dict 做 best-effort 路由表。
+        """
+        instance_count = self.parallel_config.lwd_config.instance_parallel_size
+        self._req_id_to_instance: dict[str, int] = {}
+        self._rr_cursor = 0
+        if instance_count <= 1:
+            self._instance_count = 1
+            self._cur_instance = 0
+            return
+
+        from vllm.v1.core.sched.request_queue import create_request_queue
+
+        bucket0 = {name: getattr(self, name) for name in _LWD_INSTANCE_DOMAIN_ATTRS}
+        buckets: list[dict] = [bucket0]
+        for _ in range(1, instance_count):
+            bucket: dict = {}
+            for name, value in bucket0.items():
+                if name in _LWD_INSTANCE_QUEUE_ATTRS:
+                    bucket[name] = create_request_queue(self.policy)
+                else:
+                    bucket[name] = _fresh_instance_value(value)
+            buckets.append(bucket)
+        self._instance_buckets = buckets
+        self._instance_count = instance_count
+        self._cur_instance = 0
+        logger.info(
+            "[Lwd][edge-sched] expanded to %d per-instance queue buckets",
+            instance_count,
+        )
+
+    def _switch_instance(self, idx: int) -> None:
+        """把 instance ``idx`` 的桶绑定到 self.*(先写回当前桶)。"""
+        if self._instance_count <= 1 or idx == self._cur_instance:
+            return
+        current = self._instance_buckets[self._cur_instance]
+        for name in _LWD_INSTANCE_DOMAIN_ATTRS:
+            current[name] = getattr(self, name)
+        target = self._instance_buckets[idx]
+        for name in _LWD_INSTANCE_DOMAIN_ATTRS:
+            setattr(self, name, target[name])
+        self._cur_instance = idx
+
+    @contextmanager
+    def _instance_binding(self, idx: int):
+        """在 with 块期间绑定 instance ``idx``,退出后还原。"""
+        previous = self._cur_instance
+        self._switch_instance(idx)
+        try:
+            yield
+        finally:
+            self._switch_instance(previous)
+
+    def _instance_attr(self, name: str, idx: int):
+        """读桶 ``idx`` 的 ``name``,不改变当前绑定。"""
+        if self._instance_count <= 1 or idx == self._cur_instance:
+            return getattr(self, name)
+        return self._instance_buckets[idx][name]
+
+    def _instance_has_work(self, idx: int) -> bool:
+        """instance ``idx`` 是否有可调度工作(不含 awaiting)。"""
+        if self._instance_count <= 1:
+            return True
+        return bool(
+            self._instance_attr("running", idx)
+            or self._instance_attr("waiting", idx)
+            or self._instance_attr("skipped_waiting", idx)
+            or self._instance_attr("finished_req_ids", idx)
+        )
+
+    def _pick_instance_to_schedule(self) -> int:
+        """round-robin 选择有工作的实例(skip-empty)。"""
+        candidates = [
+            i for i in range(self._instance_count) if self._instance_has_work(i)
+        ]
+        if not candidates:
+            return self._cur_instance
+        for offset in range(self._instance_count):
+            idx = (self._rr_cursor + offset) % self._instance_count
+            if idx in candidates:
+                self._rr_cursor = (idx + 1) % self._instance_count
+                return idx
+        return candidates[0]
+
+    def has_requests(self) -> bool:
+        """任一实例存在未完成/待返回请求即返回 True。"""
+        if self._instance_count <= 1:
+            return super().has_requests()
+        return any(self._instance_has_work(i) for i in range(self._instance_count))
 
     def schedule(self) -> SchedulerOutput:
         """单请求组批 + 原生分块决策。
@@ -96,6 +220,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         开新准入:云侧在途满员(lwd_edge_max_num_seqs_check 为 False)
         时本步空排、新开请求留 waiting 等云侧排水;running 尚有未发完
         embed 的续传不受闸门约束(先收尾再开新,亦防上限=1 时自锁)。"""
+        if self._instance_count <= 1:
+            return self._lwd_schedule_bound_instance()
+        idx = self._pick_instance_to_schedule()
+        self._switch_instance(idx)
+        out = self._lwd_schedule_bound_instance()
+        if out is not None and out.num_scheduled_tokens:
+            out.instance_parallel_id = idx
+        return out
+
+    def _lwd_schedule_bound_instance(self) -> SchedulerOutput:
+        """对当前绑定实例做闸门判断 + 单请求组批。"""
         LwdControlLog.flight(len(self.running), len(self._lwd_awaiting))
         if (
             not self.lwd_edge_max_num_seqs_check()
@@ -157,16 +292,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。"""
         self._lwd_validate_request(request)
+        idx = request.client_index if self._instance_count > 1 else 0
+        if not 0 <= idx < self._instance_count:
+            raise ValueError(
+                f"[LWD] request client_index {idx} out of range "
+                f"[0, {self._instance_count})"
+            )
+        self._req_id_to_instance[request.request_id] = idx
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
         )
-        super().add_request(request)
-        if request.abort_immediately:
-            self.finish_requests([request.request_id], RequestStatus.FINISHED_ABORTED)
-            self.lwd_edge_abort([request.request_id])
+        with self._instance_binding(idx):
+            super().add_request(request)
+            if request.abort_immediately:
+                self.finish_requests(
+                    [request.request_id], RequestStatus.FINISHED_ABORTED
+                )
+                self.lwd_edge_abort([request.request_id])
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 块发 LwdRangeNotify(seqno 先行)。
@@ -294,7 +439,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
         publisher = self.lwd_edge_publisher
         for request_id in request_ids:
-            self._lwd_awaiting.pop(request_id, None)
+            idx = self._req_id_to_instance.get(request_id, 0)
+            with self._instance_binding(idx):
+                self._lwd_awaiting.pop(request_id, None)
             if publisher is None:
                 continue
             if not publisher.publish(LwdAbortNotify(request_id=request_id)):
@@ -319,23 +466,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         finished_req_ids 通知 worker 释放缓存——该通知随下一个排程步
         下发,引擎纯睡眠期滞后),同时登记 awaiting;前端未收到任何
         输出会继续等待,终结由云结果驱动(lwd_edge_deliver_tokens)。"""
-        finished_ids: list[str] = []
         for request_id in executed:
-            request = self.requests.get(request_id)
-            if request is None:
-                # 本步内已终结(abort/更早完成):迟到的登记无对象
-                continue
-            if request.num_computed_tokens >= request.num_prompt_tokens:
-                finished_ids.append(request_id)
-        if finished_ids:
-            self.finish_requests(finished_ids, RequestStatus.FINISHED_STOPPED)
-            now = time.monotonic()
-            for request_id in finished_ids:
-                self._lwd_awaiting[request_id] = now
-                logger.info(
-                    "[Lwd][edge-progress] req=%s embed done -> awaiting",
-                    request_id,
-                )
+            idx = self._req_id_to_instance.get(request_id, 0)
+            with self._instance_binding(idx):
+                request = self.requests.get(request_id)
+                if request is None:
+                    # 本步内已终结(abort/更早完成):迟到的登记无对象
+                    continue
+                if request.num_computed_tokens >= request.num_prompt_tokens:
+                    self.finish_requests(
+                        [request_id], RequestStatus.FINISHED_STOPPED
+                    )
+                    now = time.monotonic()
+                    self._lwd_awaiting[request_id] = now
+                    logger.info(
+                        "[Lwd][edge-progress] req=%s embed done -> awaiting",
+                        request_id,
+                    )
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
@@ -350,19 +497,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           调用方丢弃告警(幂等,不复活)。
 
         token_ids/finished 的输出组包归引擎层(EngineCoreOutputs)。"""
-        if request_id not in self._lwd_awaiting:
-            logger.warning(
-                "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
-                request_id,
+        idx = self._req_id_to_instance.get(request_id, 0)
+        with self._instance_binding(idx):
+            if request_id not in self._lwd_awaiting:
+                logger.warning(
+                    "[Lwd][edge-deliver] stale result for req=%s (not awaiting)",
+                    request_id,
+                )
+                return False
+            if finished:
+                del self._lwd_awaiting[request_id]
+            logger.info(
+                "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
+                request_id, len(token_ids), finished,
             )
-            return False
-        if finished:
-            del self._lwd_awaiting[request_id]
-        logger.info(
-            "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
-            request_id, len(token_ids), finished,
-        )
-        return True
+            return True
 
     @staticmethod
     def _lwd_validate_request(request: Request) -> None:
