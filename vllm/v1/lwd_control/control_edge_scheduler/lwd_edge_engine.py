@@ -44,6 +44,9 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
+from vllm.v1.lwd_control.control_communication.lwd_zmq_factory import (
+    create_edge_zmq_channel,
+)
 from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
@@ -97,7 +100,11 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 按底层队列序排水,交错收割会连带等错批。t_dispatch 供
         # [Lwd][sched] harvest wait(派发→收割)度量批在队列里的滞留时长
         self._lwd_batch_queue: deque = deque()
-        self._lwd_setup_zmq(config)
+        # 传输模式标记:泵线程 HELLO 分支按此决定是否 retarget
+        # (full_duplex 单通道无发布面换址概念)
+        self._lwd_zmq_mode = "full_duplex"
+        self._lwd_setup_zmq_router_dealer(config)
+        # self._lwd_setup_zmq(config)
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
@@ -140,6 +147,36 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"master_addr connectivity and POST_OUT port)"
             )
 
+    def _lwd_setup_zmq_router_dealer(self, config: LwdConfig) -> None:
+        """full_duplex 模式装配:边 bind 单 ROUTER 端口,云 DEALER 按
+        identity 连入;收发同通道,无 PRE_OUT 延迟连接/retarget。云侧
+        业务层 HELLO 通告保留(通道握手只证明 TCP 连通,业务层 HELLO
+        证明云全量初始化完成),屏障超时语义与 push_pull 一致。"""
+        self._edge_receiver = create_edge_zmq_channel(
+            dp_rank=0,
+            pre_out_port=config.pre_out_port,
+            name="lwd-edge",
+            instance_count=1,
+        )
+        self._edge_sender = self._edge_receiver
+        hello_event = threading.Event()
+        pump = threading.Thread(
+            target=self._receive_thread,
+            args=(hello_event,),
+            name="lwd-post-in",
+            daemon=True,
+        )
+        pump.start()
+        if not hello_event.wait(config.hello_timeout_s):
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[Lwd] edge engine init failed (full_duplex): no cloud "
+                f"HELLO within {config.hello_timeout_s}s on port "
+                f"{config.pre_out_port} (ROUTER bind; check cloud "
+                f"master_addr connectivity and VLLM_ASCEND_LWD_ZMQ_MODE "
+                f"consistency on both sides)"
+            )
+
     def _receive_thread(self, hello_event: threading.Event) -> None:
         """POST_OUT 泵线程:泵取搬运线程攒下的消息,按消息类型分发。
 
@@ -160,23 +197,29 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 timeout_ms=LWD_POST_OUT_PUMP_TIMEOUT_MS
             ):
                 if isinstance(msg, LwdHelloNotify):
-                    endpoint = (
-                        f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-                    )
-                    if not hello_event.is_set():
+                    if self._lwd_zmq_mode == "push_pull":
+                        endpoint = (
+                            f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
+                        )
+                        if not hello_event.is_set():
+                            logger.info(
+                                "[Lwd] cloud discovered via HELLO: "
+                                "PRE_OUT -> %s",
+                                endpoint,
+                            )
+                        while not publisher.retarget(endpoint):
+                            if receiver.closed:
+                                break
+                            logger.warning(
+                                "[Lwd] PRE_OUT retarget deferred "
+                                "(queue full), retrying",
+                            )
+                            threading.Event().wait(0.05)
+                    elif not hello_event.is_set():
                         logger.info(
-                            "[Lwd] cloud discovered via HELLO: "
-                            "PRE_OUT -> %s",
-                            endpoint,
+                            "[Lwd] cloud ready via HELLO (full_duplex, "
+                            "no retarget)"
                         )
-                    while not publisher.retarget(endpoint):
-                        if receiver.closed:
-                            break
-                        logger.warning(
-                            "[Lwd] PRE_OUT retarget deferred (queue full), "
-                            "retrying",
-                        )
-                        threading.Event().wait(0.05)
                     hello_event.set()
                 elif isinstance(msg, LwdC2eNotify):
                     logger.info(

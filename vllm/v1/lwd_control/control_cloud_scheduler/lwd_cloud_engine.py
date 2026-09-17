@@ -30,6 +30,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     lwd_decode_notify,
     lwd_encode_cloud_notify,
 )
+from vllm.v1.lwd_control.control_communication.lwd_zmq_factory import (
+    create_cloud_zmq_channel,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
@@ -64,8 +67,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         super().__init__(*args, **kwargs)
         # 通信面构造期装配(与边侧 _lwd_setup_zmq 同构):subscriber 自带
         # 搬运线程后,socket 不再受泵线程的 zmq 单线程亲和约束;建站失败
-        # = 构造抛异常,与边侧同一错误路径。
-        self._lwd_setup_zmq()
+        # = 构造抛异常,与边侧同一错误路径。传输模式经 zmq_mode 选择,
+        # 边云两侧必须一致。
+        self._lwd_setup_zmq_router_dealer()
+        # self._lwd_setup_zmq()
 
     def _lwd_setup_zmq(self) -> None:
         """构造期装配通信面:PRE_OUT bind 收边(内部搬运线程)+ POST_OUT
@@ -109,12 +114,49 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def _lwd_pre_out_loop(self) -> None:
         """PRE_OUT 泵线程:泵取搬运线程攒下的通知逐条分发(_lwd_dispatch);
-        阻塞拍仅作关停响应上限,关停(closed)退出。"""
+        阻塞拍仅作关停响应上限,关停(closed)退出。两种传输模式下
+        _lwd_subscriber 均提供 recv_batch,循环逐行同构。"""
         while not self._lwd_subscriber.closed:
             for msg in self._lwd_subscriber.recv_batch(
                 timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS
             ):
                 self._lwd_dispatch(msg)
+
+    def _lwd_setup_zmq_router_dealer(self) -> None:
+        """full_duplex 模式装配:单条 ROUTER/DEALER 连接承载双向控制面,
+        云 DEALER 以显式 identity 连边绑定的端口;不再有 POST_OUT 发布面
+        与云端点发现(业务层 HELLO 通告保留,作为边侧"云全量就绪"屏障)。"""
+        config = LwdConfig.from_env_and_config(self.vllm_config)
+        master_addr = self.vllm_config.parallel_config.master_addr
+        channel = create_cloud_zmq_channel(
+            master_addr=master_addr,
+            dp_rank=0,
+            pre_out_port=config.pre_out_port,
+            name="lwd-cloud",
+            instance_id=0,
+        )
+        # 收发同通道:泵线程/发布方共用同一对象
+        self._lwd_subscriber = channel
+        self._lwd_post_out = channel
+        self._lwd_hello = LwdHelloNotify(
+            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+        )
+        # 业务层就绪通告:通道 HELLO/WELCOME 只证明 TCP 连通,本通告
+        # 证明云全量初始化(权重/KV/图编译)完成,边侧以此放行
+        self._lwd_announce()
+        # 门池与 registry:与 push_pull 装配同款,泵线程独占
+        self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
+        self._lwd_seqno_registry: dict[str, list[int]] = {}
+        self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
+        threading.Thread(
+            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
+        ).start()
+        logger.info(
+            "[Lwd] cloud engine assembled (full_duplex): DEALER connect -> "
+            "%s:%s (identity=0)",
+            master_addr,
+            config.pre_out_port,
+        )
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""

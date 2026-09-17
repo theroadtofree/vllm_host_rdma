@@ -100,6 +100,9 @@ class LwdRouterDealerChannel:
         self._pending_send: tuple[bytes, bytes] | None = None
         self._received_outputs: list[Any] = []
         self._recv_lock = threading.Lock()
+        # 新消息到达通知:IO 线程收包入列表后 set,泵线程 recv_batch
+        # 即时唤醒(与 LwdControlSubscriber 同款语义)
+        self._notify = threading.Event()
 
         self._ctx = zmq.Context()
         if self._is_router:
@@ -181,6 +184,22 @@ class LwdRouterDealerChannel:
 
     def consume_new_outputs(self) -> list[Any]:
         """取出并清空自上次调用以来收到的全部消息(FIFO 序)。"""
+        with self._recv_lock:
+            outputs = self._received_outputs
+            self._received_outputs = []
+            return outputs
+
+    def recv_batch(self, timeout_ms: int | None = None) -> list[Any]:
+        """阻塞等一批新消息并取走清空;超时/关停返回空表。
+
+        wait -> clear -> 取走 的次序保证不丢唤醒:晚于取走的 append 其
+        set 保留在事件上,下一次 wait 立即返回;clear 与取走之间的
+        append 被本次取走覆盖。与 LwdControlSubscriber.recv_batch
+        同款语义,泵线程在两种传输模式下逐行同构。"""
+        self._notify.wait(
+            timeout_ms / 1000.0 if timeout_ms is not None else None
+        )
+        self._notify.clear()
         with self._recv_lock:
             outputs = self._received_outputs
             self._received_outputs = []
@@ -470,6 +489,7 @@ class LwdRouterDealerChannel:
             return
         with self._recv_lock:
             self._received_outputs.append(msg)
+        self._notify.set()
 
     def shutdown(self) -> None:
         """关停(幂等):停 IO 线程后关 socket(linger=0 立即丢弃未发帧)。"""
