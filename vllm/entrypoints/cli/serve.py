@@ -68,6 +68,11 @@ class ServeSubcommand(CLISubcommand):
             # Default to 0 in headless mode (no API servers)
             args.api_server_count = 0
 
+        from vllm.entrypoints.openai.lwd.frontend_attach import dispatch_attach_mode
+
+        if dispatch_attach_mode(args):
+            return
+
         # Detect LB mode for defaulting api_server_count.
         # Multi-port: --data-parallel-multi-port-external-lb
         # External LB: --data-parallel-external-lb or --data-parallel-rank
@@ -266,6 +271,13 @@ def run_multi_api_server(args: argparse.Namespace):
     num_api_servers: int = args.api_server_count
     assert num_api_servers > 0
 
+    from vllm.entrypoints.openai.lwd.frontend_attach import (
+        attach_scope,
+        bind_attach_stats,
+        prepare_attach_mode,
+        wait_for_attach_registrations,
+    )
+
     if rust_frontend_path and num_api_servers > 1:
         raise ValueError(
             "VLLM_RUST_FRONTEND_PATH does not support api_server_count > 1"
@@ -320,6 +332,10 @@ def run_multi_api_server(args: argparse.Namespace):
     # so pre-allocate driver-side -- reintroducing the original race only
     # there.
     is_ray_dp = parallel_config.data_parallel_backend == "ray"
+    attach_mode, num_local_servers, registration_server = prepare_attach_mode(
+        args, num_api_servers, is_ray_dp
+    )
+
     addresses = get_engine_zmq_addresses(
         vllm_config,
         num_api_servers,
@@ -328,10 +344,13 @@ def run_multi_api_server(args: argparse.Namespace):
 
     with launch_core_engines(
         vllm_config, executor_class, log_stats, addresses, num_api_servers
-    ) as (local_engine_manager, coordinator, addresses, tensor_queue):
+    ) as (local_engine_manager, coordinator, addresses, tensor_queue), attach_scope(
+        registration_server
+    ):
         stats_update_address = (
             coordinator.get_stats_publish_address() if coordinator else None
         )
+        bind_attach_stats(registration_server, stats_update_address, tensor_queue)
 
         if rust_frontend_path:
             # Start rust front-end process.
@@ -345,16 +364,20 @@ def run_multi_api_server(args: argparse.Namespace):
                 stats_update_address=stats_update_address,
             )
         else:
-            # Start API server(s).
+            # Start API server(s). In attach mode only instance 0's
+            # frontend is local; client_count still reports the full
+            # frontend count N to the child.
             api_server_manager = APIServerProcessManager(
                 listen_address=listen_address,
                 sock=sock,
                 args=args,
-                num_servers=num_api_servers,
-                input_addresses=addresses.inputs,
-                output_addresses=addresses.outputs,
+                num_servers=num_local_servers,
+                input_addresses=addresses.inputs[:num_local_servers],
+                output_addresses=addresses.outputs[:num_local_servers],
                 stats_update_address=stats_update_address,
                 tensor_queue=tensor_queue,
+                client_count=(num_api_servers if attach_mode else None),
+                client_indices=[0] if attach_mode else None,
             )
 
             if not is_ray_dp:
@@ -364,8 +387,18 @@ def run_multi_api_server(args: argparse.Namespace):
                 actual_inputs, actual_outputs = (
                     api_server_manager.gather_actual_addresses()
                 )
-                addresses.inputs = actual_inputs
-                addresses.outputs = actual_outputs
+                for i, client_index in enumerate(
+                    api_server_manager.client_indices
+                ):
+                    addresses.inputs[client_index] = actual_inputs[i]
+                    addresses.outputs[client_index] = actual_outputs[i]
+
+            if registration_server is not None:
+                wait_for_attach_registrations(
+                    registration_server,
+                    addresses,
+                    local_engine_manager,
+                )
 
     # Wait for API servers.
     try:
