@@ -59,10 +59,14 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
-    唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。"""
+    唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
+
+    instance_id: 报告方云实例索引(边侧 N-HELLO 集合屏障按此收齐 N 个
+    不同实例);缺省 0 = 旧版云侧(additive 兼容,单实例语义不变)。"""
 
     pre_out_host: str
     pre_out_port: int
+    instance_id: int = 0
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -86,6 +90,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """本步 DOWN 隐藏张量的通道序号,自 LwdC2eMeta.down_seqno 原样透传:
     云 worker 发送时分配(通道级单调),边侧按此值预挂配对 irecv;
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
+    instance_id: int = 0
+    """报告方云实例索引(与 DEALER identity 同源):边侧据此把本通告
+    分发到对应实例的 UNEMBED/数据面路径;缺省 0 = 旧版云侧(additive
+    兼容,单实例语义不变)。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径
