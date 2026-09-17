@@ -133,7 +133,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         hello_event = threading.Event()
         pump = threading.Thread(
             target=self._receive_thread,
-            args=(hello_event,),
+            args=(hello_event, set(), 1),
             name="lwd-post-in",
             daemon=True,
         )
@@ -148,41 +148,70 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
 
     def _lwd_setup_zmq_router_dealer(self, config: LwdConfig) -> None:
-        """full_duplex 模式装配:边 bind 单 ROUTER 端口,云 DEALER 按
-        identity 连入;收发同通道,无 PRE_OUT 延迟连接/retarget。云侧
-        业务层 HELLO 通告保留(通道握手只证明 TCP 连通,业务层 HELLO
-        证明云全量初始化完成),屏障超时语义与 push_pull 一致。"""
+        """full_duplex 模式装配:边 bind 单 ROUTER 端口服务 N 个云 DEALER,
+        收发同通道,无 PRE_OUT 延迟连接/retarget。业务层 HELLO 通告保留
+        (通道握手只证明 TCP 连通,业务层 HELLO 证明云全量初始化完成):
+        集合屏障收齐 N 个不同实例的 HELLO 才放行,超时文案列出已到/
+        缺失实例;通过后与通道层就绪 identity 交叉对账(HELLO 戳与
+        identity 不一致 = 云侧三处同源被破坏,立即 error)。"""
+        self._lwd_instance_count = config.instance_count
         self._edge_receiver = create_edge_zmq_channel(
             dp_rank=0,
             pre_out_port=config.pre_out_port,
             name="lwd-edge",
-            instance_count=1,
+            instance_count=config.instance_count,
         )
         self._edge_sender = self._edge_receiver
         hello_event = threading.Event()
+        ready_instances: set[int] = set()
+        self._lwd_hello_ready = ready_instances
         pump = threading.Thread(
             target=self._receive_thread,
-            args=(hello_event,),
+            args=(hello_event, ready_instances, config.instance_count),
             name="lwd-post-in",
             daemon=True,
         )
         pump.start()
         if not hello_event.wait(config.hello_timeout_s):
+            missing = sorted(
+                set(range(config.instance_count)) - ready_instances
+            )
             self._lwd_shutdown_planes()
             raise RuntimeError(
-                f"[Lwd] edge engine init failed (full_duplex): no cloud "
-                f"HELLO within {config.hello_timeout_s}s on port "
-                f"{config.pre_out_port} (ROUTER bind; check cloud "
-                f"master_addr connectivity and VLLM_ASCEND_LWD_ZMQ_MODE "
-                f"consistency on both sides)"
+                f"[Lwd] edge engine init failed (full_duplex): only "
+                f"{len(ready_instances)}/{config.instance_count} cloud "
+                f"instances ready via HELLO within "
+                f"{config.hello_timeout_s}s (ready="
+                f"{sorted(ready_instances)}, missing={missing}; check "
+                f"every cloud instance is up with a distinct "
+                f"--instance-parallel-start-rank in "
+                f"[0, {config.instance_count}))"
+            )
+        # 交叉对账:业务 HELLO 集合 vs 通道层就绪 identity 集合
+        wire_ready = self._edge_receiver.ready_instance_ids()
+        if wire_ready != ready_instances:
+            logger.error(
+                "[Lwd] HELLO instance set %s != channel identity set %s: "
+                "a cloud instance stamps HELLO/c2e with an instance_id "
+                "different from its DEALER identity (routing will "
+                "misdeliver); check --instance-parallel-start-rank "
+                "consistency on that instance",
+                sorted(ready_instances),
+                sorted(wire_ready),
             )
 
-    def _receive_thread(self, hello_event: threading.Event) -> None:
+    def _receive_thread(
+        self,
+        hello_event: threading.Event,
+        ready_instances: set[int],
+        instance_count: int,
+    ) -> None:
         """POST_OUT 泵线程:泵取搬运线程攒下的消息,按消息类型分发。
 
-        HELLO -> retarget PRE_OUT:云端点唯一事实源,首拍一次通告;
-        retarget 队满时无下条 HELLO 可等,须本线程自旋重试到成功
-        (构造期发布队列必空,该路径仅防御性保活)。
+        HELLO -> push_pull:retarget PRE_OUT(云端点唯一事实源,首拍一次
+        通告;队满自旋重试);full_duplex:按 instance_id 收集集合屏障,
+        收齐 N 个不同实例才放行(重复 HELLO 幂等,越界实例号 error 丢弃
+        ——说明该云实例的 start-rank 配置在 [0,N) 之外)。
         LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
         + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
         引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
@@ -215,12 +244,31 @@ class LwdEdgeEngineCore(EngineCoreProc):
                                 "(queue full), retrying",
                             )
                             threading.Event().wait(0.05)
-                    elif not hello_event.is_set():
-                        logger.info(
-                            "[Lwd] cloud ready via HELLO (full_duplex, "
-                            "no retarget)"
+                        hello_event.set()
+                        continue
+                    # full_duplex:集合屏障(实例号取业务戳)
+                    iid = msg.instance_id
+                    if not 0 <= iid < instance_count:
+                        logger.error(
+                            "[Lwd] drop HELLO with out-of-range "
+                            "instance_id=%d (expect [0, %d)); this cloud "
+                            "has a misconfigured "
+                            "--instance-parallel-start-rank",
+                            iid,
+                            instance_count,
                         )
-                    hello_event.set()
+                        continue
+                    if iid not in ready_instances:
+                        ready_instances.add(iid)
+                        logger.info(
+                            "[Lwd] cloud instance %d ready via HELLO "
+                            "(%d/%d)",
+                            iid,
+                            len(ready_instances),
+                            instance_count,
+                        )
+                        if len(ready_instances) >= instance_count:
+                            hello_event.set()
                 elif isinstance(msg, LwdC2eNotify):
                     logger.info(
                         "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
