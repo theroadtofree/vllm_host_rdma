@@ -879,21 +879,26 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
-        # Deferred per-request persist channel for num_accepted_tokens: a
-        # dedicated pinned side buffer (the shared batch-position buffer is
-        # rearranged by input_batch condense/add with no ordering against an
-        # in-flight async D2H) plus the req_ids snapshot identifying rows.
+        # LWD-only: deferred per-request persist channel for
+        # num_accepted_tokens (pinned side buffer + req_ids snapshot),
+        # consumed by the phase-alternation fallback in _prepare_inputs.
+        # Isolated behind the LWD master switch so native (non-LWD)
+        # deployments keep the previous behavior bit-for-bit.
+        self._lwd_spec_persist_enabled = bool(
+            self.num_spec_tokens and self.parallel_config.lwd_config.enable_lwd
+        )
         self.num_accepted_tokens_persist_cpu: torch.Tensor | None = None
         self._num_accepted_tokens_persist_req_ids: list[str] | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
-            self.num_accepted_tokens_persist_cpu = torch.empty(
-                self.max_num_reqs,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=self.pin_memory,
-            )
+            if self._lwd_spec_persist_enabled:
+                self.num_accepted_tokens_persist_cpu = torch.empty(
+                    self.max_num_reqs,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
@@ -1568,13 +1573,15 @@ class GPUModelRunner(
         # so it survives the batch-position buffer being overwritten by the
         # next (possibly prefill) batch under prefill/decode phase
         # alternation (prev_positions == -1) without a blocking sync here.
-        assert self.num_accepted_tokens_persist_cpu is not None
-        self.num_accepted_tokens_persist_cpu[:num_reqs].copy_(
-            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
-        )
-        self._num_accepted_tokens_persist_req_ids = list(
-            self.input_batch.req_ids[:num_reqs]
-        )
+        # LWD-only: native deployments never consume the persisted values.
+        if self._lwd_spec_persist_enabled:
+            assert self.num_accepted_tokens_persist_cpu is not None
+            self.num_accepted_tokens_persist_cpu[:num_reqs].copy_(
+                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+            )
+            self._num_accepted_tokens_persist_req_ids = list(
+                self.input_batch.req_ids[:num_reqs]
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -2112,7 +2119,8 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
-            self._persist_num_accepted_tokens_to_req_states()
+            if self._lwd_spec_persist_enabled:
+                self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
