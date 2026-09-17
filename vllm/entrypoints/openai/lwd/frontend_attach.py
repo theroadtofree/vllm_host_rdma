@@ -61,24 +61,57 @@ from vllm.utils.network_utils import get_ip, get_tcp_uri, make_zmq_socket
 logger = init_logger(__name__)
 
 # CLI args that legitimately differ between the main command and an attach
-# command and are therefore excluded from the common-config comparison.
+# command and are therefore excluded from the common-config comparison:
+# - 前端监听/实例区分:host/port/uds/instance index;
+# - attach 自身管道:api-server-rpc-port / api-server-attach;
+# - 引擎侧 rendezvous/DP 网络地址:纯前端 attach 命令不参与,要求逐字
+#   一致纯属部署摩擦(master_addr/master_port/data_parallel_*);
+# - HTTP 传输层(ssl/CORS/middleware/uvicorn/h11 等)每个前端独立
+#   监听、独立配置,stay per-frontend。
 ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
     {
+        # frontend listen / instance identity
         "host",
         "port",
+        "uds",
+        "instance_parallel_start_rank",
+        # attach plumbing
         "api_server_rpc_port",
         "api_server_attach",
-        "instance_parallel_start_rank",
+        # engine rendezvous / DP network placement (inert on frontend)
         "master_addr",
         "master_port",
         "data_parallel_address",
         "data_parallel_rpc_port",
+        # HTTP transport / per-frontend
+        "uvicorn_log_level",
+        "disable_uvicorn_access_log",
+        "disable_access_log_for_endpoints",
+        "allow_credentials",
+        "allowed_origins",
+        "allowed_methods",
+        "allowed_headers",
+        "ssl_keyfile",
+        "ssl_certfile",
+        "ssl_ca_certs",
+        "enable_ssl_refresh",
+        "ssl_cert_reqs",
+        "ssl_ciphers",
+        "root_path",
+        "middleware",
+        "enable_request_id_headers",
+        "disable_fastapi_docs",
+        "h11_max_incomplete_event_size",
+        "h11_max_header_count",
+        "enable_offline_docs",
     }
 )
 
 # Serving-layer (frontend-local) args that each ApiServer reads from its
 # own CLI namespace; the main command forwards its values in the GRANT so
 # an attach command that omits them inherits the same API surface.
+# ``additional_config`` 也走继承:attach 命令可不写,写了则须与主命令一致
+# (见 ATTACH_CONFIG_EXCLUDE_KEYS 中未将其排除,故仍参与 diff)。
 FRONTEND_INHERIT_ARGS = frozenset(
     {
         "served_model_name",
@@ -104,6 +137,7 @@ FRONTEND_INHERIT_ARGS = frozenset(
         "api_key",
         "enable_tokenizer_info_endpoint",
         "tokens_only",
+        "additional_config",
     }
 )
 
@@ -185,7 +219,13 @@ def validate_frontend_attach_args(args) -> None:
             f"in [0, --instance-parallel-size={size})"
         )
 
-    if (size > 1 or start_rank is not None) and not _is_lwd_enabled(args):
+    # --instance-parallel-* 只在 LWD 模式有效;attach 命令(纯前端、无
+    # worker/engine)本身即 LWD 多实例语义,不要求额外写 --additional-config。
+    if (
+        attach is None
+        and (size > 1 or start_rank is not None)
+        and not _is_lwd_enabled(args)
+    ):
         raise ValueError(
             "Error: --instance-parallel-size/--instance-parallel-start-rank "
             "require LWD (edge-cloud) mode"
