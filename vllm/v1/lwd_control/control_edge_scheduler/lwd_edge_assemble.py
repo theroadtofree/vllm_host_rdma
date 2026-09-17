@@ -145,11 +145,13 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
 
 
 def _lwd_read_instance_count(vllm_config) -> int:
-    """读云实例总数:parallel_config.instance_parallel_size
+    """读云实例总数:parallel_config.lwd_config.instance_parallel_size
     (--instance-parallel-size),缺省归一化为 1;坏值/非正告警回退 1
-    (实例数不匹配的后续失败由边侧 N-HELLO 屏障/S5 注册校验兜底)。"""
+    (实例数不匹配的后续失败由边侧 N-HELLO 屏障兜底)。与数据面 wire
+    层(pair_list 构建)、调度器实例桶同源同路径。"""
     parallel = getattr(vllm_config, "parallel_config", None)
-    raw = getattr(parallel, "instance_parallel_size", None)
+    lwd = getattr(parallel, "lwd_config", None)
+    raw = getattr(lwd, "instance_parallel_size", None)
     if raw is None:
         return 1
     try:
@@ -170,12 +172,13 @@ def _lwd_read_instance_count(vllm_config) -> int:
 
 
 def _lwd_read_instance_id(vllm_config) -> int:
-    """读云实例索引:parallel_config.instance_parallel_start_rank
+    """读云实例索引:parallel_config.lwd_config.instance_parallel_start_rank
     (--instance-parallel-start-rank),缺省/非正归一化为 0;坏值告警
     回退 0(部署期输入错误不应炸掉引擎启动,实例冲突由边侧屏障与
     WELCOME 看门狗兜底报告)。"""
     parallel = getattr(vllm_config, "parallel_config", None)
-    raw = getattr(parallel, "instance_parallel_start_rank", None)
+    lwd = getattr(parallel, "lwd_config", None)
+    raw = getattr(lwd, "instance_parallel_start_rank", None)
     if raw is None:
         return 0
     try:
