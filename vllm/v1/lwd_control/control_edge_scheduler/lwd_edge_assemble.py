@@ -151,24 +151,24 @@ def _lwd_read_instance_count(vllm_config) -> int:
     层(pair_list 构建)、调度器实例桶同源同路径。"""
     parallel = getattr(vllm_config, "parallel_config", None)
     lwd = getattr(parallel, "lwd_config", None)
-    raw = getattr(lwd, "instance_parallel_size", None)
-    if raw is None:
+    declared_size = getattr(lwd, "instance_parallel_size", None)
+    if declared_size is None:
         return 1
     try:
-        value = int(raw)
+        instance_count = int(declared_size)
     except (TypeError, ValueError):
         logger.warning(
             "[Lwd] ignore invalid instance_parallel_size %r, fallback to 1",
-            raw,
+            declared_size,
         )
         return 1
-    if value < 1:
+    if instance_count < 1:
         logger.warning(
             "[Lwd] non-positive instance_parallel_size %d, fallback to 1",
-            value,
+            instance_count,
         )
         return 1
-    return value
+    return instance_count
 
 
 def _lwd_read_instance_id(vllm_config) -> int:
@@ -178,25 +178,25 @@ def _lwd_read_instance_id(vllm_config) -> int:
     WELCOME 看门狗兜底报告)。"""
     parallel = getattr(vllm_config, "parallel_config", None)
     lwd = getattr(parallel, "lwd_config", None)
-    raw = getattr(lwd, "instance_parallel_start_rank", None)
-    if raw is None:
+    start_rank = getattr(lwd, "instance_parallel_start_rank", None)
+    if start_rank is None:
         return 0
     try:
-        value = int(raw)
+        instance_id = int(start_rank)
     except (TypeError, ValueError):
         logger.warning(
             "[Lwd] ignore invalid instance_parallel_start_rank %r, "
             "fallback to 0",
-            raw,
+            start_rank,
         )
         return 0
-    if value < 0:
+    if instance_id < 0:
         logger.warning(
             "[Lwd] negative instance_parallel_start_rank %d, fallback to 0",
-            value,
+            instance_id,
         )
         return 0
-    return value
+    return instance_id
 
 
 def _lwd_read_env_int(name: str) -> int | None:
