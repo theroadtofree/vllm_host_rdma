@@ -145,55 +145,58 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
 
 
 def _lwd_read_instance_count(vllm_config) -> int:
-    """读云实例总数:parallel_config.instance_parallel_size
+    """读云实例总数:parallel_config.lwd_config.instance_parallel_size
     (--instance-parallel-size),缺省归一化为 1;坏值/非正告警回退 1
-    (实例数不匹配的后续失败由边侧 N-HELLO 屏障/S5 注册校验兜底)。"""
+    (实例数不匹配的后续失败由边侧 N-HELLO 屏障兜底)。与数据面 wire
+    层(pair_list 构建)、调度器实例桶同源同路径。"""
     parallel = getattr(vllm_config, "parallel_config", None)
-    raw = getattr(parallel, "instance_parallel_size", None)
-    if raw is None:
+    lwd = getattr(parallel, "lwd_config", None)
+    declared_size = getattr(lwd, "instance_parallel_size", None)
+    if declared_size is None:
         return 1
     try:
-        value = int(raw)
+        instance_count = int(declared_size)
     except (TypeError, ValueError):
         logger.warning(
             "[Lwd] ignore invalid instance_parallel_size %r, fallback to 1",
-            raw,
+            declared_size,
         )
         return 1
-    if value < 1:
+    if instance_count < 1:
         logger.warning(
             "[Lwd] non-positive instance_parallel_size %d, fallback to 1",
-            value,
+            instance_count,
         )
         return 1
-    return value
+    return instance_count
 
 
 def _lwd_read_instance_id(vllm_config) -> int:
-    """读云实例索引:parallel_config.instance_parallel_start_rank
+    """读云实例索引:parallel_config.lwd_config.instance_parallel_start_rank
     (--instance-parallel-start-rank),缺省/非正归一化为 0;坏值告警
     回退 0(部署期输入错误不应炸掉引擎启动,实例冲突由边侧屏障与
     WELCOME 看门狗兜底报告)。"""
     parallel = getattr(vllm_config, "parallel_config", None)
-    raw = getattr(parallel, "instance_parallel_start_rank", None)
-    if raw is None:
+    lwd = getattr(parallel, "lwd_config", None)
+    start_rank = getattr(lwd, "instance_parallel_start_rank", None)
+    if start_rank is None:
         return 0
     try:
-        value = int(raw)
+        instance_id = int(start_rank)
     except (TypeError, ValueError):
         logger.warning(
             "[Lwd] ignore invalid instance_parallel_start_rank %r, "
             "fallback to 0",
-            raw,
+            start_rank,
         )
         return 0
-    if value < 0:
+    if instance_id < 0:
         logger.warning(
             "[Lwd] negative instance_parallel_start_rank %d, fallback to 0",
-            value,
+            instance_id,
         )
         return 0
-    return value
+    return instance_id
 
 
 def _lwd_read_env_int(name: str) -> int | None:
