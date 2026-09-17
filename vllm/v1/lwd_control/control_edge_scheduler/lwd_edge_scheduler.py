@@ -313,6 +313,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
                 self.lwd_edge_abort([request.request_id])
 
+    def _lwd_publish(self, message, idx: int) -> bool:
+        """控制面发布出口(唯一模式分流派发点):多实例(必为 router 模式)
+        按实例定向路由;单实例 push_pull/单实例 router 均用原单参调用
+        (instance 0 缺省)。push_pull 不支持多实例(装配期 fail-fast)。"""
+        if self._instance_count > 1:
+            return self.lwd_edge_publisher.publish(message, instance_id=idx)
+        return self.lwd_edge_publisher.publish(message)
+
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 块发 LwdRangeNotify(seqno 先行)。
 
@@ -338,19 +346,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
             seqno = self._lwd_seqno
-            if not publisher.publish(
+            # 实例戳 = 请求 pin 的实例(发布路由到对应云 DEALER);
+            # _lwd_seqno 是当前绑定桶的计数器,与请求所属实例一致
+            idx = self._req_id_to_instance.get(request_id, 0)
+            if not self._lwd_publish(
                 LwdRangeNotify(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     seqno=seqno,
-                )
+                ),
+                idx,
             ):
                 return False
             self._lwd_seqno = seqno + 1
             logger.info(
-                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d",
-                request_id, offset, num_tokens, seqno,
+                "[Lwd][edge-notify] req=%s inst=%d offset=%d num=%d seqno=%d",
+                request_id, idx, offset, num_tokens, seqno,
             )
             # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
             # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
@@ -395,6 +407,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if publisher is None:
             return
         sp = sampling_params
+        # 实例戳:调用点(lwd_edge_add_request)已先登记路由表
+        idx = self._req_id_to_instance.get(request_id, 0)
         message = LwdRequestNotify(
             request_id=request_id,
             num_prompt_tokens=num_prompt_tokens,
@@ -418,11 +432,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             eos_token_id=sp.eos_token_id if sp is not None else None,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if publisher.publish(message):
+            if self._lwd_publish(message, idx):
                 logger.info(
                     "[Lwd][edge-notify] request meta announced: req=%s "
-                    "prompt=%d",
-                    request_id, num_prompt_tokens,
+                    "inst=%d prompt=%d",
+                    request_id, idx, num_prompt_tokens,
                 )
                 return
             time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
@@ -444,13 +458,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 self._lwd_awaiting.pop(request_id, None)
             if publisher is None:
                 continue
-            if not publisher.publish(LwdAbortNotify(request_id=request_id)):
+            if not self._lwd_publish(LwdAbortNotify(request_id=request_id), idx):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
             else:
                 logger.info(
-                    "[Lwd][edge-notify] AbortNotify req=%s", request_id
+                    "[Lwd][edge-notify] AbortNotify req=%s inst=%d",
+                    request_id, idx,
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:

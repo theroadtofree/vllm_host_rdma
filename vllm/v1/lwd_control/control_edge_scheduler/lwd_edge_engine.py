@@ -119,6 +119,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
         bind POST_OUT 订阅面(内部搬运线程)+ 延迟连接的 PRE_OUT 发布面,
         云端点由 HELLO 通告决定(边不预知云地址);泵线程泵取搬运线程攒下
         的消息并分发;HELLO 屏障超时(hello_timeout_s)fail-fast。"""
+        if config.instance_count > 1:
+            # push_pull 双单向面无按实例寻址能力(需 ROUTER/DEALER 的
+            # identity 信封),多实例在此 fail-fast 而非静默串线
+            raise ValueError(
+                "[LWD] edge-cloud multi-instance (instance_parallel_size "
+                f"= {config.instance_count}) requires the router/dealer "
+                "ZMQ mode; push_pull is single-instance only"
+            )
         self._edge_receiver = LwdControlSubscriber(
             config.lwd_post_out_bind_endpoint(),
             bind=True,
