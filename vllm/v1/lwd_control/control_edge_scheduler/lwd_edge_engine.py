@@ -90,10 +90,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
         config = LwdConfig.from_env_and_config(vllm_config)
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
-        # 云->边唯一载荷队列:生产端接收线程,消费端引擎步;数据面经
-        # UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读队列
+        # 云->边唯一载荷的按实例暂存桶(生产端泵线程 append,消费端引擎
+        # 步轮询 popleft;deque 单操作原子,单生产者单消费者无锁):
+        # 泵不阻塞,按实例背压由通道层 per-identity FIFO(上限 1000)
+        # 承担;桶水位是消费滞后的本地读数(正常远低于通道 FIFO)。
+        # 数据面经 UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读桶
         # (单消费者语义)
-        self.lwd_c2e_meta_queue = queue.Queue(maxsize=LWD_C2E_META_QUEUE_MAX)
+        self._lwd_c2e_pending: dict[int, deque] = {}
+        # 实例数标记:泵线程 c2e 越界防御用(与屏障/通道的 N 同源)
+        self._lwd_instance_count = config.instance_count
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
         # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
@@ -162,7 +167,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         集合屏障收齐 N 个不同实例的 HELLO 才放行,超时文案列出已到/
         缺失实例;通过后与通道层就绪 identity 交叉对账(HELLO 戳与
         identity 不一致 = 云侧三处同源被破坏,立即 error)。"""
-        self._lwd_instance_count = config.instance_count
         self._edge_receiver = create_edge_zmq_channel(
             dp_rank=0,
             pre_out_port=config.pre_out_port,
@@ -278,14 +282,41 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         if len(ready_instances) >= instance_count:
                             hello_event.set()
                 elif isinstance(msg, LwdC2eNotify):
+                    iid = msg.instance_id
+                    if not 0 <= iid < self._lwd_instance_count:
+                        # 云侧 start-rank 配错(fail-loud 不 fail-fast:
+                        # 坏戳不污染批队列,实例屏障/看门狗另行定位)
+                        logger.error(
+                            "[Lwd] drop C2eNotify with out-of-range "
+                            "instance_id=%d (expect [0, %d)); reqs=%d "
+                            "down_seqno=%s — this cloud has a misconfigured "
+                            "--instance-parallel-start-rank",
+                            iid,
+                            self._lwd_instance_count,
+                            len(getattr(msg, "req_ids", []) or []),
+                            getattr(msg, "down_seqno", None),
+                        )
+                        continue
+                    bucket = self._lwd_c2e_pending.setdefault(iid, deque())
+                    # 元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
+                    # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
+                    bucket.append((msg, time.monotonic()))
+                    if len(bucket) > LWD_C2E_META_QUEUE_MAX:
+                        # 本地桶水位越过告警线:引擎步排水停滞(正常背压
+                        # 应止步于通道层 per-identity FIFO)
+                        logger.warning(
+                            "[Lwd] c2e pending bucket for instance %d at %d "
+                            "(edge engine consumption stalled?)",
+                            iid,
+                            len(bucket),
+                        )
                     logger.info(
-                        "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
+                        "[Lwd][edge-ctrl] C2eNotify inst=%d reqs=%d "
+                        "down_seqno=%s",
+                        iid,
                         len(getattr(msg, "req_ids", []) or []),
                         getattr(msg, "down_seqno", None),
                     )
-                    # 队列元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
-                    # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
-                    self.lwd_c2e_meta_queue.put((msg, time.monotonic()))
                     self.input_queue.put_nowait(
                         (EngineCoreRequestType.WAKEUP, None)
                     )
@@ -329,7 +360,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         get,轮询循环是否退出由本判据决定(core.py while not has_work)。
         批队列非空必须计入——否则最后一批派发后引擎睡眠,最终 token
         永不收割交付。"""
-        return (super().has_work() or not self.lwd_c2e_meta_queue.empty()
+        return (super().has_work() or any(self._lwd_c2e_pending.values())
                 or self._lwd_batch_queue)
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
@@ -390,7 +421,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             "[Lwd][sched] edge step harvest_emb=%d harvest_unemb=%d "
             "disp_emb=%d disp_unemb=%d queue=%demb/%dunemb c2e_pending=%d",
             h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
-            self.lwd_c2e_meta_queue.qsize(),
+            self._lwd_c2e_pending_total(),
         )
         if outputs:
             step_outputs = EngineCoreOutputs(
@@ -416,18 +447,38 @@ class LwdEdgeEngineCore(EngineCoreProc):
         batch = getattr(payload, "lwd_batch", None)
         return str(getattr(batch, "seqno", "?")) if batch else "?"
 
+    def _lwd_c2e_pending_total(self) -> int:
+        """全部实例桶的 c2e 积压总数(水位日志用)。"""
+        return sum(len(b) for b in self._lwd_c2e_pending.values())
+
     def _lwd_edge_consume_c2e(self) -> int:
-        """消费 c2e 通告:派发 UNEMBED 批入批队列(异步收割)。
+        """消费 c2e 通告:按实例轮询取条,派发 UNEMBED 批入批队列
+        (异步收割)。每轮每桶至多取 1 条直至总配额用尽——单实例退化为
+        顺序取(与原单队列行为等价);多实例下繁忙实例不再按到达比例
+        挤占其他实例的 token 交付配额。
         云侧有活请求才产 meta(build_hidden_payload 空则返回 None),
         每条 entry 行数>=1——通告必有行,无需无行分流。
         返回本步派发条数。"""
         quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
         notifies: list[tuple[LwdC2eNotify, float]] = []
         while len(notifies) < quota:
-            try:
-                notifies.append(self.lwd_c2e_meta_queue.get_nowait())
-            except queue.Empty:
+            progressed = False
+            for iid in sorted(self._lwd_c2e_pending):
+                bucket = self._lwd_c2e_pending[iid]
+                if not bucket:
+                    continue
+                notifies.append(bucket.popleft())
+                progressed = True
+                if len(notifies) >= quota:
+                    break
+            if not progressed:
                 break
+        # 清掉取空的桶,防长期运行字典膨胀
+        self._lwd_c2e_pending = {
+            iid: bucket
+            for iid, bucket in self._lwd_c2e_pending.items()
+            if bucket
+        }
         for notify, t_arrive in notifies:
             future = self._lwd_dispatch_unembed(notify, t_arrive)
             self._lwd_batch_queue.append(
@@ -452,7 +503,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
             batch.seqno, batch.batch_meta.req_ids[0],
             scheduler_output.total_num_scheduled_tokens,
-            n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
+            n_unemb, n_emb, self._lwd_c2e_pending_total(),
         )
         return self.model_executor.execute_model(
             scheduler_output, non_block=True
@@ -469,12 +520,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
         unembed_batch = lwd_build_unembed_batch(notify)
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
-            "[Lwd][sched] edge dispatch-unembed seqno=%s reqs=%d rows=%d "
-            "ahead_unemb=%d ahead_emb=%d c2e_wait=%.2fms c2e_pending=%d",
-            notify.down_seqno, len(notify.req_ids),
+            "[Lwd][sched] edge dispatch-unembed seqno=%s inst=%d reqs=%d "
+            "rows=%d ahead_unemb=%d ahead_emb=%d c2e_wait=%.2fms "
+            "c2e_pending=%d",
+            notify.down_seqno, notify.instance_id, len(notify.req_ids),
             sum(notify.num_accepted_tokens), n_unemb, n_emb,
             (time.monotonic() - t_arrive) * 1000,
-            self.lwd_c2e_meta_queue.qsize(),
+            self._lwd_c2e_pending_total(),
         )
         return self.model_executor.execute_model(
             unembed_batch, non_block=True
