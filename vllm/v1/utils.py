@@ -210,11 +210,6 @@ class APIServerProcessManager:
         self.client_indices = (
             list(range(num_servers)) if client_indices is None else client_indices
         )
-        if len(self.client_indices) != num_servers:
-            raise ValueError(
-                f"client_indices ({self.client_indices}) must have exactly "
-                f"num_servers={num_servers} entries"
-            )
 
         spawn_context = multiprocessing.get_context("spawn")
         self.processes: list[BaseProcess] = []

@@ -68,9 +68,11 @@ class ServeSubcommand(CLISubcommand):
             # Default to 0 in headless mode (no API servers)
             args.api_server_count = 0
 
-        from vllm.entrypoints.openai.lwd.frontend_attach import dispatch_attach_mode
+        from vllm.entrypoints.openai.lwd.frontend_attach import (
+            lwd_dispatch_attach_frontend,
+        )
 
-        if dispatch_attach_mode(args):
+        if lwd_dispatch_attach_frontend(args):
             return
 
         # Detect LB mode for defaulting api_server_count.
