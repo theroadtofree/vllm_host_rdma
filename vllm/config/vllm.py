@@ -872,27 +872,26 @@ class VllmConfig:
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
             # 多实例(instance-parallel)模式下 cloud_npu_count 是所有实例
-            # 的总量(N * D * C);先换算成每实例卡数 C,再推导 TP/world,
-            # 否则并行度被夸大导致维度整除校验失败(对齐 multi_instance
-            # 参考实现 ParallelConfig.__post_init__ edge-cloud 分支)。
-            cloud_divisor = (
+            # 的总量(N * D * C),不能就地归一化 —— local_world_size /
+            # lwd_cloud_first_rank / lwd_group_ranks 等辅助函数都期望读到
+            # 原始总量并各自自行换算;且 VllmConfig 的 __post_init__ 可能
+            # 被再次执行,就地除法会重复累乘。这里仅在推导 TP 时取每实例
+            # 卡数 C,world 仍为边+云总量的全局 rank 空间。
+            cloud_per_instance = parallel_lwd.cloud_npu_count_per_instance_dp(
                 self.parallel_config.data_parallel_size
-                * parallel_lwd.instance_parallel_size
             )
-            if cloud_divisor > 1:
-                parallel_lwd.cloud_npu_count //= cloud_divisor
             # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-            # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
+            # 云一组 TP=每实例 cloud 卡数 C);配置 tp 回填为真值,使头数/
             # KV spec/MoE 切分等配置派生量与运行时组态对齐。
-            self.parallel_config.tensor_parallel_size = (
-                parallel_lwd.edge_npu_count
-                if self.lwd_config.is_edge
-                else parallel_lwd.cloud_npu_count
-            )
             # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
             # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
             # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
-            # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
+            # TP 边取 edge_npu_count、云取每实例 C(云侧按此切权重)。
+            self.parallel_config.tensor_parallel_size = (
+                parallel_lwd.edge_npu_count
+                if parallel_lwd.is_edge_node
+                else cloud_per_instance
+            )
             if (self.parallel_config.tensor_parallel_size != 1
                     or self.parallel_config.pipeline_parallel_size != 1):
                 logger.warning(
@@ -908,7 +907,7 @@ class VllmConfig:
             self.parallel_config.tensor_parallel_size = (
                 parallel_lwd.edge_npu_count
                 if parallel_lwd.is_edge_node
-                else parallel_lwd.cloud_npu_count
+                else cloud_per_instance
             )
 
         if self.performance_mode != "balanced":
