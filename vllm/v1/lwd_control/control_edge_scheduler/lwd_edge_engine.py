@@ -28,7 +28,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -366,8 +366,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
         """单步编排(批队列异步化+多批在飞,embed 优先):收割队首直至
         清空 -> prefill 连续派发(优先占深度配额) -> 消费云载荷(剩余
-        配额派发 UNEMBED)-> 返回({0: 云侧结果输出} | None,prefill
-        是否有派发)。
+        配额派发 UNEMBED)-> 返回({client_index: 云侧结果输出} | None,
+        prefill 是否有派发)。
+
+        输出按请求的实例 pin 分组(client_index == instance,pin 校验
+        保证):前端 attach 按字典 key 送达对应客户端,多实例下各组
+        各回各家;单实例退化为 {0: ...}(与原行为等价)。
 
         embed/unembed 均派发入队不收割,队首全局 FIFO 收割(序与
         executor 排水序同构,不可交错);突发时一步连派至深度上限
@@ -379,15 +383,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         [Lwd][sched] 三类日志(饿死分析锚点):每批 harvest(含队列滞留
         wait)、每批 dispatch(含 ahead 队列构成/c2e 水位)、每步汇总。"""
-        outputs: list = []
-        finished_reqs: set = set()
+        outputs_by_client: dict[int, list] = defaultdict(list)
+        finished_by_client: dict[int, set] = defaultdict(set)
         prefill_work = False
         h_emb = h_unemb = 0
         while self._lwd_batch_queue:
             kind, payload, t_dispatch, future = self._lwd_batch_queue.popleft()
             if kind == "unembed":
                 self._lwd_deliver_unembed(
-                    payload, future, outputs, finished_reqs
+                    payload, future, outputs_by_client, finished_by_client
                 )
                 h_unemb += 1
             else:
@@ -423,12 +427,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
             h_emb, h_unemb, d_emb, d_unemb, n_emb, n_unemb,
             self._lwd_c2e_pending_total(),
         )
-        if outputs:
-            step_outputs = EngineCoreOutputs(
-                outputs=outputs,
-                finished_requests=finished_reqs or None,
-            )
-            return {0: step_outputs}, prefill_work
+        if outputs_by_client:
+            step_outputs = {
+                client_index: EngineCoreOutputs(
+                    outputs=outs,
+                    finished_requests=finished_by_client[client_index] or None,
+                )
+                for client_index, outs in outputs_by_client.items()
+            }
+            return step_outputs, prefill_work
         return None, prefill_work
 
     def _lwd_queue_mix(self) -> tuple[int, int]:
@@ -533,14 +540,22 @@ class LwdEdgeEngineCore(EngineCoreProc):
         )
 
     def _lwd_deliver_unembed(
-        self, notify: LwdC2eNotify, future, outputs: list, finished_reqs: set,
+        self,
+        notify: LwdC2eNotify,
+        future,
+        outputs_by_client: dict[int, list],
+        finished_by_client: dict[int, set],
     ) -> None:
         """UNEMBED 批收割侧:等 worker 应答取采样 token 表,逐请求交付。
         不感知提交时机,只消费 (notify, future)。应答契约:
         token ids 按 ModelRunnerOutput 的 req_ids x sampled_token_ids
         按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
         缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
-        迟到载荷幂等丢弃。"""
+        迟到载荷幂等丢弃。
+
+        输出按请求的实例 pin 归组(client_index == instance,入口 pin
+        校验保证):与原生 update_from_output 的 outputs[request.
+        client_index] 分组同构,前端 attach 据此送达对应客户端。"""
         _t = time.monotonic()
         result = future.result()
         # [Lwd][perf] 临时探针:收割时长 = RPC 往返 + worker 执行全长
@@ -558,6 +573,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             {} if result is None
             else dict(zip(result.req_ids, result.sampled_token_ids))
         )
+        routing = self.scheduler._req_id_to_instance
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished = finish_reason is not None
@@ -584,14 +600,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
             if not sampled_token_ids and not finished:
                 # 无内容且未完结:不出空输出
                 continue
-            outputs.append(
+            client_index = routing.get(request_id, 0)
+            outputs_by_client[client_index].append(
                 EngineCoreOutput(
                     request_id, sampled_token_ids,
                     finish_reason=finish_reason,
                 )
             )
             if finished:
-                finished_reqs.add(request_id)
+                finished_by_client[client_index].add(request_id)
 
     @staticmethod
     def _lwd_finish_code(
