@@ -27,6 +27,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdHelloNotify,
     LwdRangeNotify,
     LwdRequestNotify,
+    lwd_decode_notify,
     lwd_encode_cloud_notify,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
@@ -61,13 +62,18 @@ class LwdCloudEngineCore(EngineCoreProc):
         vllm_config = kwargs["vllm_config"]
         vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
         super().__init__(*args, **kwargs)
+        # 通信面构造期装配(与边侧 _lwd_setup_zmq 同构):subscriber 自带
+        # 搬运线程后,socket 不再受泵线程的 zmq 单线程亲和约束;建站失败
+        # = 构造抛异常,与边侧同一错误路径。
+        self._lwd_setup_zmq()
 
     def _lwd_setup_zmq(self) -> None:
-        """介入 ZMQ 双面:PRE_OUT bind 收边;POST_OUT connect 边,承载首拍
-        HELLO 通告与步内元数据。建站失败走 EXECUTOR_FAILED 升级。"""
+        """构造期装配通信面:PRE_OUT bind 收边(内部搬运线程)+ POST_OUT
+        connect 边,承载首拍 HELLO 通告与步内元数据。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True
+            config.lwd_pre_out_endpoint(), bind=True,
+            decoder=lwd_decode_notify,
         )
         master_addr = self.vllm_config.parallel_config.master_addr
         self._lwd_post_out = LwdControlPublisher(
@@ -80,15 +86,18 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
-        # 门池:元数据查重与暂存,到达即构建放行;仅本 IO 线程独占
+        # 门池:元数据查重与暂存,到达即构建放行;仅本泵线程独占
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         # UP 链 seqno 登记(边→云→云 worker 的最后一跳,§9.12 接缝):
         # rid -> [chunk 序 seqno 列表],RangeNotify 到达即登记;调度器
         # 出 prefill 批时取快照挂 SO.lwd_up_seqnos 随批下发云 worker
         # (数据面 UP recv 配对键,与边侧 SO.lwd_batch.seqno 同源同值)。
-        # registry 引用交付调度器(IO 线程登记 / 主循环读,dict 赋值原子)。
+        # registry 引用交付调度器(泵线程登记 / 主循环读,dict 赋值原子)。
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
+        threading.Thread(
+            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
+        ).start()
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
@@ -98,37 +107,14 @@ class LwdCloudEngineCore(EngineCoreProc):
             master_addr,
         )
 
-    def process_input_sockets(
-        self,
-        input_addresses: list[str],
-        coord_input_address: str | None,
-        identity: bytes,
-        ready_event: threading.Event,
-    ) -> None:
-        """父线程照跑父类原版,PRE_OUT 循环独立成线程,两生产者共用 input_queue。"""
-        threading.Thread(
-            target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
-        ).start()
-        super().process_input_sockets(
-            input_addresses, coord_input_address, identity, ready_event
-        )
-
     def _lwd_pre_out_loop(self) -> None:
-        """PRE_OUT 接收循环:socket 与门状态在本线程内先建后用(zmq 单线程
-        亲和);recv 挂超时拍仅作关停响应上限,关停(closed)退出。"""
-        try:
-            self._lwd_setup_zmq()
-        except Exception:
-            logger.exception("[Lwd] cloud PRE_OUT setup failed")
-            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
-            return
-        while True:
-            msg = self._lwd_subscriber.recv(timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS)
-            if msg is None:
-                if self._lwd_subscriber.closed:
-                    break
-                continue
-            self._lwd_dispatch(msg)
+        """PRE_OUT 泵线程:泵取搬运线程攒下的通知逐条分发(_lwd_dispatch);
+        阻塞拍仅作关停响应上限,关停(closed)退出。"""
+        while not self._lwd_subscriber.closed:
+            for msg in self._lwd_subscriber.recv_batch(
+                timeout_ms=LWD_PRE_OUT_RECV_TIMEOUT_MS
+            ):
+                self._lwd_dispatch(msg)
 
     def _lwd_announce(self) -> None:
         """首拍 HELLO 通告一次;队满不重试,由边侧等待超时 fail-fast 兜底。"""
