@@ -221,7 +221,13 @@ def validate_frontend_attach_args(args) -> None:
             f"in [0, --instance-parallel-size={size})"
         )
 
-    if (size > 1 or start_rank is not None) and not _is_lwd_enabled(args):
+    # --instance-parallel-* 只在 LWD 模式有效;attach 命令(纯前端、无
+    # worker/engine)本身即 LWD 多实例语义,不要求额外写 --additional-config。
+    if (
+        attach is None
+        and (size > 1 or start_rank is not None)
+        and not _is_lwd_enabled(args)
+    ):
         raise ValueError(
             "Error: --instance-parallel-size/--instance-parallel-start-rank "
             "require LWD (edge-cloud) mode"
