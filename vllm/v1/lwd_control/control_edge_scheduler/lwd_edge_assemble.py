@@ -51,6 +51,13 @@ class LwdConfig:
     hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
+    # 本云实例索引(--instance-parallel-start-rank,None 归一化为 0):
+    # DEALER identity / 业务 HELLO 戳 / c2e 戳三处同源的唯一事实源;
+    # 边侧恒 0(单边进程服务所有实例)
+    instance_id: int = 0
+    # 云实例总数(--instance-parallel-size,边侧消费:ROUTER 服务数与
+    # N-HELLO 屏障的收齐目标;云侧消费:S5 注册交叉校验);坏值回退 1
+    instance_count: int = 1
     debug: bool = False
 
     def lwd_pre_out_endpoint(self) -> str:
@@ -82,6 +89,8 @@ class LwdConfig:
             publish_queue_max=int(
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),
+            instance_id=_lwd_read_instance_id(vllm_config),
+            instance_count=_lwd_read_instance_count(vllm_config),
             debug=bool(section.get("debug", False)),
         )
         return _lwd_apply_env_overrides(config)
@@ -129,8 +138,62 @@ def _lwd_apply_env_overrides(config: LwdConfig) -> LwdConfig:
         ),
         scheduler_name=config.scheduler_name,
         publish_queue_max=config.publish_queue_max,
+        instance_id=config.instance_id,
+        instance_count=config.instance_count,
         debug=config.debug or (debug is not None and debug.lower() == "1"),
     )
+
+
+def _lwd_read_instance_count(vllm_config) -> int:
+    """读云实例总数:parallel_config.instance_parallel_size
+    (--instance-parallel-size),缺省归一化为 1;坏值/非正告警回退 1
+    (实例数不匹配的后续失败由边侧 N-HELLO 屏障/S5 注册校验兜底)。"""
+    parallel = getattr(vllm_config, "parallel_config", None)
+    raw = getattr(parallel, "instance_parallel_size", None)
+    if raw is None:
+        return 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[Lwd] ignore invalid instance_parallel_size %r, fallback to 1",
+            raw,
+        )
+        return 1
+    if value < 1:
+        logger.warning(
+            "[Lwd] non-positive instance_parallel_size %d, fallback to 1",
+            value,
+        )
+        return 1
+    return value
+
+
+def _lwd_read_instance_id(vllm_config) -> int:
+    """读云实例索引:parallel_config.instance_parallel_start_rank
+    (--instance-parallel-start-rank),缺省/非正归一化为 0;坏值告警
+    回退 0(部署期输入错误不应炸掉引擎启动,实例冲突由边侧屏障与
+    WELCOME 看门狗兜底报告)。"""
+    parallel = getattr(vllm_config, "parallel_config", None)
+    raw = getattr(parallel, "instance_parallel_start_rank", None)
+    if raw is None:
+        return 0
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[Lwd] ignore invalid instance_parallel_start_rank %r, "
+            "fallback to 0",
+            raw,
+        )
+        return 0
+    if value < 0:
+        logger.warning(
+            "[Lwd] negative instance_parallel_start_rank %d, fallback to 0",
+            value,
+        )
+        return 0
+    return value
 
 
 def _lwd_read_env_int(name: str) -> int | None:

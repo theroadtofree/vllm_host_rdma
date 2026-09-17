@@ -125,21 +125,27 @@ class LwdCloudEngineCore(EngineCoreProc):
     def _lwd_setup_zmq_router_dealer(self) -> None:
         """full_duplex 模式装配:单条 ROUTER/DEALER 连接承载双向控制面,
         云 DEALER 以显式 identity 连边绑定的端口;不再有 POST_OUT 发布面
-        与云端点发现(业务层 HELLO 通告保留,作为边侧"云全量就绪"屏障)。"""
+        与云端点发现(业务层 HELLO 通告保留,作为边侧"云全量就绪"屏障)。
+
+        实例号三处同源(config.instance_id):DEALER identity、业务 HELLO
+        戳、c2e 戳——任何一处单独取值即未来串线隐患。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
         master_addr = self.vllm_config.parallel_config.master_addr
+        self._lwd_instance_id = config.instance_id
         channel = create_cloud_zmq_channel(
             master_addr=master_addr,
             dp_rank=0,
             pre_out_port=config.pre_out_port,
-            name="lwd-cloud",
-            instance_id=0,
+            name=f"lwd-cloud-inst{config.instance_id}",
+            instance_id=config.instance_id,
         )
         # 收发同通道:泵线程/发布方共用同一对象
         self._lwd_subscriber = channel
         self._lwd_post_out = channel
         self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            instance_id=config.instance_id,
         )
         # 业务层就绪通告:通道 HELLO/WELCOME 只证明 TCP 连通,本通告
         # 证明云全量初始化(权重/KV/图编译)完成,边侧以此放行
@@ -153,9 +159,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         ).start()
         logger.info(
             "[Lwd] cloud engine assembled (full_duplex): DEALER connect -> "
-            "%s:%s (identity=0)",
+            "%s:%s (identity=%d)",
             master_addr,
             config.pre_out_port,
+            config.instance_id,
         )
 
     def _lwd_announce(self) -> None:
@@ -391,7 +398,8 @@ class LwdCloudEngineCore(EngineCoreProc):
 
     def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
-        (元数据不可丢),关停(closed)退出。"""
+        (元数据不可丢),关停(closed)退出。instance_id 与 DEALER identity
+        同源盖章,边侧据此分发到对应实例的 UNEMBED/数据面路径。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
@@ -399,6 +407,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             req_ids=meta.req_ids,
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
+            instance_id=getattr(self, "_lwd_instance_id", 0),
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
