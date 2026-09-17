@@ -66,9 +66,6 @@ logger = init_logger(__name__)
 # - attach 自身管道:api-server-rpc-port / api-server-attach;
 # - 引擎侧 rendezvous/DP 网络地址:纯前端 attach 命令不参与,要求逐字
 #   一致纯属部署摩擦(master_addr/master_port/data_parallel_*);
-# - additional_config 承载 lwd_config(role/mode/层切分/传输层字段),
-#   主命令(实例0)与纯前端 attach 命令在该段天然不同;LWD 使能由
-#   _is_lwd_enabled 单独校验,故整段排除;
 # - HTTP 传输层(ssl/CORS/middleware/uvicorn/h11 等)每个前端独立
 #   监听、独立配置,stay per-frontend。
 ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
@@ -86,8 +83,6 @@ ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
         "master_port",
         "data_parallel_address",
         "data_parallel_rpc_port",
-        # LWD config carrier
-        "additional_config",
         # HTTP transport / per-frontend
         "uvicorn_log_level",
         "disable_uvicorn_access_log",
@@ -115,6 +110,8 @@ ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
 # Serving-layer (frontend-local) args that each ApiServer reads from its
 # own CLI namespace; the main command forwards its values in the GRANT so
 # an attach command that omits them inherits the same API surface.
+# ``additional_config`` 也走继承:attach 命令可不写,写了则须与主命令一致
+# (见 ATTACH_CONFIG_EXCLUDE_KEYS 中未将其排除,故仍参与 diff)。
 FRONTEND_INHERIT_ARGS = frozenset(
     {
         "served_model_name",
@@ -140,6 +137,7 @@ FRONTEND_INHERIT_ARGS = frozenset(
         "api_key",
         "enable_tokenizer_info_endpoint",
         "tokens_only",
+        "additional_config",
     }
 )
 
