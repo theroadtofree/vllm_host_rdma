@@ -487,6 +487,8 @@ class EngineArgs:
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     edge_npu_count: int = 0
     cloud_npu_count: int = 0
+    instance_parallel_size: int = 1
+    instance_parallel_start_rank: int | None = None
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1088,6 +1090,22 @@ class EngineArgs:
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
             help="Total number of cloud NPUs across all DP instances (LWD mode).",
+        )
+        parallel_group.add_argument(
+            "--instance-parallel-size", type=int, default=1,
+            help="Total number of cloud instances (N) in LWD multi-instance "
+            "deployment (LWD mode). N=1 (default) degenerates to the "
+            "existing 1:1 edge-cloud behavior.",
+        )
+        parallel_group.add_argument(
+            "--instance-parallel-start-rank",
+            type=int,
+            default=None,
+            help="Instance index of this cloud instance, in "
+            "[0, instance_parallel_size). LWD multi-instance mode only: "
+            "cloud instances (and edge frontend attach commands) pass "
+            "their instance number here; instances on the same machine "
+            "differ only by this value.",
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -2001,7 +2019,12 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
-            lwd_config=LwdParallelConfig(edge_npu_count=self.edge_npu_count, cloud_npu_count=self.cloud_npu_count),
+            lwd_config=LwdParallelConfig(
+                edge_npu_count=self.edge_npu_count,
+                cloud_npu_count=self.cloud_npu_count,
+                instance_parallel_size=self.instance_parallel_size,
+                instance_parallel_start_rank=self.instance_parallel_start_rank,
+            ),
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

@@ -180,6 +180,8 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        client_count: int | None = None,
+        client_indices: list[int] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -204,6 +206,16 @@ class APIServerProcessManager:
         self.sock = sock
         self.args = args
 
+        self.client_count = num_servers if client_count is None else client_count
+        self.client_indices = (
+            list(range(num_servers)) if client_indices is None else client_indices
+        )
+        if len(self.client_indices) != num_servers:
+            raise ValueError(
+                f"client_indices ({self.client_indices}) must have exactly "
+                f"num_servers={num_servers} entries"
+            )
+
         spawn_context = multiprocessing.get_context("spawn")
         self.processes: list[BaseProcess] = []
         self._address_pipes: list[connection.Connection] = []
@@ -214,8 +226,8 @@ class APIServerProcessManager:
             client_config: dict[str, Any] = {
                 "input_address": in_addr,
                 "output_address": out_addr,
-                "client_count": num_servers,
-                "client_index": i,
+                "client_count": self.client_count,
+                "client_index": self.client_indices[i],
             }
             if stats_update_address is not None:
                 client_config["stats_update_address"] = stats_update_address
