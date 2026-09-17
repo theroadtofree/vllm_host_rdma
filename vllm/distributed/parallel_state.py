@@ -1569,6 +1569,29 @@ def init_distributed_environment(
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if (
         config is not None
+        and config.parallel_config.lwd_config.enable_lwd
+        and config.parallel_config.distributed_executor_backend != "external_launcher"
+    ):
+        parallel_config = config.parallel_config
+        # LWD 多实例(§4.1):executor 已直接分配全局 rank——边命令覆盖
+        # [0, E) 全部边 rank,云实例 i 命令覆盖其实例的连续 rank 块,
+        # 不再按 dp 做标准重排;world_size 用 N 感知的总数(post_init
+        # 已算好 = edge + cloud 总数)。init method 统一从 master
+        # addr/port 派生,让边命令与全部云实例命令在同一 store 会合。
+        world_size = parallel_config.world_size
+        distributed_init_method = get_distributed_init_method(
+            parallel_config.master_addr, parallel_config.master_port
+        )
+        logger.debug(
+            "Adjusting world_size=%d rank=%d for LWD multi-instance",
+            world_size,
+            rank,
+        )
+        # 跨命令配置不一致会算出不同 world_size,init_process_group
+        # 本身就会挂死;预检经一次性 TCPStore 快速失败并给出明确报错。
+        _validate_lwd_topology_pre_init(parallel_config, world_size, rank)
+    elif (
+        config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
         and (
             config.parallel_config.nnodes > 1
@@ -1705,6 +1728,119 @@ def init_distributed_environment(
             _INNER_DP_WORLD = _WORLD
 
 
+_LWD_TOPOLOGY_CHECK_TIMEOUT_S = 600.0
+
+
+def _lwd_topology_axes(parallel_config) -> dict:
+    """Topology axes every launch command must agree on (the edge command
+    + N cloud instance commands derive their group tables from these)."""
+    return {
+        "world_size": parallel_config.world_size,
+        "data_parallel_size": parallel_config.data_parallel_size,
+        "instance_parallel_size": (
+            parallel_config.lwd_config.instance_parallel_size
+        ),
+        "edge_npu_count": parallel_config.lwd_config.edge_npu_count,
+        "cloud_npu_count": parallel_config.lwd_config.cloud_npu_count,
+    }
+
+
+def _raise_on_lwd_topology_mismatch(
+    local_axes: dict, remote_axes: dict, remote_rank: int
+) -> None:
+    """Raise if ``remote_axes`` disagrees with ``local_axes`` on any axis."""
+    diff = [k for k in local_axes if local_axes[k] != remote_axes.get(k)]
+    if not diff:
+        return
+    raise ValueError(
+        f"Lwd topology mismatch with global rank {remote_rank}: "
+        f"local axes {local_axes} vs remote {remote_axes} "
+        f"(differing: {diff}). Every launch command (the edge and all "
+        "cloud instances) must pass the same --data-parallel-size, "
+        "--instance-parallel-size, --edge-npu-count and "
+        "--cloud-npu-count; otherwise the process group layout "
+        "misaligns and init_process_group hangs."
+    )
+
+
+def _validate_lwd_topology_pre_init(
+    parallel_config, world_size: int, rank: int
+) -> None:
+    """Pre-``init_process_group`` Lwd topology guard.
+
+    A cross-command config mismatch usually produces *different world
+    sizes*, which hangs ``init_process_group`` itself before the
+    all-gather guard (``_validate_lwd_topology_consistency``) can run.
+    This guard exchanges the topology axes (and world size) over a
+    one-shot TCPStore on a rendezvous-adjacent port so a mismatch fails
+    fast with a clear error instead.
+    """
+    axes = _lwd_topology_axes(parallel_config)
+    timeout = timedelta(seconds=_LWD_TOPOLOGY_CHECK_TIMEOUT_S)
+    store = torch.distributed.TCPStore(
+        host_name=parallel_config.master_addr,
+        port=parallel_config.master_port + 2,
+        world_size=world_size,
+        is_master=(rank == 0),
+        wait_for_workers=False,
+        timeout=timeout,
+    )
+    store.set_timeout(timeout)
+    try:
+        store.set(f"lwd_topo_{rank}", pickle.dumps(axes))
+        # Every rank compares its axes against rank 0 (the edge's first
+        # worker: the master and authoritative topology source).
+        master_axes = pickle.loads(store.get("lwd_topo_0"))
+        _raise_on_lwd_topology_mismatch(axes, master_axes, 0)
+        # Rank 0 additionally verifies every rank registered, so a
+        # missing rank (world-size mismatch) is reported instead of
+        # hanging.
+        if rank == 0:
+            for r in range(1, world_size):
+                remote = pickle.loads(store.get(f"lwd_topo_{r}"))
+                _raise_on_lwd_topology_mismatch(axes, remote, r)
+    finally:
+        del store
+
+
+def _validate_lwd_topology_consistency(parallel_config) -> None:
+    """§4.1 startup guard: all-gather the topology axes over the world
+    CPU group and fail fast if any rank derived a different layout.
+
+    The edge and the N cloud instances are separate launch commands; if
+    their ``--instance-parallel-size``/``--data-parallel-size``/
+    ``--edge-npu-count``/``--cloud-npu-count`` disagree, each side
+    derives a different group table. Different layouts can still
+    coincide on the same world size (edge N=1/C=8 and cloud N=2/C=4 both
+    give world 9), so the world-size assert passes and the misaligned
+    ``new_group`` sequences only surface as a silent deadlock in the
+    first group collective. Must be called by every rank at the same
+    point (top of the LWD handling in ``initialize_model_parallel``).
+    """
+    axes = _lwd_topology_axes(parallel_config)
+    local = torch.tensor(list(axes.values()), dtype=torch.int64)
+    world_group = get_world_group()
+    gathered = [torch.zeros_like(local) for _ in range(world_group.world_size)]
+    torch.distributed.all_gather(gathered, local, group=world_group.cpu_group)
+    names = list(axes)
+    for rank, remote in enumerate(gathered):
+        diff = [
+            n for n, a, b in zip(names, local.tolist(), remote.tolist())
+            if a != b
+        ]
+        if diff:
+            raise ValueError(
+                f"Lwd topology mismatch with global rank {rank}: "
+                f"local axes {dict(zip(names, local.tolist()))} vs remote "
+                f"{dict(zip(names, remote.tolist()))} (differing: {diff}). "
+                "Every launch command (the edge and all cloud instances) "
+                "must pass the same --data-parallel-size, "
+                "--instance-parallel-size, --edge-npu-count and "
+                "--cloud-npu-count; otherwise the process group layout "
+                "misaligns and deadlocks."
+            )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -1746,14 +1882,19 @@ def initialize_model_parallel(
     parallel_config = config.parallel_config
     coord_store: Store | None = None
 
-    # Lwd 边云模式:边云 rank 数不对称(edge_npu_count + cloud_npu_count),
-    # 排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后返回。
-    # 布局(以边 1 + 云 4、dp=1、world=5 为例):
-    #   TP: [[0], [1,2,3,4]]        边单例;云 4 卡合切一份权重
-    #   PP: [[0,1], [2], [3], [4]]  边 rank0 与云 rank1 组成两段流水线,
-    #                               其余云 rank 单例
-    #   DCP/PCP/DP: 全单例
-    #   EP(仅 MoE): [[0], [1,2,3,4]]
+    # Lwd 边云多实例模式(§4.1/§4.2):边云 rank 数不对称且云侧可有 N 个
+    # 实例,排不进原生的均匀 rank 网格,按 Lwd 布局直接构建各并行组后
+    # 返回。布局由 vllm/config/parallel.py 的
+    # ``LwdParallelConfig.lwd_group_ranks()`` 纯函数给出(所有 rank 算出
+    # 同一张表):边 ranks 全局在前 [0, E);云实例 instance-major 续编,
+    # 实例 i dp j 首 rank = E + i*D*C + j*C。
+    # 以边 1 + 2 云实例各 4 卡(dp=1、N=2、world=9)为例:
+    #   TP: [[0], [1,2,3,4], [5,6,7,8]]   边单例;每实例云块一组
+    #   PP: [0,1], [0,5], [2], [3], [4], [6], [7], [8]
+    #       ↑ dp0 首张边卡进全部 N 个实例的 PP 对(边分时复用,数据面
+    #         按 (instance, dp) 建通道对)
+    #   DCP/PCP: 全单例
+    #   EP(仅 MoE): [[0], [1,2,3,4], [5,6,7,8]]  (EP 跨 D 不跨 N)
     # 所有分组都必须全 rank 集体创建,因此每个 rank 都带完整分组列表。
     if parallel_config.lwd_config.enable_lwd:
         global _TP, _PP, _DCP, _PCP, _DP, _EP
@@ -1765,21 +1906,29 @@ def initialize_model_parallel(
         backend = backend or torch.distributed.get_backend(
             get_world_group().device_group
         )
-        edge_count = lwd.edge_npu_count
-        cloud_count = lwd.cloud_npu_count
-        world_per_dp = edge_count + cloud_count
-        assert world_size == data_parallel_size * world_per_dp, (
+        # 启动一致性守卫:边命令与 N 条云实例命令是独立启动命令,
+        # 拓扑参数不一致时各侧会派生出不同的分组表;不同布局可能恰好
+        # 凑出相同 world(边 N=1/C=8 与云 N=2/C=4 都是 world 9),逐分支
+        # 的 world 断言拦不住,错位的 new_group 序列只在第一个组集体上
+        # 静默死锁。全 rank 在同一时点 all-gather 拓扑轴快速失败。
+        _validate_lwd_topology_consistency(parallel_config)
+        expected_world = lwd.lwd_world_size(data_parallel_size)
+        assert world_size == expected_world, (
             f"Lwd world size mismatch: got {world_size}, expected "
-            f"{data_parallel_size} * ({edge_count} + {cloud_count})")
-        is_edge = rank % world_per_dp < edge_count
+            f"edge {lwd.edge_npu_count} + {lwd.instance_parallel_size} "
+            f"instances * {data_parallel_size} dp * "
+            f"{lwd.cloud_npu_count_per_instance_dp(data_parallel_size)} "
+            "cloud ranks per (instance, dp)")
+        is_edge = rank < lwd.edge_rank_count(data_parallel_size)
 
-        # TP:每个 dp 实例内,边 rank 一组、云 rank 一组
+        groups = lwd.lwd_group_ranks(data_parallel_size)
+        tp_groups = groups["tp"]
+        pp_groups = groups["pp"]
+        dp_groups = groups["dp"]
+        singleton_groups = groups["dcp"]
+
+        # TP:边每 dp 一组;每 (instance, dp) 云块一组
         assert _TP is None, "tensor model parallel group is already initialized"
-        tp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            tp_groups.append([base + r for r in range(edge_count)])
-            tp_groups.append([base + edge_count + r for r in range(cloud_count)])
         _TP = init_model_parallel_group(
             tp_groups,
             get_world_group().local_rank,
@@ -1788,15 +1937,8 @@ def initialize_model_parallel(
             group_name="tp",
         )
 
-        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        # PP:每 (instance, dp) 边首卡与云首卡成两段 pp 对,其余单例
         assert _PP is None, "pipeline model parallel group is already initialized"
-        pp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            pp_groups.append([base + 0, base + edge_count])
-            for r in range(1, world_per_dp):
-                if r != edge_count:
-                    pp_groups.append([base + r])
         _PP = init_model_parallel_group(
             pp_groups,
             get_world_group().local_rank,
@@ -1809,7 +1951,6 @@ def initialize_model_parallel(
         _LWD_FULL_HEAD_TAIL = True
 
         # DCP/PCP:全单例(pcp_size = dcp_size = 1)
-        singleton_groups = [[r] for r in range(world_size)]
         assert _DCP is None, "decode context model parallel group is already initialized"
         _DCP = init_model_parallel_group(
             singleton_groups,
@@ -1823,30 +1964,21 @@ def initialize_model_parallel(
             singleton_groups,
             get_world_group().local_rank,
             backend,
+            use_message_queue_broadcaster=True,
             group_name="pcp",
         )
 
-        # DP:各 dp 实例同位置的 rank 一组
+        # DP:各 dp 实例同位置的 rank 一组(边与每实例分开)
         assert _DP is None, "data parallel group is already initialized"
-        dp_groups = [
-            [pos + dp_idx * world_per_dp for dp_idx in range(data_parallel_size)]
-            for pos in range(world_per_dp)
-        ]
         _DP = init_model_parallel_group(
             dp_groups, get_world_group().local_rank, backend, group_name="dp"
         )
 
-        # EP(仅 MoE):边 rank 一组、云 rank 一组
+        # EP(仅 MoE):边一组、每实例云一组(跨 D 不跨 N)
         if config.model_config is not None and config.model_config.is_moe:
             assert _EP is None, "expert parallel group is already initialized"
-            ep_edge_ranks: list[int] = []
-            ep_cloud_ranks: list[int] = []
-            for dp_idx in range(data_parallel_size):
-                base = dp_idx * world_per_dp
-                ep_edge_ranks.extend(range(base, base + edge_count))
-                ep_cloud_ranks.extend(range(base + edge_count, base + world_per_dp))
             _EP = init_model_parallel_group(
-                [ep_edge_ranks, ep_cloud_ranks],
+                groups["ep"],
                 get_world_group().local_rank,
                 backend,
                 group_name="ep",
@@ -1854,12 +1986,13 @@ def initialize_model_parallel(
 
         logger.info(
             "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
-            "edge_npu_count=%s, cloud_npu_count=%s, world_size=%s, "
-            "TP groups=%s, PP groups=%s, DP groups=%s",
+            "instances=%s, edge_npu_count=%s, cloud_npu_count=%s, "
+            "world_size=%s, TP groups=%s, PP groups=%s, DP groups=%s",
             rank,
             is_edge,
-            edge_count,
-            cloud_count,
+            lwd.instance_parallel_size,
+            lwd.edge_npu_count,
+            lwd.cloud_npu_count,
             world_size,
             tp_groups,
             pp_groups,

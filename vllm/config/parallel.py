@@ -125,23 +125,144 @@ class LwdParallelConfig:
     edge_npu_count: int = Field(default=0, ge=0)
     """Total number of edge NPUs across all DP instances (LWD mode)."""
     cloud_npu_count: int = Field(default=0, ge=0)
-    """Total number of cloud NPUs across all DP instances (LWD mode)."""
+    """Total number of cloud NPUs across all DP instances AND all cloud
+    instances (LWD mode): with ``instance_parallel_size = N`` each cloud
+    instance runs ``cloud_npu_count / (N * data_parallel_size)`` NPUs, so
+    the count must be divisible by ``N * data_parallel_size``."""
     instance_parallel_size: int = Field(default=1, ge=1, le=16)
-    """Total number of cloud instances (N) in LWD multi-instance
-    deployment. N=1 (default) degenerates to the existing 1:1
-    edge-cloud behavior."""
-    instance_parallel_start_rank: int | None = None
-    """Instance index of this cloud instance, in
-    ``[0, instance_parallel_size)``. Only the cloud side (and edge
-    frontend attach commands) set it."""
+    """Number of cloud instances (N) in the LWD multi-instance deployment.
+    Must be identical on the edge command and on every cloud instance
+    command (guaranteed by deployment, like ``data_parallel_size``).
+    Cloud instances are laid out instance-major after the edge ranks
+    (design doc §4.1): instance i, dp j first rank =
+    ``E + i*D*C + j*C``. N=1 (default) degenerates to the historical
+    1:1 edge-cloud behavior. Capped at 16: each instance multiplies the
+    number of HCCL communicators (2 duplex channels per (instance, dp)
+    pair) and the edge holds one channel pair per instance."""
+    instance_parallel_start_rank: int | None = Field(default=None, ge=0)
+    """Instance index of THIS cloud instance command, in
+    ``[0, instance_parallel_size)``. Only the cloud side sets it; cloud
+    instances sharing one physical machine are distinguished by this
+    value alone. ``None`` means instance 0 (also the edge value)."""
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
         """Per-DP-instance edge NPU count."""
         return self.edge_npu_count // data_parallel_size
 
     def cloud_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance cloud NPU count."""
+        """Per-DP-instance cloud NPU count (across its N instances)."""
         return self.cloud_npu_count // data_parallel_size
+
+    def cloud_npu_count_per_instance_dp(
+        self, data_parallel_size: int
+    ) -> int:
+        """Cloud NPUs of one cloud instance inside one DP instance (C)."""
+        return self.cloud_npu_count // (
+            self.instance_parallel_size * data_parallel_size
+        )
+
+    def edge_rank_count(self, data_parallel_size: int) -> int:
+        """Total edge ranks E = data_parallel_size * E_per (§4.1: the
+        edge ranks occupy ``[0, E)`` first)."""
+        return self.edge_npu_count
+
+    def lwd_cloud_first_rank(
+        self, instance_id: int, dp_rank: int, data_parallel_size: int
+    ) -> int:
+        """First global rank of cloud instance ``instance_id``'s dp
+        ``dp_rank`` block (§4.1 instance-major layout)."""
+        c_per = self.cloud_npu_count_per_instance_dp(data_parallel_size)
+        return (
+            self.edge_rank_count(data_parallel_size)
+            + instance_id * data_parallel_size * c_per
+            + dp_rank * c_per
+        )
+
+    def lwd_world_size(self, data_parallel_size: int) -> int:
+        """Grand-total HCCL world: edge ranks first, then all N cloud
+        instance blocks (instance-major)."""
+        c_per = self.cloud_npu_count_per_instance_dp(data_parallel_size)
+        return self.edge_rank_count(data_parallel_size) + (
+            self.instance_parallel_size * data_parallel_size * c_per
+        )
+
+    def lwd_group_ranks(
+        self, data_parallel_size: int
+    ) -> dict[str, list[list[int]]]:
+        """Build the §4.1/§4.2 group rank lists (TP, PP, DCP/PCP, DP, EP)
+        for the per-rank LWD edge-cloud topology.
+
+        Layout: edge ranks occupy ``[0, E)`` (dp j owns
+        ``[j*E_per, (j+1)*E_per)``); cloud instances continue
+        instance-major — instance i, dp j block starts at
+        ``E + i*D*C + j*C``. Each dp's FIRST edge card is listed in all
+        N instance PP pairs, so the edge endpoint card is time-shared
+        across instances (the data plane keys its channel pairs by
+        ``(instance, dp)`` on top of this layout).
+
+        Pure function of the config so the rank layout can be
+        unit-tested without a distributed environment; every rank
+        computes the SAME full table (``new_group`` is a world
+        collective and must be called in the same order everywhere).
+        N=1, D=1 degenerates to the historical single-pair layout.
+        """
+        d = data_parallel_size
+        n = self.instance_parallel_size
+        e_per = self.edge_npu_count_per_dp(d)
+        c_per = self.cloud_npu_count_per_instance_dp(d)
+        e_total = self.edge_rank_count(d)
+        world = self.lwd_world_size(d)
+
+        def cloud_first(i: int, j: int) -> int:
+            return self.lwd_cloud_first_rank(i, j, d)
+
+        tp_groups: list[list[int]] = []
+        for j in range(d):
+            tp_groups.append(
+                list(range(j * e_per, (j + 1) * e_per)))
+            for i in range(n):
+                base = cloud_first(i, j)
+                tp_groups.append(list(range(base, base + c_per)))
+
+        pp_groups: list[list[int]] = []
+        pp_paired: set[int] = set()
+        for i in range(n):
+            for j in range(d):
+                # dp j's first edge card pairs with instance i's dp j
+                # first cloud rank; other edge cards are singletons.
+                pp_groups.append([j * e_per, cloud_first(i, j)])
+                pp_paired.add(j * e_per)
+                pp_paired.add(cloud_first(i, j))
+        for r in range(world):
+            if r not in pp_paired:
+                pp_groups.append([r])
+
+        dp_groups: list[list[int]] = []
+        for t in range(e_per):
+            dp_groups.append(
+                [j * e_per + t for j in range(d)])
+        for i in range(n):
+            for t in range(c_per):
+                dp_groups.append(
+                    [cloud_first(i, j) + t for j in range(d)])
+
+        # EP (MoE): one group over the edge ranks plus one group per
+        # cloud instance — expert parallelism crosses the dp axis but
+        # never the instance axis.
+        ep_groups: list[list[int]] = [list(range(e_total))]
+        for i in range(n):
+            ep_groups.append(
+                list(range(cloud_first(i, 0), cloud_first(i + 1, 0))))
+
+        singleton_groups = [[r] for r in range(world)]
+        return {
+            "tp": tp_groups,
+            "pp": pp_groups,
+            "dcp": singleton_groups,
+            "pcp": singleton_groups,
+            "dp": dp_groups,
+            "ep": ep_groups,
+        }
 
     def is_shared_model_edge(self, data_parallel_size: int) -> bool:
         """True when the LWD edge is a single shared rank across all DP
@@ -760,15 +881,39 @@ class ParallelConfig:
     @property
     def local_world_size(self) -> int:
         if self.lwd_config.enable_lwd:
-            # LWD edge-cloud: each side spawns its own NPU count; the
-            # world_size // nnodes_within_dp division does not apply to the
-            # asymmetric edge/cloud topology.
-            return (
-                self.lwd_config.edge_npu_count
-                if self.lwd_config.is_edge_node
-                else self.lwd_config.cloud_npu_count
+            # LWD edge-cloud multi-instance: each launch command spawns
+            # its own contiguous rank block of the §4.1 layout. The edge
+            # command spawns ALL edge ranks [0, E); each cloud instance
+            # command (identified by instance_parallel_start_rank) spawns
+            # its own instance block (all dp segments of that instance,
+            # contiguous because the layout is instance-major).
+            if self.lwd_config.is_edge_node:
+                return self.lwd_config.edge_npu_count
+            return self.lwd_config.cloud_npu_count // (
+                self.lwd_config.instance_parallel_size
             )
         return self.world_size // self.nnodes_within_dp
+
+    @property
+    def lwd_global_start_rank(self) -> int:
+        """First global rank owned by this command's executor in LWD
+        multi-instance mode (§4.1 rank layout).
+
+        Edge command: 0 (it spawns every edge rank, dp j's block being
+        ``[j*E_per, (j+1)*E_per)``). Cloud instance i command:
+        ``E + i*D*C`` — the first rank of instance i's contiguous block
+        (the command spans all dp segments of that instance). The
+        executor passes ``lwd_global_start_rank + local_rank`` to each
+        worker, so the standard dp-rank rearrangement in
+        ``init_distributed_environment`` is skipped for LWD.
+        """
+        assert self.lwd_config.enable_lwd
+        if self.lwd_config.is_edge_node:
+            return 0
+        i = self.lwd_config.instance_parallel_start_rank or 0
+        return self.lwd_config.lwd_cloud_first_rank(
+            i, 0, self.data_parallel_size
+        )
 
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
@@ -881,9 +1026,13 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
-        # LWD edge-cloud mode: ``world_size`` spans both sides of the
-        # deployment (per DP instance) so that per-rank bookkeeping (e.g.
-        # ``WorkerProc.all_kwargs``) has a slot for every edge/cloud rank.
+        # LWD edge-cloud mode: ``world_size`` is the GRAND-TOTAL HCCL
+        # world spanning all sides of the deployment — every edge rank
+        # plus every cloud instance's ranks (instance-major, §4.1) — so
+        # that per-rank bookkeeping (e.g. ``WorkerProc.all_kwargs``) has
+        # a slot for every edge/cloud rank and the workers can pass it
+        # straight into ``init_distributed_environment``. With counts as
+        # grand totals, ``edge + cloud`` is exactly that world.
         # NOTE: ``lwd_config.enable_lwd`` is only back-filled later in
         # ``VllmConfig.__post_init__``, so gate on the CLI-provided NPU
         # counts here instead.
@@ -891,6 +1040,33 @@ class ParallelConfig:
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
         ):
+            n = self.lwd_config.instance_parallel_size
+            if (
+                self.lwd_config.cloud_npu_count
+                % (n * self.data_parallel_size)
+                != 0
+            ):
+                raise ValueError(
+                    f"cloud_npu_count ({self.lwd_config.cloud_npu_count}) "
+                    f"must be divisible by instance_parallel_size * "
+                    f"data_parallel_size "
+                    f"({n} * {self.data_parallel_size})"
+                )
+            if self.lwd_config.instance_parallel_start_rank is not None and (
+                self.lwd_config.instance_parallel_start_rank >= n
+                or (
+                    self.lwd_config.edge_npu_count > 0
+                    and self.lwd_config.is_edge_node
+                )
+            ):
+                raise ValueError(
+                    "instance_parallel_start_rank must be in "
+                    f"[0, instance_parallel_size) and set on cloud "
+                    "commands only; got "
+                    f"{self.lwd_config.instance_parallel_start_rank} "
+                    f"(instance_parallel_size={n}, "
+                    f"is_edge_node={self.lwd_config.is_edge_node})"
+                )
             self.world_size = (
                 self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
             )

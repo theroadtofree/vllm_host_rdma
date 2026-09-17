@@ -59,8 +59,6 @@ class LwdBatch:
     batch_type: LwdBatchType
     seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
     batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
-    # 目标云实例(EMBED)/来源云实例(UNEMBED):worker 据此选数据面 wire;
-    # seqno 的配对域 = 单实例 wire,跨实例无需全局唯一。缺省 0 兼容单实例。
     instance_id: int = 0
 
 
