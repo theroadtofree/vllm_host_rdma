@@ -59,6 +59,14 @@ class LwdBatch:
     batch_type: LwdBatchType
     seqno: int  # every batch has a unique seqno, increasing by 1 on every dispatch.
     batch_meta: LwdEmbedBatch | LwdUnembedBatch | None
+    # Cloud instance this batch's data-plane traffic belongs to (0 =
+    # single-instance / unstamped legacy traffic). The data plane routes
+    # every CommRequest onto this instance's channel pair; the per-
+    # instance seqno counters and the comm service's per-instance
+    # channels are two halves of the same contract. Stamped by the edge
+    # scheduler at dispatch time once instance dispatch lands; until
+    # then every batch routes to instance 0 (single-instance behavior).
+    instance_id: int = 0
 
 
 @dataclass

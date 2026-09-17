@@ -1089,7 +1089,9 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
-            help="Total number of cloud NPUs across all DP instances (LWD mode).",
+            help="Total number of cloud NPUs across all DP instances AND "
+                 "all cloud instances (LWD mode); must be divisible by "
+                 "instance-parallel-size * data-parallel-size.",
         )
         parallel_group.add_argument(
             "--instance-parallel-size", type=int, default=1,
@@ -2023,7 +2025,9 @@ class EngineArgs:
                 edge_npu_count=self.edge_npu_count,
                 cloud_npu_count=self.cloud_npu_count,
                 instance_parallel_size=self.instance_parallel_size,
-                instance_parallel_start_rank=self.instance_parallel_start_rank,
+                instance_parallel_start_rank=(
+                    self.instance_parallel_start_rank
+                ),
             ),
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,

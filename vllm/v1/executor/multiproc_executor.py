@@ -169,10 +169,12 @@ class MultiprocExecutor(Executor):
         success = False
         try:
             if self.parallel_config.lwd_config.enable_lwd:
+                # §4.1 multi-instance layout: the executor already owns a
+                # contiguous global rank block — the edge command covers
+                # [0, E_total), cloud instance i's command covers its own
+                # instance block (instance-major, so contiguous).
                 global_start_rank = (
-                    0
-                    if self.parallel_config.lwd_config.is_edge_node
-                    else self.parallel_config.lwd_config.edge_npu_count
+                    self.parallel_config.lwd_global_start_rank
                 )
             else:
                 global_start_rank = (
@@ -287,12 +289,12 @@ class MultiprocExecutor(Executor):
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
-            # Each side's first rank is its own engine's driver worker
-            # (edge rank 0, cloud rank edge_npu_count); the native
+            # Each command's first rank is its own engine's driver worker
+            # (edge rank 0, cloud instance i rank E_total + i*D*C) — the
+            # block base equals ``lwd_global_start_rank``; the native
             # ``rank % tp_size`` picks the wrong worker under the
             # edge-first asymmetric layout.
-            lwd = self.parallel_config.lwd_config
-            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
+            return rank == self.parallel_config.lwd_global_start_rank
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
