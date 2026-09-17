@@ -378,6 +378,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         )
                     ],
                 ),
+                instance_id=idx,
             )
         return True
 
@@ -606,6 +607,9 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
         ),
+        # 来源实例戳:worker 据此选数据面 DOWN wire(down_seqno 配对域
+        # = 单实例 wire,实例号是选 wire 的唯一依据)
+        instance_id=notify.instance_id,
     )
     scheduler_output.lwd_c2e_notify = [notify]
     return scheduler_output
