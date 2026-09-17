@@ -366,6 +366,30 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         "Defaults to data_parallel_size if not specified.",
     )
     parser.add_argument(
+        "--api-server-rpc-port",
+        type=int,
+        default=None,
+        help="LWD multi-instance attach mode (main command): port this "
+        "command listens on for frontend registration. The main command "
+        "starts the engines plus instance 0's API server only; the remaining "
+        "N-1 frontends are separate commands using --api-server-attach, and "
+        "the service only starts once all N registered (count-to-N barrier). "
+        "--api-server-count becomes the total frontend count and must equal "
+        "--instance-parallel-size.",
+    )
+    parser.add_argument(
+        "--api-server-attach",
+        type=str,
+        default=None,
+        help="LWD multi-instance attach mode (attach command): attach "
+        "this command as one extra frontend (one ApiServer, listening on "
+        "this command's own --host/--port) to an already-running main "
+        "command, given as <ip>:<port> where port is the main command's "
+        "--api-server-rpc-port. Skips engine startup and rendezvous; "
+        "requires --instance-parallel-start-rank in [1, "
+        "instance_parallel_size) to select the instance index.",
+    )
+    parser.add_argument(
         "--config",
         help="Read CLI options from a config file. "
         "Must be a YAML with the following options: "
@@ -404,6 +428,12 @@ def validate_parsed_serve_args(args: argparse.Namespace):
         )
 
         validate_multi_port_external_lb_args(args)
+
+    from vllm.entrypoints.openai.lwd.frontend_attach import (
+        validate_frontend_attach_args,
+    )
+
+    validate_frontend_attach_args(args)
 
 
 def create_parser_for_docs() -> FlexibleArgumentParser:

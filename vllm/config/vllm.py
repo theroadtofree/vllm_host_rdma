@@ -861,6 +861,10 @@ class VllmConfig:
         # counts into the aggregated ParallelConfig.lwd_config object.
         additional = self.additional_config if isinstance(self.additional_config, dict) else {}
         self.lwd_config = LwdConfig.from_dict(additional.get("lwd_config") or {})
+        self.parallel_config.lwd_config.validate_instance_parallel(
+            self.parallel_config.data_parallel_size,
+            self.lwd_config.enabled,
+        )
         if self.lwd_config.enabled:
             parallel_lwd = self.parallel_config.lwd_config
             parallel_lwd.enable_lwd = True

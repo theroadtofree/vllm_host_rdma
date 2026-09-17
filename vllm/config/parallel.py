@@ -126,6 +126,14 @@ class LwdParallelConfig:
     """Total number of edge NPUs across all DP instances (LWD mode)."""
     cloud_npu_count: int = Field(default=0, ge=0)
     """Total number of cloud NPUs across all DP instances (LWD mode)."""
+    instance_parallel_size: int = Field(default=1, ge=1, le=16)
+    """Total number of cloud instances (N) in LWD multi-instance
+    deployment. N=1 (default) degenerates to the existing 1:1
+    edge-cloud behavior."""
+    instance_parallel_start_rank: int | None = None
+    """Instance index of this cloud instance, in
+    ``[0, instance_parallel_size)``. Only the cloud side (and edge
+    frontend attach commands) set it."""
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
         """Per-DP-instance edge NPU count."""
@@ -139,6 +147,49 @@ class LwdParallelConfig:
         """True when the LWD edge is a single shared rank across all DP
         instances (one NPU shared by the virtual DP workers)."""
         return (self.enable_lwd and self.edge_npu_count_per_dp(data_parallel_size) == 1 and data_parallel_size > 1)
+
+    def validate_instance_parallel(
+        self, data_parallel_size: int, enable_lwd: bool
+    ) -> None:
+        """Validate LWD multi-instance (instance-parallel) config.
+
+        ``instance_parallel_size``/``instance_parallel_start_rank`` are
+        only valid in LWD mode, and the cloud NPU count must be evenly
+        divisible by ``instance_parallel_size * data_parallel_size`` so
+        every cloud instance gets the same number of NPUs.
+        """
+        multi_instance = (
+            self.instance_parallel_size > 1
+            or self.instance_parallel_start_rank is not None
+        )
+        if not enable_lwd:
+            if multi_instance:
+                raise ValueError(
+                    "--instance-parallel-size/--instance-parallel-start-rank "
+                    "are only valid with LWD (edge-cloud) mode."
+                )
+            return
+        if self.instance_parallel_start_rank is not None and not (
+            0 <= self.instance_parallel_start_rank < self.instance_parallel_size
+        ):
+            raise ValueError(
+                f"instance_parallel_start_rank "
+                f"({self.instance_parallel_start_rank}) must be in "
+                f"[0, instance_parallel_size="
+                f"{self.instance_parallel_size})."
+            )
+        if multi_instance:
+            if self.cloud_npu_count % (
+                self.instance_parallel_size * data_parallel_size
+            ) != 0:
+                raise ValueError(
+                    f"cloud_npu_count ({self.cloud_npu_count}) must be a "
+                    f"multiple of instance_parallel_size * "
+                    f"data_parallel_size "
+                    f"({self.instance_parallel_size} * "
+                    f"{data_parallel_size}) so that each cloud instance "
+                    f"gets the same number of NPUs."
+                )
 
 
 @config
