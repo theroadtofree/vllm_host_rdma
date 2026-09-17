@@ -871,6 +871,16 @@ class VllmConfig:
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
+            # 多实例(instance-parallel)模式下 cloud_npu_count 是所有实例
+            # 的总量(N * D * C);先换算成每实例卡数 C,再推导 TP/world,
+            # 否则并行度被夸大导致维度整除校验失败(对齐 multi_instance
+            # 参考实现 ParallelConfig.__post_init__ edge-cloud 分支)。
+            cloud_divisor = (
+                self.parallel_config.data_parallel_size
+                * parallel_lwd.instance_parallel_size
+            )
+            if cloud_divisor > 1:
+                parallel_lwd.cloud_npu_count //= cloud_divisor
             # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
             # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
             # KV spec/MoE 切分等配置派生量与运行时组态对齐。
