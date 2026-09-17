@@ -879,9 +879,21 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Deferred per-request persist channel for num_accepted_tokens: a
+        # dedicated pinned side buffer (the shared batch-position buffer is
+        # rearranged by input_batch condense/add with no ordering against an
+        # in-flight async D2H) plus the req_ids snapshot identifying rows.
+        self.num_accepted_tokens_persist_cpu: torch.Tensor | None = None
+        self._num_accepted_tokens_persist_req_ids: list[str] | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
+            self.num_accepted_tokens_persist_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
@@ -1514,6 +1526,23 @@ class GPUModelRunner(
         else:
             return None
 
+    def _persist_num_accepted_tokens_to_req_states(self) -> None:
+        """Write the stashed accepted counts into ``CachedRequestState``.
+
+        The values were asynchronously copied device-to-host by
+        :meth:`_update_states_after_model_execute`; callers must synchronize
+        ``num_accepted_tokens_event`` first to guarantee the copy has landed.
+        """
+        req_ids = self._num_accepted_tokens_persist_req_ids
+        if req_ids is None:
+            return
+        assert self.num_accepted_tokens_persist_cpu is not None
+        counts = self.num_accepted_tokens_persist_cpu.numpy()
+        for i, req_id in enumerate(req_ids):
+            if (req_state := self.requests.get(req_id)) is not None:
+                req_state.num_accepted_tokens = int(counts[i])
+        self._num_accepted_tokens_persist_req_ids = None
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1533,6 +1562,19 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        # Stash the per-request accepted count for deferred persistence
+        # (non-blocking; landed into CachedRequestState at the next
+        # _prepare_inputs after num_accepted_tokens_event confirms the copy),
+        # so it survives the batch-position buffer being overwritten by the
+        # next (possibly prefill) batch under prefill/decode phase
+        # alternation (prev_positions == -1) without a blocking sync here.
+        assert self.num_accepted_tokens_persist_cpu is not None
+        self.num_accepted_tokens_persist_cpu[:num_reqs].copy_(
+            self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+        )
+        self._num_accepted_tokens_persist_req_ids = list(
+            self.input_batch.req_ids[:num_reqs]
+        )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -2070,6 +2112,7 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
+            self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]
