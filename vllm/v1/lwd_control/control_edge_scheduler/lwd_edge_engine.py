@@ -29,6 +29,7 @@ import queue
 import threading
 import time
 from collections import defaultdict, deque
+from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.engine import (
@@ -145,8 +146,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         )
         hello_event = threading.Event()
         pump = threading.Thread(
-            target=self._receive_thread,
-            args=(hello_event, set(), 1),
+            target=self._lwd_pump_cloud_messages_push_pull,
+            args=(hello_event,),
             name="lwd-post-in",
             daemon=True,
         )
@@ -159,6 +160,49 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
             )
+
+    def _lwd_pump_cloud_messages_push_pull(
+        self,
+        hello_event: threading.Event,
+    ) -> None:
+        """push_pull 模式(_lwd_setup_zmq_publisher_subscriber)的
+        POST_OUT 泵线程:泵取搬运线程攒下的消息,按消息类型分发。
+
+        HELLO -> retarget PRE_OUT(云端点唯一事实源,首拍一次通告;
+        队满自旋重试)。
+        LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
+        + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
+        引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
+        唤醒任何线程,必须向 input_queue 敲门;WAKEUP 原生语义即丢弃
+        消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
+        其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
+        """
+        receiver = self._edge_receiver
+        publisher = self._edge_sender
+        while not receiver.closed:
+            for msg in receiver.recv_batch(
+                timeout_ms=LWD_POST_OUT_PUMP_TIMEOUT_MS
+            ):
+                if isinstance(msg, LwdHelloNotify):
+                    endpoint = f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
+                    if not hello_event.is_set():
+                        logger.info(
+                            "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s",
+                            endpoint,
+                        )
+                    while not publisher.retarget(endpoint):
+                        if receiver.closed:
+                            break
+                        logger.warning(
+                            "[Lwd] PRE_OUT retarget deferred (queue full), "
+                            "retrying",
+                        )
+                        threading.Event().wait(0.05)
+                    hello_event.set()
+                elif isinstance(msg, LwdC2eNotify):
+                    self._lwd_dispatch_c2e_notify(msg)
+                else:
+                    self._lwd_drop_unexpected_frame(msg)
 
     def _lwd_setup_zmq_router_dealer(self, config: LwdConfig) -> None:
         """full_duplex 模式装配:边 bind 单 ROUTER 端口服务 N 个云 DEALER,
@@ -178,7 +222,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         ready_instances: set[int] = set()
         self._lwd_hello_ready = ready_instances
         pump = threading.Thread(
-            target=self._receive_thread,
+            target=self._lwd_pump_cloud_messages_router_dealer,
             args=(hello_event, ready_instances, config.instance_count),
             name="lwd-post-in",
             daemon=True,
@@ -212,53 +256,26 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 sorted(wire_ready),
             )
 
-    def _receive_thread(
+    def _lwd_pump_cloud_messages_router_dealer(
         self,
         hello_event: threading.Event,
         ready_instances: set[int],
         instance_count: int,
     ) -> None:
-        """POST_OUT 泵线程:泵取搬运线程攒下的消息,按消息类型分发。
+        """full_duplex/router_dealer 模式(_lwd_setup_zmq_router_dealer)
+        的 POST_OUT 泵线程:泵取通道层攒下的消息,按消息类型分发。
 
-        HELLO -> push_pull:retarget PRE_OUT(云端点唯一事实源,首拍一次
-        通告;队满自旋重试);full_duplex:按 instance_id 收集集合屏障,
-        收齐 N 个不同实例才放行(重复 HELLO 幂等,越界实例号 error 丢弃
-        ——说明该云实例的 start-rank 配置在 [0,N) 之外)。
-        LwdC2eNotify(云->边唯一载荷)-> 载荷队列(阻塞 put,不可丢)
-        + WAKEUP 唤醒主循环:prefill 全部完成后请求转入 awaiting,
-        引擎无排程工作、阻塞在 input_queue.get(),载荷只进队列不会
-        唤醒任何线程,必须向 input_queue 敲门;WAKEUP 原生语义即丢弃
-        消息体,数据与唤醒分离,多投无害(空 drain 一步即返回)。
-        其余帧(坏帧已被订阅层丢弃后仍不认识的类型)告警丢弃。
+        HELLO -> 按 instance_id 收集集合屏障,收齐 N 个不同实例才
+        放行(重复 HELLO 幂等,越界实例号 error 丢弃——说明该云实例
+        的 start-rank 配置在 [0,N) 之外)。
         """
         receiver = self._edge_receiver
-        publisher = self._edge_sender
         while not receiver.closed:
             for msg in receiver.recv_batch(
                 timeout_ms=LWD_POST_OUT_PUMP_TIMEOUT_MS
             ):
                 if isinstance(msg, LwdHelloNotify):
-                    if self._lwd_zmq_mode == "push_pull":
-                        endpoint = (
-                            f"tcp://{msg.pre_out_host}:{msg.pre_out_port}"
-                        )
-                        if not hello_event.is_set():
-                            logger.info(
-                                "[Lwd] cloud discovered via HELLO: "
-                                "PRE_OUT -> %s",
-                                endpoint,
-                            )
-                        while not publisher.retarget(endpoint):
-                            if receiver.closed:
-                                break
-                            logger.warning(
-                                "[Lwd] PRE_OUT retarget deferred "
-                                "(queue full), retrying",
-                            )
-                            threading.Event().wait(0.05)
-                        hello_event.set()
-                        continue
-                    # full_duplex:集合屏障(实例号取业务戳)
+                    # 集合屏障(实例号取业务戳)
                     iid = msg.instance_id
                     if not 0 <= iid < instance_count:
                         logger.error(
@@ -273,8 +290,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     if iid not in ready_instances:
                         ready_instances.add(iid)
                         logger.info(
-                            "[Lwd] cloud instance %d ready via HELLO "
-                            "(%d/%d)",
+                            "[Lwd] cloud instance %d ready via HELLO (%d/%d)",
                             iid,
                             len(ready_instances),
                             instance_count,
@@ -282,48 +298,49 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         if len(ready_instances) >= instance_count:
                             hello_event.set()
                 elif isinstance(msg, LwdC2eNotify):
-                    iid = msg.instance_id
-                    if not 0 <= iid < self._lwd_instance_count:
-                        # 云侧 start-rank 配错(fail-loud 不 fail-fast:
-                        # 坏戳不污染批队列,实例屏障/看门狗另行定位)
-                        logger.error(
-                            "[Lwd] drop C2eNotify with out-of-range "
-                            "instance_id=%d (expect [0, %d)); reqs=%d "
-                            "down_seqno=%s — this cloud has a misconfigured "
-                            "--instance-parallel-start-rank",
-                            iid,
-                            self._lwd_instance_count,
-                            len(getattr(msg, "req_ids", []) or []),
-                            getattr(msg, "down_seqno", None),
-                        )
-                        continue
-                    bucket = self._lwd_c2e_pending.setdefault(iid, deque())
-                    # 元素带到达时间戳:消费滞后(c2e_wait=到达→派发)
-                    # 是"边消费不动 → 云 publisher 队满小睡"闭环的前置指标
-                    bucket.append((msg, time.monotonic()))
-                    if len(bucket) > LWD_C2E_META_QUEUE_MAX:
-                        # 本地桶水位越过告警线:引擎步排水停滞(正常背压
-                        # 应止步于通道层 per-identity FIFO)
-                        logger.warning(
-                            "[Lwd] c2e pending bucket for instance %d at %d "
-                            "(edge engine consumption stalled?)",
-                            iid,
-                            len(bucket),
-                        )
-                    logger.info(
-                        "[Lwd][edge-ctrl] C2eNotify inst=%d reqs=%d "
-                        "down_seqno=%s",
-                        iid,
-                        len(getattr(msg, "req_ids", []) or []),
-                        getattr(msg, "down_seqno", None),
-                    )
-                    self.input_queue.put_nowait(
-                        (EngineCoreRequestType.WAKEUP, None)
-                    )
+                    self._lwd_dispatch_c2e_notify(msg)
                 else:
-                    logger.warning(
-                        "[Lwd] drop unexpected POST_OUT frame %r", type(msg)
-                    )
+                    self._lwd_drop_unexpected_frame(msg)
+
+    def _lwd_dispatch_c2e_notify(self, msg: LwdC2eNotify) -> None:
+        """两种 ZMQ 模式共用的 C2eNotify 分发(见泵线程 docstring)。"""
+        iid = msg.instance_id
+        if not 0 <= iid < self._lwd_instance_count:
+            # 云侧 start-rank 配错(fail-loud 不 fail-fast:坏戳不污染
+            # 批队列,实例屏障/看门狗另行定位)
+            logger.error(
+                "[Lwd] drop C2eNotify with out-of-range instance_id=%d "
+                "(expect [0, %d)); reqs=%d down_seqno=%s — this cloud has "
+                "a misconfigured --instance-parallel-start-rank",
+                iid,
+                self._lwd_instance_count,
+                len(getattr(msg, "req_ids", []) or []),
+                getattr(msg, "down_seqno", None),
+            )
+            return
+        bucket = self._lwd_c2e_pending.setdefault(iid, deque())
+        # 元素带到达时间戳:消费滞后(c2e_wait=到达→派发)是
+        # "边消费不动 → 云 publisher 队满小睡"闭环的前置指标
+        bucket.append((msg, time.monotonic()))
+        if len(bucket) > LWD_C2E_META_QUEUE_MAX:
+            # 本地桶水位越过告警线:引擎步排水停滞(正常背压应止步于
+            # 通道层 per-identity FIFO)
+            logger.warning(
+                "[Lwd] c2e pending bucket for instance %d at %d "
+                "(edge engine consumption stalled?)",
+                iid,
+                len(bucket),
+            )
+        logger.info(
+            "[Lwd][edge-ctrl] C2eNotify inst=%d reqs=%d down_seqno=%s",
+            iid,
+            len(getattr(msg, "req_ids", []) or []),
+            getattr(msg, "down_seqno", None),
+        )
+        self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+
+    def _lwd_drop_unexpected_frame(self, msg: Any) -> None:
+        logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
     def _lwd_shutdown_planes(self) -> None:
         """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
