@@ -887,6 +887,16 @@ class GPUModelRunner(
         self._lwd_spec_persist_enabled = bool(
             self.num_spec_tokens and self.parallel_config.lwd_config.enable_lwd
         )
+        # LWD-only: per-request draft-token stash for phase-alternation
+        # resume. The batch-scoped _draft_token_ids is overwritten by every
+        # propose (including intervening prefill steps), and the
+        # prev_index-based refill in _prepare_input_ids only reaches one
+        # batch back -- a decode request returning after a prefill step
+        # would otherwise run its spec slots on stale placeholders. Rows
+        # are kept as device views (no copies); entries are refreshed every
+        # decode step the request participates in and pruned when the
+        # request leaves. Populated on the ascend runner side.
+        self._lwd_draft_stash: dict[str, torch.Tensor] = {}
         self.num_accepted_tokens_persist_cpu: torch.Tensor | None = None
         self._num_accepted_tokens_persist_req_ids: list[str] | None = None
         if self.num_spec_tokens:
@@ -1827,9 +1837,30 @@ class GPUModelRunner(
         max_flattened_index = -1
         total_num_spec_tokens = 0
 
+        resumed_spec_indices: list[int] = []
+        resumed_draft_rows: list[torch.Tensor] = []
         for cur_index in range(num_reqs):
             prev_index = prev_positions[cur_index]
             if prev_index < 0:
+                # LWD 相位交替恢复:上一步缺席的请求,批次级草稿 stash
+                # 已被中间步的 propose 覆写,且 prev_index 映射只够得着
+                # 上一批——改从按请求持久化的草稿 stash 重挂。该请求
+                # 缺席期间无新 token 提交,其最后一个 decode 步的草稿
+                # 仍合法。
+                if self._lwd_spec_persist_enabled:
+                    req_id = self.input_batch.req_ids[cur_index]
+                    draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                    row = self._lwd_draft_stash.get(req_id)
+                    if (
+                        draft_len > 0
+                        and row is not None
+                        and row.numel() >= draft_len
+                    ):
+                        last_index = cu_num_tokens[cur_index].item() - 1
+                        resumed_spec_indices.extend(
+                            range(last_index - draft_len + 1, last_index + 1)
+                        )
+                        resumed_draft_rows.append(row[:draft_len])
                 continue
             prev_indices.append(prev_index)
             req_id = self.input_batch.req_ids[cur_index]
@@ -1865,6 +1896,20 @@ class GPUModelRunner(
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+        if resumed_spec_indices:
+            # LWD 相位交替恢复请求的草稿重挂:上面的全量拷贝刚把占位/
+            # 陈旧值带上卡,此处用按请求持久化 stash 里的真实草稿覆写
+            # 其 spec 槽位。resumed 请求存在时全量拷贝必然已执行
+            # (num_common < total_without_spec),顺序安全;且必须置于
+            # 下方 num_common_tokens == 0 的提前返回之前(纯恢复批
+            # 会走那里)。
+            resumed_idx = torch.tensor(
+                resumed_spec_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            resumed_src = torch.cat(resumed_draft_rows).to(dtype=torch.int32)
+            self.input_ids.gpu.scatter_(
+                dim=0, index=resumed_idx, src=resumed_src
+            )
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
