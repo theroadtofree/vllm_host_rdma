@@ -606,6 +606,7 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
             recv_num_elements=notify.hidden_num_elements,
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
+            token_ids=[list(t) for t in notify.token_ids],
         ),
         # 来源实例戳:worker 据此选数据面 DOWN wire(down_seqno 配对域
         # = 单实例 wire,实例号是选 wire 的唯一依据)
