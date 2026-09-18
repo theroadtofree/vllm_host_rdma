@@ -51,12 +51,7 @@ class LwdConfig:
     hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
     scheduler_name: str = "prefill_first"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
-    # 本云实例索引(--instance-parallel-start-rank,None 归一化为 0):
-    # DEALER identity / 业务 HELLO 戳 / c2e 戳三处同源的唯一事实源;
-    # 边侧恒 0(单边进程服务所有实例)
     instance_id: int = 0
-    # 云实例总数(--instance-parallel-size,边侧消费:ROUTER 服务数与
-    # N-HELLO 屏障的收齐目标;云侧消费:S5 注册交叉校验);坏值回退 1
     instance_count: int = 1
     debug: bool = False
 

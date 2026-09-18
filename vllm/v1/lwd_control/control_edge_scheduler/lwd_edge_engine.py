@@ -109,7 +109,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # (full_duplex 单通道无发布面换址概念)
         self._lwd_zmq_mode = "full_duplex"
         self._lwd_setup_zmq_router_dealer(config)
-        # self._lwd_setup_zmq(config)
+        # self._lwd_setup_zmq_publisher_subscriber(config)
         self.scheduler.lwd_edge_publisher = self._edge_sender
         logger.info(
             "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
@@ -119,7 +119,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
     # ------------------------------------------------------------------ #
     # 通信面                                                              #
     # ------------------------------------------------------------------ #
-    def _lwd_setup_zmq(self, config: LwdConfig) -> None:
+    def _lwd_setup_zmq_publisher_subscriber(self, config: LwdConfig) -> None:
         """构造期装配通信面(与云侧 _lwd_setup_zmq 同构):
         bind POST_OUT 订阅面(内部搬运线程)+ 延迟连接的 PRE_OUT 发布面,
         云端点由 HELLO 通告决定(边不预知云地址);泵线程泵取搬运线程攒下
