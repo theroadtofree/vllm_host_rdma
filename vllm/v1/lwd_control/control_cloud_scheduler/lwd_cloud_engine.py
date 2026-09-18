@@ -396,6 +396,11 @@ class LwdCloudEngineCore(EngineCoreProc):
             for outputs in engine_core_outputs.values():
                 for rid in outputs.finished_requests or ():
                     ids_by_req.setdefault(rid, [])
+            if not ids_by_req:
+                # 空步(无输出也无完结):空通告没有任何可交付内容,
+                # 发了只会让边侧白醒来一次并空派一个 UNEMBED 批占配额,
+                # 直接跳过。
+                return model_output
             req_ids = list(ids_by_req)
             from vllm.v1.outputs import LwdC2eMeta
 
