@@ -70,9 +70,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         # = 构造抛异常,与边侧同一错误路径。传输模式经 zmq_mode 选择,
         # 边云两侧必须一致。
         self._lwd_setup_zmq_router_dealer()
-        # self._lwd_setup_zmq()
+        # self._lwd_setup_zmq_publisher_subscriber()
 
-    def _lwd_setup_zmq(self) -> None:
+    def _lwd_setup_zmq_publisher_subscriber(self) -> None:
         """构造期装配通信面:PRE_OUT bind 收边(内部搬运线程)+ POST_OUT
         connect 边,承载首拍 HELLO 通告与步内元数据。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
