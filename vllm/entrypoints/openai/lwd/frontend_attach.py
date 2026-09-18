@@ -836,11 +836,13 @@ def run_attach_api_server(args):
         api_server_manager.shutdown()
 
 
-def dispatch_attach_mode(args) -> bool:
-    """Handle attach command dispatch / main-command attach defaults.
+def lwd_dispatch_attach_frontend(args) -> bool:
+    """Dispatch the LWD attach command, or apply the main command's
+    attach-mode defaults.
 
-    Returns ``True`` when the command was fully handled (attach command),
-    in which case the caller should return immediately.
+    Returns ``True`` only when this process is an attach command and its
+    frontend was fully launched and handled here, in which case the
+    caller should return immediately.
     """
     if getattr(args, "api_server_attach", None) is not None:
         run_attach_api_server(args)
