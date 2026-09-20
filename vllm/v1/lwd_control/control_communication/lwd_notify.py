@@ -12,14 +12,28 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
 
+class LwdRangeItem(msgspec.Struct, gc=False):
+    """批量范围预告条目(mixed 组批);offset 预留 chunk 支持,
+    整体 prefill 组批下恒 0(整 prompt 一步排程)。"""
+
+    request_id: str
+    offset: int
+    num_tokens: int
+
+
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     """边->云调度范围预告(PRE_OUT);offset/num_tokens 取自原生调度决策,
-    重复预告按 (request_id, offset) 幂等登记(边侧队满重试天然产生重复)。"""
+    重复预告按 (request_id, offset) 幂等登记(边侧队满重试天然产生重复)。
+
+    items(mixed 组批):本批全部条目,一个批一个 seqno;空 = 旧版单请求
+    语义(顶层 request_id/offset/num_tokens)。新版边侧恒填 items 且顶层
+    字段 = 首条目;新云侧优先读 items。"""
 
     request_id: str
     offset: int
     num_tokens: int
     seqno: int
+    items: list[LwdRangeItem] = []
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):

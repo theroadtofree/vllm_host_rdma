@@ -37,9 +37,14 @@ def lwd_resolve_engine_cls(vllm_config):
 
 
 def lwd_serve_guard(vllm_config) -> None:
-    """serve 入口守卫:云角色经 _lwd_cloud_deploy_guard 校验后注入相位调度器;
-    云引擎类由子进程内 lwd_resolve_engine_cls 解析,边调度器由引擎自注入。"""
+    """serve 入口守卫:云角色经 _lwd_cloud_deploy_guard 校验后按
+    scheduler_name 注入调度器(mixed 默认混排;prefill_first/decode_first
+    旧相位机);云引擎类由子进程内 lwd_resolve_engine_cls 解析,边调度器
+    由引擎自注入。"""
     from vllm.logger import init_logger
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_mixed_scheduler import (
+        LwdCloudMixedScheduler,
+    )
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
         LwdCloudPhaseScheduler,
     )
@@ -54,9 +59,14 @@ def lwd_serve_guard(vllm_config) -> None:
     if config.is_edge_node:
         return
     _lwd_cloud_deploy_guard(vllm_config, config)
-    vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+    vllm_config.scheduler_config.scheduler_cls = (
+        LwdCloudPhaseScheduler
+        if config.scheduler_name in ("prefill_first", "decode_first")
+        else LwdCloudMixedScheduler
+    )
     init_logger(__name__).info(
-        "[Lwd] prefill_only cloud: phase scheduler injected (construction-time)"
+        "[Lwd] prefill_only cloud: %s scheduler injected (construction-time)",
+        config.scheduler_name,
     )
 
 
