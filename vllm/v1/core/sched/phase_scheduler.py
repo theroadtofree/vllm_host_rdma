@@ -4,7 +4,9 @@
 仿 LWD prefill_only 云侧相位调度的调度语义,但不依赖任何 LWD 数据面:
 每步只排程一种相位——prefill 步单请求(不组批),decode 步收全部
 decode 态请求;相位优先级与 prefill_only 相同(有 waiting 或 prefill
-尾巴即 prefill);无禁连续 prefill 不变量(与 0920 实验分支对齐)。
+尾巴即 prefill)。禁连续两步 prefill 不变量由
+VLLM_PHASE_NO_CONSECUTIVE_PREFILL 控制(默认 1,与 prefill_only 生产
+行为一致;置 0 对齐 0920 实验分支的连续 prefill 语义)。
 
 与 LwdCloudPhaseScheduler 的唯一差异是 prefill 的请求来源:集中式没有
 边侧 RangeNotify 点名,prefill 步按「running 中的 prefill 尾巴优先、
@@ -14,6 +16,8 @@ decode 态请求;相位优先级与 prefill_only 相同(有 waiting 或 prefill
 """
 
 from __future__ import annotations
+
+import os
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -34,9 +38,19 @@ class CentralizedPhaseScheduler(LwdBaseScheduler):
         # 双标志显式定向,按偏好取反会错翻,造成空步死循环。
         self._force_prefill_once: bool = False
         self._force_decode_once: bool = False
+        # 禁连续两步 prefill 不变量(开关):VLLM_PHASE_NO_CONSECUTIVE_PREFILL
+        # 默认 1(与 prefill_only 生产行为一致);置 0 允许连续 prefill
+        # (对齐 0920 实验分支语义),用于 TTFT/ITL 权衡对照。
+        self._no_consecutive_prefill: bool = os.environ.get(
+            "VLLM_PHASE_NO_CONSECUTIVE_PREFILL", "1"
+        ) == "1"
+        # 上一个非空步是否为 prefill,驱动该不变量
+        self._last_step_was_prefill: bool = False
         logger.info(
             "[phase-sched] centralized phase scheduler: single-request "
-            "prefill batches, prefill_first priority (experiment arm)"
+            "prefill batches, prefill_first priority, "
+            "no_consecutive_prefill=%s (experiment arm)",
+            self._no_consecutive_prefill,
         )
 
     # ------------------------------------------------------------------ #
@@ -91,8 +105,7 @@ class CentralizedPhaseScheduler(LwdBaseScheduler):
     # schedule
     # ------------------------------------------------------------------ #
     def schedule(self) -> SchedulerOutput:
-        # 相位偏好与 prefill_only(prefill_first)一致;无禁连续 prefill
-        # 不变量(0920 实验分支语义)
+        # 相位偏好与 prefill_only(prefill_first)一致
         prefer_prefill = bool(self.waiting) or self._has_prefill_tails()
         if self._force_prefill_once:
             self._force_prefill_once = False
@@ -100,12 +113,24 @@ class CentralizedPhaseScheduler(LwdBaseScheduler):
         elif self._force_decode_once:
             self._force_decode_once = False
             prefer_prefill = False
+        # 不变量(开关控制):prefill 不连续执行两步;仅当中间的 decode
+        # 步为空时才允许连续,空 decode 步经 _force_prefill_once 翻回。
+        if (
+            self._no_consecutive_prefill
+            and prefer_prefill
+            and self._last_step_was_prefill
+            and self.running
+        ):
+            prefer_prefill = False
+        self._last_step_was_prefill = False
 
         if prefer_prefill:
             out = self._schedule_pure_prefill()
             if self._is_empty(out) and self.running:
                 # prefill 受 KV 压力阻塞:放行空步,下一步转 decode 泄压
                 self._force_decode_once = True
+            else:
+                self._last_step_was_prefill = True
             return out
         out = self._schedule_pure_decode()
         if self._is_empty(out) and (self.waiting or self._has_prefill_tails()):
