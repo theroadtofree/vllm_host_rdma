@@ -55,11 +55,13 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 混排步消费的间隔与中间插入的 decode-only 步数)
         self._lwd_sched_step = 0
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 占预算与 KV);k = num_spec_tokens,无 spec 配置即 1
+        # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
+        # 缺省 None 按 0),无 spec 配置即 1
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        self._lwd_spec_factor: int = (
-            1 + spec_config.num_spec_tokens if spec_config is not None else 1
+        num_spec = (
+            getattr(spec_config, "num_speculative_tokens", None) or 0
         )
+        self._lwd_spec_factor: int = 1 + num_spec
         logger.info(
             "[Lwd] cloud mixed scheduler: whole-prefill batches mixed with "
             "decode (one notify consumed per step at most, spec_factor=%d)",

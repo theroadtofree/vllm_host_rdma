@@ -116,13 +116,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
-        # 同样占预算与 KV);k = num_spec_tokens,无 spec 配置即 1。
+        # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
+        # 求值,缺省 None 按 0),无 spec 配置即 1。
         # 边云 max_num_batched_tokens/max_num_seqs 部署对齐(同值),故
         # cap 直接读本地配置(设计 §2.3,配置对齐为部署约束)
         spec_config = getattr(self.vllm_config, "speculative_config", None)
-        self._lwd_spec_factor: int = (
-            1 + spec_config.num_spec_tokens if spec_config is not None else 1
+        num_spec = (
+            getattr(spec_config, "num_speculative_tokens", None) or 0
         )
+        self._lwd_spec_factor: int = 1 + num_spec
         # mixed 开关:与云侧调度器选择同源(scheduler_name,部署双侧同值)。
         # 非 mixed(prefill_first/decode_first 逃生通道)= 旧单请求组批语义:
         # 只取队首、允许原生截断成 chunk、不做整 prompt 核验
