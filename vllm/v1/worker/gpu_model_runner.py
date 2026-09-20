@@ -879,14 +879,13 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
-        # LWD-only: deferred per-request persist channel for
-        # num_accepted_tokens (pinned side buffer + req_ids snapshot),
-        # consumed by the phase-alternation fallback in _prepare_inputs.
-        # Isolated behind the LWD master switch so native (non-LWD)
-        # deployments keep the previous behavior bit-for-bit.
-        self._lwd_spec_persist_enabled = bool(
-            self.num_spec_tokens and self.parallel_config.lwd_config.enable_lwd
-        )
+        # Deferred per-request persist channel for num_accepted_tokens
+        # (pinned side buffer + req_ids snapshot), consumed by the
+        # phase-alternation fallback in _prepare_inputs.
+        # 实验分支(perf_test_pd):门控放宽为纯 spec 开关——相位交替
+        # 并非 LWD 特有,集中式相位调度对照臂(及原生抢占恢复)走同一条
+        # prev_positions == -1 路径,需要同一套缺席恢复链。
+        self._lwd_spec_persist_enabled = bool(self.num_spec_tokens)
         # LWD-only: per-request draft-token stash for phase-alternation
         # resume. The batch-scoped _draft_token_ids is overwritten by every
         # propose (including intervening prefill steps), and the
