@@ -218,25 +218,30 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         调度其请求(按公告量钳制本步预算,照单执行;按原队列归位,
         waiting/skipped 来源走原生准入);没有则空集进窗口,等价空步,
         三队列原样保留。"""
-        notify = q.popleft() if (q := self.prefill_notify_queue) else None
-        if notify is not None and notify.request_id not in self.requests:
-            # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
-            notify = None
-        if notify is not None:
-            logger.info(
-                "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
-                notify.request_id, notify.seqno, notify.num_tokens,
-            )
+        q = self.prefill_notify_queue
+        if not q:
+            return self._lwd_schedule_for_visible_reqs([])
+        # peek 而非 popleft:队首请求可能尚未准入(RequestNotify 走
+        # input_queue ADD,RangeNotify 直接进本队列,两者有时序 race)。
+        # 直接 pop+丢弃会丢掉该 chunk,造成 UP seqno 空洞 → 数据面 recv
+        # 端按序 hold → 云侧 prefill 卡死、decode 停摆(边侧空闲、云侧
+        # 空转的根因)。请求未准入时本步空排,等下一轮 ADD 处理后再消费。
+        notify = q[0]
+        if notify.request_id not in self.requests:
+            return self._lwd_schedule_for_visible_reqs([])
+        q.popleft()
+        logger.info(
+            "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
+            notify.request_id, notify.seqno, notify.num_tokens,
+        )
         # 边侧是 prefill 切块权威,云侧按预告 chunk 钳制本步预算执行
         # (只收紧不放宽原生上限):num_scheduled_tokens == 公告量,边云
         # 锁步;mamba align 的块对齐复切在原生路径内照常生效(边侧
         # chunk 块对齐时为 no-op)。
         out = self._lwd_schedule_for_visible_reqs(
-            [notify.request_id] if notify is not None else [],
-            token_budget_cap=notify.num_tokens if notify is not None else None,
+            [notify.request_id],
+            token_budget_cap=notify.num_tokens,
         )
-        if notify is None:
-            return out
         if not out.num_scheduled_tokens:
             # 未实际准入(典型 KV 压力空步):预告塞回队首原位,decode
             # 泄压后重新点名;本步不挂 lwd_batch,不向 worker 预告配对号
