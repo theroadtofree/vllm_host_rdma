@@ -67,6 +67,68 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             "decode (one notify consumed per step at most, spec_factor=%d)",
             self._lwd_spec_factor,
         )
+        # spec 接受率累计器(引擎进程内直出):LWD 云前端没有注册请求,
+        # 前端 stats 链(output_processor 丢弃未知请求输出 + lifespan
+        # 周期任务)在云侧不可靠;接受率数据的源头本来就在调度器里,
+        # 此处按原生口径(scheduler.py:1414-1424)累计并周期直出,
+        # 与集中式的 Prometheus 计数器/前端日志同公式可直接对比
+        self._lwd_spec_drafts = 0
+        self._lwd_spec_draft_tokens = 0
+        self._lwd_spec_accepted = 0
+        self._lwd_spec_last_log = time.monotonic()
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
+        再走原生输出处理。"""
+        self._lwd_observe_spec_acceptance(scheduler_output, model_runner_output)
+        return super().update_from_output(scheduler_output, model_runner_output)
+
+    _LWD_SPEC_LOG_INTERVAL_S = 10.0
+
+    def _lwd_observe_spec_acceptance(
+        self, scheduler_output, model_runner_output
+    ) -> None:
+        """逐请求累计草稿/接受数并周期打运行总计。
+
+        口径与原生完全一致:num_draft_tokens = len(scheduled_spec_token_ids),
+        num_accepted = len(generated_token_ids) - 1(含 bonus,减一剔除);
+        跳过已终结/未知请求(与原生 :1403-1412 同款过滤)。"""
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return
+        sampled = model_runner_output.sampled_token_ids
+        req_id_to_index = model_runner_output.req_id_to_index
+        for req_id, spec_ids in spec_tokens.items():
+            if not spec_ids:
+                continue
+            request = self.requests.get(req_id)
+            if request is None or request.is_finished():
+                continue
+            req_index = req_id_to_index.get(req_id)
+            if req_index is None:
+                continue
+            generated = sampled[req_index] if sampled else []
+            if not generated:
+                continue
+            self._lwd_spec_draft_tokens += len(spec_ids)
+            self._lwd_spec_accepted += len(generated) - 1
+            self._lwd_spec_drafts += 1
+        now = time.monotonic()
+        if now - self._lwd_spec_last_log < self._LWD_SPEC_LOG_INTERVAL_S:
+            return
+        self._lwd_spec_last_log = now
+        if not self._lwd_spec_draft_tokens:
+            return
+        rate = self._lwd_spec_accepted / self._lwd_spec_draft_tokens * 100
+        mean_accept_len = 1 + self._lwd_spec_accepted / max(
+            self._lwd_spec_drafts, 1
+        )
+        logger.info(
+            "[Lwd][spec] cumulative: rate=%.1f%% mean_accept_len=%.2f "
+            "accepted=%d draft_tokens=%d drafts=%d",
+            rate, mean_accept_len, self._lwd_spec_accepted,
+            self._lwd_spec_draft_tokens, self._lwd_spec_drafts,
+        )
 
     @staticmethod
     def _lwd_is_decode(request) -> bool:
