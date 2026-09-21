@@ -313,48 +313,19 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 供 min_tokens 判定;云侧无客户端 generation_config,传空。
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
-        # prompt-embeds 语义挂零缓冲,行数即 prompt 长度(UP 注入直接写
-        # 该缓冲的对应窗口);prompt 段 is_token_ids 强制 False,目标侧
-        # 恒走注入 embeds,与 ids 是否真实无关。
-        # prompt_token_ids(token_id 上线路,精度排查手段):边侧转发真实
-        # ids 且长度吻合时携带——draft 首遍因此可走原生 token-id 路径
-        # (ids=None 的占位零值污染面整体消失);长度不符/空链(旧版边
-        # 侧)回退 ids=None 既有形态。正式方案上线前移除。
+        # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
+        # 行数即 prompt 长度(UP 注入直接写该缓冲的对应窗口);
+        # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
+        # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
         prompt_ids: list[int] | None = None
-        if wire.prompt_token_ids:
-            if len(wire.prompt_token_ids) == wire.num_prompt_tokens:
-                prompt_ids = list(wire.prompt_token_ids)
-            else:
-                logger.warning(
-                    "[Lwd] req=%s prompt_token_ids len %d != num_prompt_tokens "
-                    "%d; falling back to ids=None",
-                    wire.request_id, len(wire.prompt_token_ids),
-                    wire.num_prompt_tokens,
-                )
-        # VLLM_ASCEND_LWD_TARGET_TOKEN_IDS=1(精度排查探针,用完即弃):
-        # 目标侧也走 token-id 路径——不挂占位 embeds,prompt 段
-        # is_token_ids 落原生 True,云侧目标模型完全由真实 id 驱动
-        # (注入仍照常收发保持通道配对,但值不再被消费)。用于二分
-        # 「embeds 注入链是否为精度问题触发器」。
-        target_token_ids = (
-            os.environ.get("VLLM_ASCEND_LWD_TARGET_TOKEN_IDS") == "1"
-            and prompt_ids is not None
-        )
-        prompt_is_token_ids = (
-            [False] * wire.num_prompt_tokens if prompt_ids is not None else None
-        )
-        prompt_embeds = None if target_token_ids else torch.zeros(
+        prompt_embeds = torch.zeros(
             wire.num_prompt_tokens,
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
         )
-        if target_token_ids:
-            prompt_is_token_ids = None
         logger.info(
-            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=%s+embeds_buf%s",
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=none+embeds_buf",
             wire.request_id, wire.num_prompt_tokens,
-            "real" if prompt_ids is not None else "none",
-            " TARGET_TOKEN_IDS" if target_token_ids else "",
         )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
@@ -365,13 +336,11 @@ class LwdCloudEngineCore(EngineCoreProc):
                 prompt_embeds=prompt_embeds,
                 sampling_params=sampling_params,
                 pooling_params=None,
-                prompt_is_token_ids=prompt_is_token_ids,
             )
             # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
             # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
             # 单程 240ms+,是 prefill SO 开工延迟的主因。
-            if prompt_embeds is not None:
-                request.lwd_embeds_placeholder = True
+            request.lwd_embeds_placeholder = True
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
@@ -392,10 +361,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             sampling_params=sampling_params,
             pooling_params=None,
             block_hasher=block_hasher,
-            prompt_is_token_ids=prompt_is_token_ids,
         )
-        if prompt_embeds is not None:
-            request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
         return request
     
     def step_with_batch_queue(self):

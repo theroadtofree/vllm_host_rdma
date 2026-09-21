@@ -395,7 +395,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
-            prompt_token_ids=list(request.prompt_token_ids),
         )
         with self._instance_binding(idx):
             super().add_request(request)
@@ -516,17 +515,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_prompt_tokens: int,
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
-        prompt_token_ids: list[int] | None = None,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
 
         block_hashes = prompt 全量满块哈希链(自位置 0 起)。云侧
         prompt token 是占位零值,本地算不出真实内容哈希,前缀缓存
         命中只能靠这条链;缺省空链 = 不提供,云侧回退占位链。
-
-        prompt_token_ids(token_id 上线路,精度排查手段):真实 prompt
-        ids 原样转发(边是 id 唯一产生源,无分叉);正式方案上线前
-        移除,届时云侧回退 ids=None 既有形态。
 
         sampling_params 只透传影响云侧 token 选择的字段(采样核/惩罚/
         EOS 策略/min_tokens);stop 字符串等 detokenizer 层参数留在
@@ -550,9 +544,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 sp.max_tokens if sp is not None and sp.max_tokens is not None else 16
             ),
             block_hashes=block_hashes if block_hashes is not None else [],
-            prompt_token_ids=(
-                list(prompt_token_ids) if prompt_token_ids is not None else []
-            ),
             temperature=sp.temperature if sp is not None else 1.0,
             top_p=sp.top_p if sp is not None else 1.0,
             top_k=sp.top_k if sp is not None else 0,
