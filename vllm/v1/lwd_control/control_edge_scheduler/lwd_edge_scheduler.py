@@ -108,6 +108,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_gen_chain_sent: dict[str, int] = {}
         # 租户 HMAC hasher 惰性缓存(避免每请求重读密钥文件)
         self._lwd_hasher_cache = None
+        # 探前缀客户端惰性缓存(复用 hasher/tenant_key,避免每请求读文件重建)
+        self._lwd_probe_client_cache = None
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -274,16 +276,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 LwdEdgePrefixClient,
             )
 
-            with open(coord_cfg.tenant_key_file, "rb") as f:
-                tenant_key = f.read()
-            client = LwdEdgePrefixClient(
-                coord_cfg.control_url,
-                vllm_config.cache_config.block_size,
-                tenant_key,
-                edge_id=self._lwd_edge_id,
-                consumer_id=coord_cfg.consumer_id,
-                connect_timeout=coord_cfg.connect_timeout,
-            )
+            client = self._lwd_probe_client_cache
+            if client is None:
+                with open(coord_cfg.tenant_key_file, "rb") as f:
+                    tenant_key = f.read()
+                # 探前缀客户端复用(hasher/密钥只建一次),并把总超时钳到
+                # 3s:死锁残余时快速 fail-open,避免边侧主循环 10s 级卡顿。
+                client = LwdEdgePrefixClient(
+                    coord_cfg.control_url,
+                    vllm_config.cache_config.block_size,
+                    tenant_key,
+                    edge_id=self._lwd_edge_id,
+                    consumer_id=coord_cfg.consumer_id,
+                    connect_timeout=min(coord_cfg.connect_timeout, 3.0),
+                )
+                self._lwd_probe_client_cache = client
             manifest = client.build_manifest(
                 request.request_id, list(request.prompt_token_ids)
             )
