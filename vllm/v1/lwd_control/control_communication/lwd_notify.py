@@ -48,6 +48,11 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
     num_prompt_tokens: int
     max_tokens: int = 16
     block_hashes: list[bytes] = []
+    prompt_token_ids: list[int] = []
+    """真实 prompt token ids(token_id 上线路,精度排查手段):空 = 旧版/
+    正式形态(ids=None,云侧走占位 embeds);非空且长度 == num_prompt_tokens
+    时云侧请求携带真实 id,draft 首遍可走原生 token-id 路径。目标侧
+    嵌入注入不受影响(prompt_is_token_ids 强制全 False)。"""
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = 0
