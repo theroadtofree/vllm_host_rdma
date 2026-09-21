@@ -331,18 +331,30 @@ class LwdCloudEngineCore(EngineCoreProc):
                     wire.request_id, len(wire.prompt_token_ids),
                     wire.num_prompt_tokens,
                 )
+        # VLLM_ASCEND_LWD_TARGET_TOKEN_IDS=1(精度排查探针,用完即弃):
+        # 目标侧也走 token-id 路径——不挂占位 embeds,prompt 段
+        # is_token_ids 落原生 True,云侧目标模型完全由真实 id 驱动
+        # (注入仍照常收发保持通道配对,但值不再被消费)。用于二分
+        # 「embeds 注入链是否为精度问题触发器」。
+        target_token_ids = (
+            os.environ.get("VLLM_ASCEND_LWD_TARGET_TOKEN_IDS") == "1"
+            and prompt_ids is not None
+        )
         prompt_is_token_ids = (
             [False] * wire.num_prompt_tokens if prompt_ids is not None else None
         )
-        prompt_embeds = torch.zeros(
+        prompt_embeds = None if target_token_ids else torch.zeros(
             wire.num_prompt_tokens,
             self.vllm_config.model_config.get_hidden_size(),
             dtype=self.vllm_config.model_config.dtype,
         )
+        if target_token_ids:
+            prompt_is_token_ids = None
         logger.info(
-            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=%s+embeds_buf",
+            "[Lwd][cloud-ctrl] build request req=%s prompt=%d ids=%s+embeds_buf%s",
             wire.request_id, wire.num_prompt_tokens,
             "real" if prompt_ids is not None else "none",
+            " TARGET_TOKEN_IDS" if target_token_ids else "",
         )
         local_hasher = self.request_block_hasher
         if local_hasher is None:
@@ -358,7 +370,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 占位 embeds 不随 SO 上传运输层(NewRequestData 只带形状,
             # worker 本地分配):35MB 零 buffer 走 MQ overflow 通道实测
             # 单程 240ms+,是 prefill SO 开工延迟的主因。
-            request.lwd_embeds_placeholder = True
+            if prompt_embeds is not None:
+                request.lwd_embeds_placeholder = True
             return request
         hash_block_size = resolve_kv_cache_block_sizes(
             self.scheduler.kv_cache_config, self.vllm_config
@@ -381,7 +394,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             block_hasher=block_hasher,
             prompt_is_token_ids=prompt_is_token_ids,
         )
-        request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
+        if prompt_embeds is not None:
+            request.lwd_embeds_placeholder = True  # 同上:占位 embeds 不上 MQ
         return request
     
     def step_with_batch_queue(self):
