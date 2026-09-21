@@ -1,22 +1,27 @@
-"""云侧混合调度器:prefill/decode 同批下发(设计:lwd_mixed_batch_design.md)。
+"""云侧混合调度器:prefill/decode 同批下发(设计:lwd_mixed_batch_design.md
++ lwd_chunked_prefill_design.md)。
 
-整体 prefill 组批语义:边侧只发整 prompt 批(不切 chunk,预算不足即
-边侧排队),云侧每步至多消费 prefill_notify_queue 队首一条批量
-RangeNotify,与全部 decode 态请求混排一个批下发:
+chunk 混排语义:边侧按 c = min(剩余 prompt, chunk 单元) 切块组批
+(续传优先 + FCFS 前缀),云侧每步至多消费 prefill_notify_queue 队首
+一条批量 RangeNotify,与全部 decode 态请求混排一个批下发:
 
   - preflight 三检(预算/名额/KV 保守预估)任一不过 -> 本步 decode-only,
     预告留队首原位,decode 泄压后下步重试;
-  - 放行则可见集 = decode 集 + 批内请求,容器交换调原生 schedule();
-  - 步后全量核验批内每请求 num_scheduled == 预告量,不等即 fail-fast
-    (mixed 不允许部分准入:一次 UP recv 对应整批张量,部分注入会留
-    残余行错配)。
+  - 放行先做 offset 对账(item.offset == 云侧 num_computed,chunk
+    断流/重复/乱序即 fail-fast),再按 T = max(items) 临时覆写
+    long_prefill_token_threshold——原生调度的 threshold 截断逐请求
+    复现边侧 chunk 边界(自限 chunk,设计 §2.3 证明与处理顺序无关);
+  - 步后核验批内每请求 num_scheduled == 预告量(chunk 精确准入),
+    不等即 fail-fast(一次 UP recv 对应整批张量,错排会留残余行错配)。
 
 前置约束:spec decode(MTP)预算已按 1+k 系数对齐(边 cap 与本类
 preflight),但端到端未经真机验证(eagle 纯度判据失真风险,台账
 P3-3/设计 M-8);
 不兼容云侧抢占重算(占位 embeds 无法本地重 prefill)与 prefix caching
-(命中使调度量 < 整 prompt,触发注入窗口看门狗)——部署须保证 KV
-充足并关闭缓存,本类的核验只负责把违背变成当场报错而非静默错算。
+(命中使 num_computed 起点 >0,触发 offset 对账 fail-fast;且被命中
+chunk 的 UP send 无人消费 = 通道打洞,chunk 化后硬前提,设计 §8-C3)
+——部署须保证 KV 充足并关闭缓存,本类的核验只负责把违背变成当场
+报错而非静默错算。
 """
 
 from __future__ import annotations
@@ -63,8 +68,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         )
         self._lwd_spec_factor: int = 1 + num_spec
         logger.info(
-            "[Lwd] cloud mixed scheduler: whole-prefill batches mixed with "
-            "decode (one notify consumed per step at most, spec_factor=%d)",
+            "[Lwd] cloud mixed scheduler: chunked-prefill batches mixed "
+            "with decode (one notify consumed per step at most, "
+            "spec_factor=%d)",
             self._lwd_spec_factor,
         )
         # spec 接受率累计器(引擎进程内直出):LWD 云前端没有注册请求,
@@ -132,8 +138,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
 
     @staticmethod
     def _lwd_is_decode(request) -> bool:
-        """prompt 已算完 = decode 态(可采样)。整体组批下 running 请求
-        恒为 decode 态(num_computed 一跳到底),本判据是兜底过滤。"""
+        """prompt 已算完 = decode 态(可采样)。chunk 化后 running 可含
+        prefill 半途请求(num_computed 爬坡中)——它们不进 decode 集,
+        留在隐藏集等自己的下一条 chunk 预告驱动续排。"""
         return request.num_computed_tokens >= request.num_prompt_tokens
 
     def _lwd_collect_decode_requests(self) -> list[str]:
@@ -208,10 +215,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 need_tokens, self.max_num_scheduled_tokens,
             )
             return False
-        if len(self.running) + len(items) > self.max_num_running_reqs:
+        # 名额只数新增准入:续传 chunk 的请求已在 running,再按条目数
+        # 计会双重占用名额造成假性 hold(chunk 化前批内恒为新增,
+        # len(items) 与新增数相等)
+        running_ids = {req.request_id for req in self.running}
+        new_items = sum(
+            1 for item in items if item.request_id not in running_ids
+        )
+        if len(self.running) + new_items > self.max_num_running_reqs:
             logger.info(
                 "[Lwd][cloud-sched] preflight hold: seqs %d+%d > max %d",
-                len(self.running), len(items), self.max_num_running_reqs,
+                len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
         need_blocks = (
@@ -231,9 +245,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
     def _lwd_verify_full_admission(
         out: SchedulerOutput, notify: LwdRangeNotify, items: list[LwdRangeItem]
     ) -> None:
-        """步后全量核验:批内每请求排程量 == 预告量。不等即配置发散/
-        KV 失守(部分准入会让整批 UP 张量留残余行),fail-fast 不当场
-        炸就会静默错算。"""
+        """步后核验:批内每请求排程量 == 预告量(chunk 精确准入)。
+        不等即配置发散/KV 失守(错排会让整批 UP 张量留残余行),
+        fail-fast 不当场炸就会静默错算。"""
         for item in items:
             scheduled = out.num_scheduled_tokens.get(item.request_id, 0)
             if scheduled != item.num_tokens:
@@ -286,14 +300,43 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         items: list[LwdRangeItem],
         decode_ids: list[str],
     ) -> SchedulerOutput:
-        """混排步:decode 集 + 批内整 prompt 请求同批下发。"""
+        """混排步:decode 集 + 批内 chunk 同批下发。
+
+        offset 对账:item.offset 必须 == 云侧当前 num_computed(async
+        关闭前提下调度时刻即真实水位)——不等即 chunk 断流(>)/
+        重复(<)/乱序,协议级事故 fail-fast,不当场炸就会把
+        embeddings 注入错位窗口静默错算。
+        阈值复现(设计 §2.3):临时覆写 long_prefill_token_threshold =
+        max(items.num_tokens),原生调度的 threshold 截断逐请求复现
+        边侧 chunk 边界(自限 chunk,与处理顺序无关);finally 恢复。
+        注意 decode 请求 num_new = 1+k 远小于正常量级的 T,不受覆写
+        影响(病态小 chunk 配置见设计 §8-C9)。"""
         logger.info(
             "[Lwd][cloud-sched] mixed notify seqno=%d reqs=%s tokens=%d",
             notify.seqno, [item.request_id for item in items],
             sum(item.num_tokens for item in items),
         )
+        for item in items:
+            request = self.requests[item.request_id]
+            if request.num_computed_tokens != item.offset:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] chunk offset mismatch "
+                    f"req={item.request_id} seqno={notify.seqno}: "
+                    f"notify offset={item.offset} != cloud computed="
+                    f"{request.num_computed_tokens} "
+                    f"(chunk 断流/重复/乱序)"
+                )
         req_ids = decode_ids + [item.request_id for item in items]
-        out = self._lwd_schedule_for_visible_reqs(req_ids)
+        saved_threshold = self.scheduler_config.long_prefill_token_threshold
+        self.scheduler_config.long_prefill_token_threshold = max(
+            item.num_tokens for item in items
+        )
+        try:
+            out = self._lwd_schedule_for_visible_reqs(req_ids)
+        finally:
+            self.scheduler_config.long_prefill_token_threshold = (
+                saved_threshold
+            )
         self._lwd_verify_full_admission(out, notify, items)
         # 消费队首:abort 清扫(IO 线程)可能整体替换过 deque,按对象
         # 身份弹队首,避免错弹替换后的新队首

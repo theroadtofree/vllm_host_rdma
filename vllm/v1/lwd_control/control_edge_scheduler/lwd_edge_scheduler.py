@@ -1,10 +1,10 @@
-"""边侧调度器:整体 prefill 组批 + 控制面发布(notify/abort/seqno)。
+"""边侧调度器:chunk 化 prefill 组批 + 控制面发布(notify/abort/seqno)。
 
 原生 AsyncScheduler 的两个前提在边侧不成立:prompt 算完会转 decode、
 请求只能由模型输出终结。边侧只做 embedding(执行层无 decode),故需
 专用调度器接管请求的边侧生命周期:
 
-  入队 -> EMBEDDING(整体组批/范围预告)
+  入队 -> EMBEDDING(chunk 组批/范围预告)
        -> 嵌入完结:走原生 finish_requests 清出调度器(释放边侧 KV
           簿记、通知 worker 释放缓存),登记 awaiting
        -> AWAITING(等待云结果;前端未收到输出继续等待)
@@ -15,11 +15,13 @@
 完结当步即被清出调度器,原生 RUNNING 段每步只会调度剩余 prefill,
 decode 分支不可达。
 
-整体组批约束(lwd_mixed_batch_design.md):prefill 批可含多个请求,
-但只装「整 prompt」——预算(cap = 云侧预算 − 在途数,经 HELLO 获知)
-装不下即留在 waiting 队首阻塞,不允许截断成 chunk。一个批 = 一条批量
-RangeNotify = 一个 seqno = 一次 UP send,数据面 chunk 流退化为
-「按批连续」,跨请求交错/重组复杂度仍为零。
+chunk 组批约束(lwd_chunked_prefill_design.md):prompt 按
+c = min(剩余, chunk 单元 C) 切块,批 = 续传 chunk 优先 + waiting FCFS
+前缀,Σc ≤ cap(云侧预算 − 在途数 × spec 系数,边云同值前提下读本地
+配置);续传队首装不下时的 cap 截断块独占一批(云侧按批内最大条目
+复现 chunk 边界,设计 §2.4)。一个批 = 一条批量 RangeNotify = 一个
+seqno = 一次 UP send,数据面 chunk 流按批连续,跨请求交错/重组复杂度
+仍为零。
 """
 
 from __future__ import annotations
@@ -136,6 +138,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdConfig.from_env_and_config(self.vllm_config).scheduler_name
             == "mixed"
         )
+        # chunk 单元 C:prompt 按 min(剩余, C) 切块下发
+        # (lwd_chunked_prefill_design.md)。C 取本地
+        # long_prefill_token_threshold(原生调度本就按它截断 prompt 排程,
+        # scheduler.py:408/690,双侧天然复现同一边界);未配置(≤0,默认)
+        # 时退化为 max_num_scheduled_tokens(= 边云对齐预算,整 prompt 不
+        # 超预算不切块,与整体组批形态连续过渡)。云侧不读本值,按每条
+        # RangeNotify 的 max(items) 临时覆写阈值复现(设计 §2.3)。
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        self._lwd_chunk_unit: int = (
+            threshold if threshold > 0 else self.max_num_scheduled_tokens
+        )
+        # 活性 fail-fast:最坏在途(满员)下 cap 恒 < 1 即死锁配置
+        # (设计 §2.6),拉起时直接拒绝
+        if self._lwd_mixed and (
+            self.max_num_scheduled_tokens
+            - self.max_num_running_reqs * self._lwd_spec_factor
+            < 1
+        ):
+            raise RuntimeError(
+                f"[LWD] 死锁配置: max_num_batched_tokens("
+                f"{self.max_num_scheduled_tokens}) - max_num_seqs("
+                f"{self.max_num_running_reqs}) * spec_factor("
+                f"{self._lwd_spec_factor}) < 1, 续传 chunk 永无可调度预算; "
+                "请增大 max_num_batched_tokens 或减小 max_num_seqs"
+            )
         self._init_instance_buckets()
 
     # ------------------------------------------------------------------ #
@@ -236,7 +263,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return any(self._instance_has_work(i) for i in range(self._instance_count))
 
     def schedule(self) -> SchedulerOutput:
-        """整体 prefill 组批 + 原生准入。
+        """chunk 化 prefill 组批 + 原生准入。
 
         EMBED 批的 LwdBatch(seqno/token 片段)由 lwd_edge_notify 在
         发布成功后挂批——seqno 必须与发布成功绑定。
@@ -263,92 +290,125 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         return self._lwd_schedule_batch()
 
-    def _lwd_pick_prefill_batch(self) -> tuple[list[str], dict[str, int]]:
-        """选下一步 embed 批:FCFS 前缀贪心,只装整 prompt(不截断)。
+    def _lwd_pick_prefill_batch(
+        self,
+    ) -> tuple[list[str], dict[str, int], int]:
+        """选下一步 embed 批:续传优先 + FCFS 前缀组批,按 chunk 单元切块。
 
-        返回 (req_ids, expected):expected 为逐请求的本步应排 token 数
-        (步后核验用,不等即配置发散 fail-fast)。
+        返回 (req_ids, expected, cap):expected 为逐请求的本步应排 token
+        数(步后 chunk 核验用,不等即配置发散 fail-fast);cap 为本步
+        token 预算上界(云侧预算 − 在途数 × spec 系数,边云同值前提下
+        本地配置即云侧预算),供 _lwd_schedule_batch 做预算钳制。
 
-        选择规则:
-        - running 中第一个未发完的 prefill 优先单独成批(断点续传,
-          先收尾再开新;chunk 支持预留分支,整体组批下不可达,
-          expected 空缺 = 不做整 prompt 核验);
-        - scheduler_name 非 mixed(逃生通道):只取队首单请求,允许
-          原生截断成 chunk,核验关闭,复现旧相位语义;
-        - 否则从 waiting(skipped 优先,原生准入失败回插者)按 FCFS
-          迭代序取最长前缀,满足:
-            Σprompt_len ≤ cap(预算 − 在途数 × spec 系数,边云同值前提
-            下本地配置即云侧预算)
-            批内请求数 ≤ 剩余名额(max_num_running_reqs − 在途数)
-            单请求 prompt ≤ long_prefill_token_threshold(若配置)
-          队首装不下即停(不跳过队首,保 FCFS 与 seqno 链次序;
-          超长 prompt 因此队首阻塞,属设计边界 M-1)。
+        chunk 语义(lwd_chunked_prefill_design.md §3.1):
+        - 每个 chunk 自限:c = min(剩余 prompt, chunk 单元 C),云侧原生
+          调度在阈值复现下逐请求推出同一边界,无需逐请求钳制通道;
+        - 续传(先收尾再开新):running 中未发完的 prefill 按 FCFS 序取
+          c = min(剩余, C);装不下剩余 cap 的续传等下步(cap 排水回升
+          后仍最优先),余量允许开新(自限块不影响云侧复现);
+          队首续传连一个单元都装不下且批仍为空时,单独截断成
+          min(剩余, cap) 放行(cap 截断块必须独占一批:云侧按批内
+          最大条目覆写阈值复现 chunk 边界,截断块与更大的块同批会被
+          云侧超排,设计 §2.4);
+        - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
+          迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
+          新增请求数 ≤ free_seq;队首装不下即停(不跳过队首,保 FCFS
+          与 seqno 链次序;超长 prompt 按 C 切块续传,不再队首阻塞,
+          设计 M-1 解药)。
         priority 调度策略下 waiting 迭代序非弹出序,本前缀语义未适配
         (LWD 部署恒 FCFS,设计 M-10)。"""
-        running_prefill = next(
-            (r for r in self.running if r.num_computed_tokens < r.num_prompt_tokens),
-            None,
-        )
-        if running_prefill is not None:
-            return [running_prefill.request_id], {}
         # 逃生通道(旧相位语义):单请求、不 cap、允许原生截断成 chunk、
-        # 不做整批核验——两侧同配 prefill_first/decode_first 时逐字节
+        # 不做核验——两侧同配 prefill_first/decode_first 时逐字节
         # 复现旧行为
         if not self._lwd_mixed:
             candidates = list(self.skipped_waiting) + list(self.waiting)
-            return ([candidates[0].request_id], {}) if candidates else ([], {})
-        # cap 语义:批 Σprompt ≤ 预算 − 在途数 × spec 系数(云混排步里
+            picked = [candidates[0].request_id] if candidates else []
+            return picked, {}, self.max_num_scheduled_tokens
+        # cap 语义:批 Σchunk ≤ 预算 − 在途数 × spec 系数(云混排步里
         # decode 每请求占 1+k token,MTP 下 k = num_spec_tokens;在途数
         # 是 decode 人口的恒成立上界,设计 §2.2)。边云预算部署对齐,
         # 本地 max_num_scheduled_tokens 即云侧预算
         inflight = len(self.running) + len(self._lwd_awaiting)
-        cap = (
-            self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
-        )
+        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
         free_seq = self.max_num_running_reqs - inflight
-        threshold = self.scheduler_config.long_prefill_token_threshold
         picked: list[str] = []
         expected: dict[str, int] = {}
         used = 0
+        if cap < 1:
+            return picked, expected, cap
+        unit = self._lwd_chunk_unit
+        # 1) 续传优先(先收尾再开新)
+        for request in self.running:
+            remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens
+            )
+            if remaining <= 0:
+                continue
+            chunk = min(remaining, unit)
+            if used + chunk > cap:
+                if picked:
+                    break  # 批非空:不塞截断块,不跳过续传
+                # 队首续传连一个单元都装不下:单独截断放行,
+                # 独占一批(设计 §2.4),本批不再续传也不再开新
+                picked.append(request.request_id)
+                expected[request.request_id] = min(remaining, cap)
+                return picked, expected, cap
+            picked.append(request.request_id)
+            expected[request.request_id] = chunk
+            used += chunk
+        # 2) 开新:FCFS 前缀,自限 chunk
+        new_count = 0
         candidates = list(self.skipped_waiting) + list(self.waiting)
         for request in candidates:
-            n = request.num_prompt_tokens  # 整体组批:只取全量
-            if (
-                len(picked) >= free_seq
-                or used + n > cap
-                or 0 < threshold < n
-            ):
+            chunk = min(request.num_prompt_tokens, unit)
+            if new_count >= free_seq or used + chunk > cap:
                 break
             picked.append(request.request_id)
-            expected[request.request_id] = n
-            used += n
-        return picked, expected
+            expected[request.request_id] = chunk
+            used += chunk
+            new_count += 1
+        return picked, expected, cap
 
     def _lwd_schedule_batch(self) -> SchedulerOutput:
-        """整体组批:picker 选批,经基类可见集机制调度 + 整批核验。
+        """chunk 组批:picker 选批,预算钳制后经基类可见集机制调度 +
+        逐 chunk 核验。
 
         选择规则见 _lwd_pick_prefill_batch;队列剔除/隔离/拼回复用基类
         _lwd_schedule_for_visible_reqs(waiting/skipped 来源走原生准入
-        窗口,running 来源走续跑)。语义注记:与旧手写容器交换不同,
-        本步被抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取
-        基类统一语义,不再做队首回插。"""
-        req_ids, expected = self._lwd_pick_prefill_batch()
+        窗口,running 来源走续跑)。
+
+        预算钳制(设计 §2.5):可见集调用期间把 max_num_scheduled_tokens
+        临时压到 cap(原生 token 预算即读该字段,
+        scheduler.py:360),原生 budget/threshold 双重截断逐请求复现
+        picker 的 chunk 划分。语义注记:与旧手写容器交换不同,本步被
+        抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取基类
+        统一语义,不再做队首回插。"""
+        req_ids, expected, cap = self._lwd_pick_prefill_batch()
         if req_ids:
             logger.info(
-                "[Lwd][edge-sched] pick batch reqs=%s tokens=%d",
-                req_ids, sum(expected.values()),
+                "[Lwd][edge-sched] pick batch reqs=%s tokens=%d cap=%d",
+                req_ids, sum(expected.values()), cap,
             )
-        out = self._lwd_schedule_for_visible_reqs(req_ids)
-        # 整批核验:整体组批不允许截断(截断即 cap/threshold 失守,
-        # 云侧注入窗口看门狗会把它变成 RuntimeError——这里先炸,
-        # 错在边侧调度,不等到数据面)
+        if req_ids and cap < self.max_num_scheduled_tokens:
+            saved_budget = self.max_num_scheduled_tokens
+            self.max_num_scheduled_tokens = cap
+            try:
+                out = self._lwd_schedule_for_visible_reqs(req_ids)
+            finally:
+                self.max_num_scheduled_tokens = saved_budget
+        else:
+            out = self._lwd_schedule_for_visible_reqs(req_ids)
+        # chunk 核验:picker 的 chunk 划分必须被原生调度逐请求复现
+        # (不等即 cap/threshold 失守或原生行为发散;云侧注入窗口
+        # 看门狗也会把它变成 RuntimeError——这里先炸,错在边侧调度,
+        # 不等到数据面)
         for req_id, want in expected.items():
             got = out.num_scheduled_tokens.get(req_id, 0)
             if got != want:
                 raise RuntimeError(
-                    f"[Lwd][edge-sched] whole-prefill truncated: "
-                    f"req={req_id} scheduled={got} != prompt={want} "
-                    f"(cap 失守或阈值配置发散)"
+                    f"[Lwd][edge-sched] chunk schedule mismatch: "
+                    f"req={req_id} scheduled={got} != expected={want} "
+                    f"(cap/threshold 失守或原生行为发散)"
                 )
         return out
 
@@ -369,7 +429,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
         """running 中是否存在未发完的 embed 请求(续传收尾中)。
 
-        与 _lwd_pick_prefill_req_id 的续传分支同判据,两处需保持一致:
+        与 _lwd_pick_prefill_batch 的续传分支同判据,两处需保持一致:
         闸门放行收尾的前提是 picker 必然挑中该续传请求而非开新。"""
         return any(
             req.num_computed_tokens < req.num_prompt_tokens

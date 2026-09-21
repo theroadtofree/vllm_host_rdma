@@ -13,8 +13,10 @@ if TYPE_CHECKING:
 
 
 class LwdRangeItem(msgspec.Struct, gc=False):
-    """批量范围预告条目(mixed 组批);offset 预留 chunk 支持,
-    整体 prefill 组批下恒 0(整 prompt 一步排程)。"""
+    """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
+    起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
+    offset == num_computed 对账。chunk 为 min(剩余 prompt, chunk 单元)
+    的自限块;cap 截断块独占一批。"""
 
     request_id: str
     offset: int
