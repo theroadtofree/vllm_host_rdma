@@ -39,6 +39,8 @@ class LwdEmbedBatch:
 
     req_ids: list[str] = field(default_factory=list)
     token_ids: list[list[int]] = field(default_factory=list)
+    # Absolute prompt offsets; cloud token_ids contain lengths-only placeholders.
+    token_offsets: list[int] = field(default_factory=list)
 
 
 @dataclass
