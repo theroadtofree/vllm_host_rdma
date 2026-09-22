@@ -607,26 +607,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         return request
     
     def step_with_batch_queue(self):
-        """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
         self._lwd_poll_coordination()
-        _t0 = time.monotonic()
-        out = super().step_with_batch_queue()
-        logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
-        return out
+        return super().step_with_batch_queue()
 
     def step(self):
-        """同步步路径同款打点。"""
         self._lwd_poll_coordination()
-        _t0 = time.monotonic()
-        out = super().step()
-        logger.info(
-            "[Lwd][perf] cloud-step exec=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
-        return out
+        return super().step()
 
     def lwd_handle_model_output(
         self,

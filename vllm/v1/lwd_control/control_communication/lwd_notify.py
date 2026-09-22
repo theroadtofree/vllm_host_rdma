@@ -22,6 +22,7 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     seqno: int
     edge_id: int = 0
     """来源边 id(云侧据此做 req_id 命名空间包装);缺省 0 单边兼容。"""
+    has_mrope: bool = False
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):

@@ -23,7 +23,9 @@ decode 分支不可达。
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import torch
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import (
@@ -106,8 +108,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 生成段链增量上报水位(request_id -> 已上报满块数):只在满块数
         # 增加时发一条(全量替换语义),避免逐步刷控制面。
         self._lwd_gen_chain_sent: dict[str, int] = {}
-        # 租户 HMAC hasher 惰性缓存(避免每请求重读密钥文件)
-        self._lwd_hasher_cache = None
+        # 云侧块哈希粒度学习缓存(cloud_id -> 云 hash 粒度):probe 响应头
+        # 携带云侧 hash_block_size(压缩/混合粒度模型上与边块粒度不同,
+        # 如 DSv4 云 hash=8 而边块 128)。链按该粒度构建后,云侧采纳条件
+        # len(链)==prompt//hash 粒度 恒成立,不再要求 prompt 为边块整数倍。
+        # 未学习(首请求前)回退边块粒度,行为与学习前一致。
+        self._lwd_hash_bs_by_cloud: dict[int, int] = {}
+        # 按粒度缓存的 hasher(同租户密钥不同 block_size;数量极小,
+        # 实际部署每云一个粒度)
+        self._lwd_hasher_by_granularity: dict[int, Any] = {}
+        # 请求 probe 链粒度记账(request_id -> 建链粒度):学习换挡只发生
+        # 在重启后首个请求(probe 用旧粒度、finish 须用同一粒度才能与云侧
+        # 存储的 manifest 对账),稳态请求 probe/finish 同粒度自然一致。
+        self._lwd_probe_bs_by_req: dict[str, int] = {}
         # 探前缀客户端惰性缓存(复用 hasher/tenant_key,避免每请求读文件重建)
         self._lwd_probe_client_cache = None
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
@@ -124,6 +137,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        # 多模态请求的整 prompt mrope positions([3,N] CPU 张量,准入时
+        # 一次性算好,按 chunk 切片随 LwdEmbedBatch 下发 worker);嵌入
+        # 完结/abort 时摘除。key 在 = 该请求各 chunk 的 has_mrope 恒真。
+        self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
+        # 惰性解析的模型类静态方法 _get_mrope_input_positions(直接缓存
+        # 方法本身而非模型类,语义直达;首用即验,不支持的族 fail-fast)。
+        self._lwd_mrope_positions_fn = None
 
     # ------------------------------------------------------------------ #
     # 云侧复用选路与控制面出口                                            #
@@ -235,6 +255,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         block_hashes, prefix_hit_tokens = self._lwd_probe_prefix(request)
         cloud_id = self._lwd_default_cloud_id()
         self._lwd_binding.bind(request.request_id, cloud_id)
+        self._lwd_compute_mrope_positions(request)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
@@ -282,9 +303,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     tenant_key = f.read()
                 # 探前缀客户端复用(hasher/密钥只建一次),并把总超时钳到
                 # 3s:死锁残余时快速 fail-open,避免边侧主循环 10s 级卡顿。
-                client = LwdEdgePrefixClient(
+                # 探测链粒度:优先用已学习的云 hash 粒度(稳态下 probe 的
+            # manifest 即云域,ratio=1 直通);未学习回退边块粒度。
+            cloud_id = self._lwd_default_cloud_id()
+            known_bs = self._lwd_hash_bs_by_cloud.get(cloud_id)
+            build_bs = known_bs or vllm_config.cache_config.block_size
+            client = LwdEdgePrefixClient(
                     coord_cfg.control_url,
-                    vllm_config.cache_config.block_size,
+                    build_bs,
                     tenant_key,
                     edge_id=self._lwd_edge_id,
                     consumer_id=coord_cfg.consumer_id,
@@ -305,9 +331,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     )
 
             result = asyncio.run(_probe())
+            # 学习云侧 hash 粒度;与本次建链粒度不一致时按其重建链。
+            # notify 在 probe 之后才发,故首请求(首次学习)即生效:非
+            # 整除 prompt 的链覆盖到云 hash 粒度,采纳条件恒成立。
+            learned = int(result.block_size)
+            self._lwd_hash_bs_by_cloud[cloud_id] = learned
+            if learned != build_bs:
+                chain = list(
+                    self._lwd_prefix_hasher(
+                        coord_cfg, vllm_config, learned
+                    ).build_manifest(
+                        request.request_id, list(request.prompt_token_ids)
+                    ).full_block_hashes
+                )
+            # 记账本请求 probe 的建链粒度(注意是 build_bs 而非学习值):
+            # 云侧存储的 manifest 即 probe 粒度,finish 须按同一粒度建链
+            # 对账;学习换挡只发生在重启后首个请求,故按请求记账。
+            self._lwd_probe_bs_by_req[request.request_id] = build_bs
             logger.info(
-                "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d",
-                request.request_id, result.hit_tokens, len(chain),
+                "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d "
+                "hash_bs=%d",
+                request.request_id, result.hit_tokens, len(chain), learned,
             )
             # 命中边界以云侧块池单真源为准(probe 现读块池,与云侧请求
             # resume 同池同链),推进 num_computed 后边侧只 embed/发尾巴,
@@ -322,6 +366,66 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge] prefix probe failed (fail-open)", exc_info=True,
             )
             return list(request.block_hashes), 0
+
+    @staticmethod
+    def _lwd_request_has_mm(request: Request) -> bool:
+        """请求是否带真实多模态数据(prompt_embeds passthrough 不算——
+        它没有 grid 元数据,mrope 按文本位置处理,与原生口径一致)。"""
+        return any(
+            feature.modality != "prompt_embeds"
+            for feature in request.mm_features
+        )
+
+    def _lwd_compute_mrope_positions(self, request: Request) -> None:
+        """准入时为多模态请求一次性算全 prompt 的 [3,N] mrope positions。
+
+        设计分工(对照 latest_lwd 边云):token_id 不上线路,云侧拿
+        不到 grid 元数据,无法从第一性原理构造 3D 位置——由边侧(唯一
+        持有真实 prompt + mm_features 的一侧)算好,逐 chunk 切片随
+        EMBED 批经数据面发给云;delta 云侧收齐末 chunk 后自推
+        (max+1-N),不上 wire。
+
+        模型类静态方法直接以 hf_config 调用(Qwen3VL 族,含 Qwen3.5),
+        无需模型实例/权重;模型族不提供该静态入口即拒绝(报错信息给出
+        白名单口径),不静默按文本位置错算。"""
+        if not self.vllm_config.model_config.uses_mrope:
+            return
+        if not self._lwd_request_has_mm(request):
+            return
+        if self._lwd_mrope_positions_fn is None:
+            from vllm.model_executor.models import ModelRegistry
+
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                self.vllm_config.model_config.architectures,
+                self.vllm_config.model_config,
+            )
+            fn = getattr(model_cls, "_get_mrope_input_positions", None)
+            if fn is None:
+                raise ValueError(
+                    f"[LWD] multimodal requests in prefill-only mode "
+                    f"require a model class exposing "
+                    f"_get_mrope_input_positions (Qwen3VL family, incl. "
+                    f"Qwen3.5); got {model_cls.__name__} "
+                    f"(request {request.request_id})"
+                )
+            self._lwd_mrope_positions_fn = fn
+        mrope_features = [
+            f for f in request.mm_features if f.modality != "prompt_embeds"
+        ]
+        positions, _delta = self._lwd_mrope_positions_fn(
+            input_tokens=list(request.prompt_token_ids),
+            mm_features=mrope_features,
+            config=self.vllm_config.model_config.hf_config,
+        )
+        assert positions.shape[1] == request.num_prompt_tokens, (
+            f"[LWD] mrope positions width {positions.shape[1]} != prompt "
+            f"len {request.num_prompt_tokens} (request {request.request_id})"
+        )
+        self._lwd_mrope_positions_dict[request.request_id] = positions
+        logger.info(
+            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
+            request.request_id, request.num_prompt_tokens,
+        )
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 块发 LwdRangeNotify(seqno 先行)。
@@ -352,6 +456,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
             seqno = self._lwd_seqno.get(cloud_id, 0)
+            positions = self._lwd_mrope_positions_dict.get(request_id)
+            has_mrope = positions is not None
             if not self._lwd_publish(
                 LwdRangeNotify(
                     request_id=request_id,
@@ -359,18 +465,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     num_tokens=num_tokens,
                     seqno=seqno,
                     edge_id=self._lwd_edge_id,
+                    has_mrope=has_mrope,
                 ),
                 cloud_id,
             ):
                 return False
             self._lwd_seqno[cloud_id] = seqno + 1
             logger.info(
-                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d cloud=%d",
-                request_id, offset, num_tokens, seqno, cloud_id,
+                "[Lwd][edge-notify] req=%s offset=%d num=%d seqno=%d "
+                "cloud=%d has_mrope=%s",
+                request_id, offset, num_tokens, seqno, cloud_id, has_mrope,
             )
             # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
             # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
             # chunk 的 token 片段
+            mrope_slice: list[list[int]] = []
+            if has_mrope:
+                assert positions is not None
+                # [3,N] 切本 chunk 列 -> [n,3] 行序与 token 轴对齐
+                mrope_slice = (
+                    positions[:, offset : offset + num_tokens].t().tolist()
+                )
             scheduler_output.lwd_batch = LwdBatch(
                 batch_type=LwdBatchType.LWD_EMBED,
                 seqno=seqno,
@@ -383,6 +498,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     ],
                     edge_id=self._lwd_edge_id,
                     cloud_id=cloud_id,
+                    token_offsets=[offset],
+                    has_mrope=has_mrope,
+                    mrope_positions=mrope_slice,
                 ),
             )
         return True
@@ -475,6 +593,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_finish_prompt_ids.pop(request_id, None)
             self._lwd_finish_gen_ids.pop(request_id, None)
             self._lwd_gen_chain_sent.pop(request_id, None)
+            # mrope 台账随 abort 清理(多模态准入期预计算的位置缓存)
+            self._lwd_mrope_positions_dict.pop(request_id, None)
             cloud_id = self._lwd_binding.unbind(request_id)
             if cloud_id is None and self.lwd_edge_channel is not None:
                 logger.info(
@@ -521,13 +641,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not coord_cfg.tenant_key_file:
             return
         try:
-            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config)
+            # finish 链粒度取本请求 probe 时的建链粒度(而非全局学习值):
+            # 云侧存储的 manifest 即 probe 粒度,两处一致校验才能对账。
+            # 学习换挡只发生在重启后首个请求,故需按请求记账。
+            probe_bs = self._lwd_probe_bs_by_req.pop(request_id, None)
+            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config, probe_bs)
             completion_ids = gen_ids or []
             manifest = hasher.build_manifest(
                 request_id, list(prompt_ids) + completion_ids
-            )
-            cloud_id = self._lwd_binding.cloud_of(
-                request_id, default=self._lwd_default_cloud_id()
             )
             message = LwdFinishNotify(
                 request_id=request_id,
@@ -535,6 +656,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 completion_tokens=len(completion_ids),
                 full_block_hashes=list(manifest.full_block_hashes),
                 edge_id=self._lwd_edge_id,
+            )
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
             )
             if not self._lwd_publish(message, cloud_id):
                 logger.warning(
@@ -602,19 +726,32 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge] gen-chain announce failed (fail-open)", exc_info=True
             )
 
-    def _lwd_prefix_hasher(self, coord_cfg, vllm_config):
-        """惰性构造并缓存租户 HMAC hasher(probe / 生成段链 / 收尾共用)。"""
-        hasher = self._lwd_hasher_cache
-        if hasher is not None:
-            return hasher
+    def _lwd_prefix_hasher(
+        self,
+        coord_cfg,
+        vllm_config,
+        hash_block_size: int | None = None,
+    ):
+        """惰性构造并缓存租户 HMAC hasher(probe / 生成段链 / 收尾共用)。
+
+        ``hash_block_size`` 指定链的块粒度:缺省为边块粒度(cache_config
+        .block_size,学习前的行为);传入从 probe 响应学到的云 hash 粒度后,
+        链与云侧采纳条件 len(链)==prompt//粒度 恒对齐。同密钥不同粒度
+        各缓存一个实例。"""
+        if hash_block_size is None:
+            hash_block_size = vllm_config.cache_config.block_size
+        cached = self._lwd_hasher_by_granularity.get(hash_block_size)
+        if cached is not None:
+            return cached
+
+        with open(coord_cfg.tenant_key_file, "rb") as f:
+            tenant_key = f.read()
         from vllm.v1.lwd_control.control_communication.lwd_prefix import (
             LwdPrefixHasher,
         )
 
-        with open(coord_cfg.tenant_key_file, "rb") as f:
-            tenant_key = f.read()
-        hasher = LwdPrefixHasher(tenant_key, vllm_config.cache_config.block_size)
-        self._lwd_hasher_cache = hasher
+        hasher = LwdPrefixHasher(tenant_key, hash_block_size)
+        self._lwd_hasher_by_granularity[hash_block_size] = hasher
         return hasher
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
@@ -643,6 +780,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             now = time.monotonic()
             for request_id in finished_ids:
                 self._lwd_awaiting[request_id] = now
+                self._lwd_mrope_positions_dict.pop(request_id, None)
                 logger.info(
                     "[Lwd][edge-progress] req=%s embed done -> awaiting",
                     request_id,
@@ -683,21 +821,47 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return True
 
-    @staticmethod
-    def _lwd_validate_request(request: Request) -> None:
+    def _lwd_validate_request(self, request: Request) -> None:
         """模式边界校验;违规抛 ValueError,在入队之前拒绝,错误经
         add_request 调用链回到客户端 error 路径。
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
         prompt_embeds),只处理纯文本补全(拒 pooling/结构化
         输出),prompt 非空;不上 wire 的采样参数(logit_bias/
-        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。"""
+        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。
+
+        多模态白名单:仅 image;video/audio 等其余模态与 EVS
+        (multimodal pruning)拒绝——merge/mrope 链路按 image 语义
+        实现,其余模态未适配,静默放过即错算。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
                 f"prompt_embeds (request {request.request_id}); the edge "
                 "is the embedding owner"
             )
+        if request.mm_features:
+            unsupported_mm = sorted(
+                {
+                    feature.modality
+                    for feature in request.mm_features
+                    if feature.modality not in ("image", "prompt_embeds")
+                }
+            )
+            if unsupported_mm:
+                raise ValueError(
+                    f"[LWD] prefill-only mode supports image-only "
+                    f"multimodal requests; got modality "
+                    f"{', '.join(unsupported_mm)} "
+                    f"(request {request.request_id})"
+                )
+            if (
+                self.vllm_config.model_config.multimodal_config
+                .is_multimodal_pruning_enabled()
+            ):
+                raise ValueError(
+                    "[LWD] prefill-only mode does not support multimodal "
+                    f"pruning (EVS) (request {request.request_id})"
+                )
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
