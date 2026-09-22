@@ -309,14 +309,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d",
                 request.request_id, result.hit_tokens, len(chain),
             )
-            # 命中边界以云侧块池单真源为准(probe 现读块池,与云侧请求
-            # resume 同池同链),推进 num_computed 后边侧只 embed/发尾巴,
-            # chunk offset == 云侧 computed,续算闭环。命中值随 notify
-            # 下发,云侧按它封顶 resume——probe 超时/并发下池增长时,
-            # 云侧不会越过边侧实际裁剪的边界。
-            if result.hit_tokens > 0:
-                request.num_computed_tokens = result.hit_tokens
-            return chain, result.hit_tokens
+            # [禁用前缀复用裁剪] probe 命中只用于报告(usage),不推进
+            # num_computed_tokens、也不下发 prefix_hit_tokens。否则边侧
+            # 只发尾巴,而云侧 prefill 时前缀块可能已被驱逐(锚点请求
+            # finish),两侧进度认知不一致 → offset 错位 → 队首死循环。
+            # 保持边侧发完整 prompt、云侧完整 prefill,offset 恒对齐。
+            return chain, 0
         except Exception:  # noqa: BLE001  fail-open:探测失败不阻断请求
             logger.warning(
                 "[Lwd][edge] prefix probe failed (fail-open)", exc_info=True,
