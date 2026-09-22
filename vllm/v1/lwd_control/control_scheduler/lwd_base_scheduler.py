@@ -33,8 +33,10 @@ class LwdBaseScheduler(AsyncScheduler):
 
         参数 ``token_budget_cap``:本步调度预算上限,把"本步执行多少
         token"的决定权从本侧原生预算移交给边侧公告量(云侧跟随边侧
-        chunk)。仅用于收紧,不放宽原生上限;原生预算内的块对齐复切
-        (mamba align)等机制照常生效。"""
+        chunk)。仅用于收紧,不放宽原生上限;跟随模式下同时豁免
+        long_prefill_token_threshold 复切(云侧不复切边侧 chunk,保证
+        调度窗口 == 预告行数);原生预算内的块对齐复切(mamba align)
+        等机制照常生效。"""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -49,14 +51,28 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
         saved_token_budget = self.max_num_scheduled_tokens
+        # 边侧是 prefill 切块权威:跟随模式(token_budget_cap 给定 = 云侧
+        # 照单执行边侧 chunk)下同步豁免长 prefill 阈值复切。原生调度会把
+        # 超过 long_prefill_token_threshold 的 prefill 再切小
+        # (max_num_partial_prefills>1 且未显式配置时自动取
+        # max_model_len*0.04,如 768),再切后调度窗口 != 预告 chunk 行数,
+        # UP 注入窗口失配直接挂死。云侧不复切边侧已定的 chunk;预算钳制
+        # (min)仍生效,内存上界不变。
+        saved_long_prefill_threshold = (
+            self.scheduler_config.long_prefill_token_threshold
+        )
         if token_budget_cap is not None:
             self.max_num_scheduled_tokens = min(
                 saved_token_budget, max(0, token_budget_cap)
             )
+            self.scheduler_config.long_prefill_token_threshold = 0
         try:
             out = super().schedule()
         finally:
             self.max_num_scheduled_tokens = saved_token_budget
+            self.scheduler_config.long_prefill_token_threshold = (
+                saved_long_prefill_threshold
+            )
             # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
             # skipped 被跳过者排队首
             post = (self.running, self.waiting, self.skipped_waiting)
