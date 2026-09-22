@@ -49,14 +49,21 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
         saved_token_budget = self.max_num_scheduled_tokens
+        saved_full_isl = self.scheduler_reserve_full_isl
         if token_budget_cap is not None:
             self.max_num_scheduled_tokens = min(
                 saved_token_budget, max(0, token_budget_cap)
             )
+            # LWD prefill 按边侧 chunk 逐步算,不要求整个序列(含 output)的
+            # KV 一次就位。否则长序列在 KV 紧张时被 full_sequence_must_fit
+            # 拒掉,prefill 空步 → 相位调度器 appendleft 塞回队首 → 队首
+            # 死循环,后面所有 notify 被堵(边侧空闲、云侧空转)。
+            self.scheduler_reserve_full_isl = False
         try:
             out = super().schedule()
         finally:
             self.max_num_scheduled_tokens = saved_token_budget
+            self.scheduler_reserve_full_isl = saved_full_isl
             # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
             # skipped 被跳过者排队首
             post = (self.running, self.waiting, self.skipped_waiting)

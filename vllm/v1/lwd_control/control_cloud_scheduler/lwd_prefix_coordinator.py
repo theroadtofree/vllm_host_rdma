@@ -86,8 +86,8 @@ class LwdPrefixCoordinator:
 
     def _pool_hit(
         self, chain: list[bytes], max_cache_hit_length: int
-    ) -> tuple[int, int]:
-        """原生块池最长命中(单真源):返回 (命中块数, 命中 token 数)。
+    ) -> tuple[list, int, int]:
+        """原生块池最长命中(单真源):返回 (命中 KV 块列表, 命中块数, 命中 token 数)。
 
         max_cache_hit_length 与云侧请求 resume(get_computed_blocks)同值
         (prompt_tokens-1,末 token 必重算以产 logits),同一
@@ -99,16 +99,18 @@ class LwdPrefixCoordinator:
         km = self._kv_cache_manager
         if km is None:
             hit = self._digest_hit(chain)
-            return hit, hit * self._hash_block_size
-        _, num_computed_tokens = km.coordinator.find_longest_cache_hit(
+            return [], hit, hit * self._hash_block_size
+        blocks_by_group, num_computed_tokens = km.coordinator.find_longest_cache_hit(
             chain, max_cache_hit_length=max(max_cache_hit_length, 0),
         )
         if num_computed_tokens <= 0:
-            return 0, 0
+            return [], 0, 0
         # 块池命中的 token 数按 hash_block_size 整除对齐(块池按满块记录),
         # 商即命中块数,与 LwdProbeResult 的 hit_tokens == hit_blocks*bs 一致。
         hit_blocks = num_computed_tokens // self._hash_block_size
-        return hit_blocks, hit_blocks * self._hash_block_size
+        # 收集各组命中的 KVCacheBlock,供 probe 预约时 touch 防驱逐。
+        hit_kv_blocks = [blk for group in blocks_by_group for blk in group]
+        return hit_kv_blocks, hit_blocks, hit_blocks * self._hash_block_size
 
     def _coordination_block_hashes(
         self, manifest: LwdPrefixManifest
@@ -130,14 +132,17 @@ class LwdPrefixCoordinator:
 
         命中边界即边侧可声明的续算上界;数据面按此值 trim 后,云侧
         resume 又被该 declared 封顶(kv_cache_manager.get_computed_blocks),
-        故边侧 chunk offset 与云侧 computed 恒等。不在此 touch 命中块:
-        ref_cnt 为原生 1:1 记账,探针侧额外 touch 无处释放会永久 pin
-        (块池泄漏);请求 admit 时原生 ``cache_blocks`` 自会 touch 复用块。
+        故边侧 chunk offset 与云侧 computed 恒等。预约命中块时 touch 一次
+        (ref_cnt+1) 防驱逐:否则锚点请求 finish 后共享前缀块 ref_cnt 归零
+        被回收,probe 命中 vs prefill 命中不一致导致 offset 错位、队首死循环。
+        注:此 touch 暂不释放(泄漏),先保证正确性。
         无块池(单测/降级)回退摘要域记账。"""
         chain = self._coordination_block_hashes(manifest)
-        hit_blocks, hit_tokens = self._pool_hit(
+        hit_kv_blocks, hit_blocks, hit_tokens = self._pool_hit(
             chain, max_cache_hit_length=manifest.prompt_tokens - 1
         )
+        if hit_kv_blocks and self._kv_cache_manager is not None:
+            self._kv_cache_manager.block_pool.touch(hit_kv_blocks)
         self._reservations[manifest.request_id] = LwdReservation(
             manifest=manifest, hit_tokens=hit_tokens
         )

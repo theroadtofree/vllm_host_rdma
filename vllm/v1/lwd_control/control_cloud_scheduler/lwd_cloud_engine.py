@@ -71,6 +71,8 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
 # 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
+# c2e 发布重试上限:边侧消费慢时避免无限重试卡死云 step(约 10s 兜底)
+_LWD_C2E_SEND_MAX_RETRIES = 200
 
 # 云侧复用 consume 阻塞拍:空批时短暂等待,避免忙转
 _LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
@@ -732,6 +734,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             ],
         )
         if self._lwd_channel is not None:
+            retries = 0
             while not self._lwd_channel.closed:
                 if self._lwd_channel.publish(notify, edge_id):
                     logger.info(
@@ -744,8 +747,20 @@ class LwdCloudEngineCore(EngineCoreProc):
                         notify.hidden_num_elements,
                     )
                     return
+                # 背压等待期间仍服务边侧 probe:否则 _lwd_poll_coordination
+                # 只在 step 头部执行,会被本重试循环堵死,边侧 probe 干等超时,
+                # 形成 probe↔c2e 循环等待(边侧挂、云侧空转的直接原因)。
+                self._lwd_poll_coordination()
+                retries += 1
+                if retries > _LWD_C2E_SEND_MAX_RETRIES:
+                    logger.error(
+                        "[Lwd] c2e publish dropped after %d retries edge=%d",
+                        retries, edge_id,
+                    )
+                    return
                 time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
             return
+        retries = 0
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):
                 logger.info(
@@ -756,6 +771,14 @@ class LwdCloudEngineCore(EngineCoreProc):
                     notify.down_seqno,
                     finish_reasons,
                     notify.hidden_num_elements,
+                )
+                return
+            self._lwd_poll_coordination()
+            retries += 1
+            if retries > _LWD_C2E_SEND_MAX_RETRIES:
+                logger.error(
+                    "[Lwd] c2e publish dropped after %d retries edge=%d",
+                    retries, edge_id,
                 )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)

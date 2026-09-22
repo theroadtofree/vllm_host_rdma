@@ -121,6 +121,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 在重启后首个请求(probe 用旧粒度、finish 须用同一粒度才能与云侧
         # 存储的 manifest 对账),稳态请求 probe/finish 同粒度自然一致。
         self._lwd_probe_bs_by_req: dict[str, int] = {}
+        # 探前缀客户端惰性缓存(复用 hasher/tenant_key,避免每请求读文件重建)
+        self._lwd_probe_client_cache = None
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -295,21 +297,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 LwdEdgePrefixClient,
             )
 
-            with open(coord_cfg.tenant_key_file, "rb") as f:
-                tenant_key = f.read()
-            # 探测链粒度:优先用已学习的云 hash 粒度(稳态下 probe 的
+            client = self._lwd_probe_client_cache
+            if client is None:
+                with open(coord_cfg.tenant_key_file, "rb") as f:
+                    tenant_key = f.read()
+                # 探前缀客户端复用(hasher/密钥只建一次),并把总超时钳到
+                # 3s:死锁残余时快速 fail-open,避免边侧主循环 10s 级卡顿。
+                # 探测链粒度:优先用已学习的云 hash 粒度(稳态下 probe 的
             # manifest 即云域,ratio=1 直通);未学习回退边块粒度。
             cloud_id = self._lwd_default_cloud_id()
             known_bs = self._lwd_hash_bs_by_cloud.get(cloud_id)
             build_bs = known_bs or vllm_config.cache_config.block_size
             client = LwdEdgePrefixClient(
-                coord_cfg.control_url,
-                build_bs,
-                tenant_key,
-                edge_id=self._lwd_edge_id,
-                consumer_id=coord_cfg.consumer_id,
-                connect_timeout=coord_cfg.connect_timeout,
-            )
+                    coord_cfg.control_url,
+                    build_bs,
+                    tenant_key,
+                    edge_id=self._lwd_edge_id,
+                    consumer_id=coord_cfg.consumer_id,
+                    connect_timeout=min(coord_cfg.connect_timeout, 3.0),
+                )
+                self._lwd_probe_client_cache = client
             manifest = client.build_manifest(
                 request.request_id, list(request.prompt_token_ids)
             )
