@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import time
 from collections import deque
 
 from vllm.logger import init_logger
@@ -58,9 +57,6 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
         # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
-        # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 →
-        # PREFILL 步消费的间隔与中间插入的 decode 步数)
-        self._lwd_sched_step = 0
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
@@ -135,7 +131,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             for stale in list(self.lwd_gen_registered_blocks)[:512]:
                 self.lwd_gen_registered_blocks.pop(stale, None)
         self.lwd_gen_registered_blocks[request.request_id] = covered
-        logger.info(
+        logger.debug(
             "[Lwd][coord] gen-blocks registered req=%s covered_blocks=%d "
             "(prompt_blocks=%d)",
             request.request_id, covered,
@@ -282,44 +278,6 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         return not self._lwd_has_decode_ready()
 
     def schedule(self) -> SchedulerOutput:
-        # [Lwd][perf] 云侧每步 LWD 税分段之一:相位调度(容器交换)时长
-        _t = time.monotonic()
-        out = self._schedule_impl()
-        self._lwd_sched_step += 1
-        self._lwd_log_sched_batch(out)
-        logger.info(
-            "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
-        )
-        return out
-
-    def _lwd_log_sched_batch(self, out: SchedulerOutput) -> None:
-        """[Lwd][sched] 每步调度批结构化日志(lwd_backlog_probe ⑤ 段锚点)。
-
-        phase 判定:lwd_batch=EMBED 即纯 prefill 步(携带 UP 配对 seqno);
-        有排程 token 为 DECODE;否则 EMPTY。pending_notify/decode_ready
-        给出两相位各自的待吃量——EMPTY 且 pending_notify>0 = 通知已到
-        但引擎没吃(引擎线程被 publish 小睡/收割阻塞的直接信号);
-        DECODE 连跑且 pending_notify>0 = decode 插队饿 prefill。reqs 超
-        12 个截断,防大 decode 批刷屏。"""
-        batch = getattr(out, "lwd_batch", None)
-        if batch is not None and batch.batch_type == LwdBatchType.LWD_EMBED:
-            phase, seqno = "PREFILL", batch.seqno
-        else:
-            phase = "DECODE" if out.total_num_scheduled_tokens else "EMPTY"
-            seqno = ""
-        reqs = list(out.num_scheduled_tokens)
-        reqs_str = ",".join(reqs[:12]) + (
-            f",+{len(reqs) - 12}more" if len(reqs) > 12 else ""
-        )
-        logger.info(
-            "[Lwd][sched] cloud step=%d phase=%s seqno=%s reqs=[%s] tokens=%d "
-            "pending_notify=%d decode_ready=%d",
-            self._lwd_sched_step, phase, seqno, reqs_str,
-            out.total_num_scheduled_tokens, len(self.prefill_notify_queue),
-            len(self._lwd_collect_decode_requests()),
-        )
-
-    def _schedule_impl(self) -> SchedulerOutput:
         prefer_prefill = self._prefer_prefill()
         if self._force_prefill_once:
             self._force_prefill_once = False

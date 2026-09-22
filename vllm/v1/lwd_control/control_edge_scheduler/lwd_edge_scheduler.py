@@ -23,7 +23,7 @@ decode 分支不可达。
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -108,8 +108,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 生成段链增量上报水位(request_id -> 已上报满块数):只在满块数
         # 增加时发一条(全量替换语义),避免逐步刷控制面。
         self._lwd_gen_chain_sent: dict[str, int] = {}
-        # 租户 HMAC hasher 惰性缓存(避免每请求重读密钥文件)
-        self._lwd_hasher_cache = None
+        # 云侧块哈希粒度学习缓存(cloud_id -> 云 hash 粒度):probe 响应头
+        # 携带云侧 hash_block_size(压缩/混合粒度模型上与边块粒度不同,
+        # 如 DSv4 云 hash=8 而边块 128)。链按该粒度构建后,云侧采纳条件
+        # len(链)==prompt//hash 粒度 恒成立,不再要求 prompt 为边块整数倍。
+        # 未学习(首请求前)回退边块粒度,行为与学习前一致。
+        self._lwd_hash_bs_by_cloud: dict[int, int] = {}
+        # 按粒度缓存的 hasher(同租户密钥不同 block_size;数量极小,
+        # 实际部署每云一个粒度)
+        self._lwd_hasher_by_granularity: dict[int, Any] = {}
+        # 请求 probe 链粒度记账(request_id -> 建链粒度):学习换挡只发生
+        # 在重启后首个请求(probe 用旧粒度、finish 须用同一粒度才能与云侧
+        # 存储的 manifest 对账),稳态请求 probe/finish 同粒度自然一致。
+        self._lwd_probe_bs_by_req: dict[str, int] = {}
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -286,9 +297,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
             with open(coord_cfg.tenant_key_file, "rb") as f:
                 tenant_key = f.read()
+            # 探测链粒度:优先用已学习的云 hash 粒度(稳态下 probe 的
+            # manifest 即云域,ratio=1 直通);未学习回退边块粒度。
+            cloud_id = self._lwd_default_cloud_id()
+            known_bs = self._lwd_hash_bs_by_cloud.get(cloud_id)
+            build_bs = known_bs or vllm_config.cache_config.block_size
             client = LwdEdgePrefixClient(
                 coord_cfg.control_url,
-                vllm_config.cache_config.block_size,
+                build_bs,
                 tenant_key,
                 edge_id=self._lwd_edge_id,
                 consumer_id=coord_cfg.consumer_id,
@@ -308,9 +324,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     )
 
             result = asyncio.run(_probe())
+            # 学习云侧 hash 粒度;与本次建链粒度不一致时按其重建链。
+            # notify 在 probe 之后才发,故首请求(首次学习)即生效:非
+            # 整除 prompt 的链覆盖到云 hash 粒度,采纳条件恒成立。
+            learned = int(result.block_size)
+            self._lwd_hash_bs_by_cloud[cloud_id] = learned
+            if learned != build_bs:
+                chain = list(
+                    self._lwd_prefix_hasher(
+                        coord_cfg, vllm_config, learned
+                    ).build_manifest(
+                        request.request_id, list(request.prompt_token_ids)
+                    ).full_block_hashes
+                )
+            # 记账本请求 probe 的建链粒度(注意是 build_bs 而非学习值):
+            # 云侧存储的 manifest 即 probe 粒度,finish 须按同一粒度建链
+            # 对账;学习换挡只发生在重启后首个请求,故按请求记账。
+            self._lwd_probe_bs_by_req[request.request_id] = build_bs
             logger.info(
-                "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d",
-                request.request_id, result.hit_tokens, len(chain),
+                "[Lwd][edge] prefix probe req=%s hit_tokens=%d blocks=%d "
+                "hash_bs=%d",
+                request.request_id, result.hit_tokens, len(chain), learned,
             )
             # 命中边界以云侧块池单真源为准(probe 现读块池,与云侧请求
             # resume 同池同链),推进 num_computed 后边侧只 embed/发尾巴,
@@ -600,13 +634,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not coord_cfg.tenant_key_file:
             return
         try:
-            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config)
+            # finish 链粒度取本请求 probe 时的建链粒度(而非全局学习值):
+            # 云侧存储的 manifest 即 probe 粒度,两处一致校验才能对账。
+            # 学习换挡只发生在重启后首个请求,故需按请求记账。
+            probe_bs = self._lwd_probe_bs_by_req.pop(request_id, None)
+            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config, probe_bs)
             completion_ids = gen_ids or []
             manifest = hasher.build_manifest(
                 request_id, list(prompt_ids) + completion_ids
-            )
-            cloud_id = self._lwd_binding.cloud_of(
-                request_id, default=self._lwd_default_cloud_id()
             )
             message = LwdFinishNotify(
                 request_id=request_id,
@@ -614,6 +649,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 completion_tokens=len(completion_ids),
                 full_block_hashes=list(manifest.full_block_hashes),
                 edge_id=self._lwd_edge_id,
+            )
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
             )
             if not self._lwd_publish(message, cloud_id):
                 logger.warning(
@@ -681,19 +719,32 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge] gen-chain announce failed (fail-open)", exc_info=True
             )
 
-    def _lwd_prefix_hasher(self, coord_cfg, vllm_config):
-        """惰性构造并缓存租户 HMAC hasher(probe / 生成段链 / 收尾共用)。"""
-        hasher = self._lwd_hasher_cache
-        if hasher is not None:
-            return hasher
+    def _lwd_prefix_hasher(
+        self,
+        coord_cfg,
+        vllm_config,
+        hash_block_size: int | None = None,
+    ):
+        """惰性构造并缓存租户 HMAC hasher(probe / 生成段链 / 收尾共用)。
+
+        ``hash_block_size`` 指定链的块粒度:缺省为边块粒度(cache_config
+        .block_size,学习前的行为);传入从 probe 响应学到的云 hash 粒度后,
+        链与云侧采纳条件 len(链)==prompt//粒度 恒对齐。同密钥不同粒度
+        各缓存一个实例。"""
+        if hash_block_size is None:
+            hash_block_size = vllm_config.cache_config.block_size
+        cached = self._lwd_hasher_by_granularity.get(hash_block_size)
+        if cached is not None:
+            return cached
+
+        with open(coord_cfg.tenant_key_file, "rb") as f:
+            tenant_key = f.read()
         from vllm.v1.lwd_control.control_communication.lwd_prefix import (
             LwdPrefixHasher,
         )
 
-        with open(coord_cfg.tenant_key_file, "rb") as f:
-            tenant_key = f.read()
-        hasher = LwdPrefixHasher(tenant_key, vllm_config.cache_config.block_size)
-        self._lwd_hasher_cache = hasher
+        hasher = LwdPrefixHasher(tenant_key, hash_block_size)
+        self._lwd_hasher_by_granularity[hash_block_size] = hasher
         return hasher
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:

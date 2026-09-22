@@ -125,46 +125,6 @@ class LwdPrefixCoordinator:
         ratio = manifest.block_size // self._hash_block_size
         return [d for d in manifest.full_block_hashes for _ in range(ratio)]
 
-    def _lwd_group_hits(self, chain: list[bytes], max_cache_hit_length: int) -> str:
-        """诊断:逐 KV 组回报「本组能服务多少 token」。
-
-        混合注意力(SWA/Mamba)下总命中取各组最小值,且这些组会把窗口外/
-        未对齐的块排除出哈希表——总命中为 0 时,这行直接指出是哪一组塌的。
-        只读查找、异常吞掉,不影响判定。"""
-        km = self._kv_cache_manager
-        if km is None:
-            return ""
-        try:
-            from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
-
-            coordinator = km.coordinator
-            parts = []
-            for gid, group in enumerate(coordinator.kv_cache_config.kv_cache_groups):
-                spec = group.kv_cache_spec
-                if spec.block_size == self._hash_block_size:
-                    hashes = chain
-                else:
-                    hashes = BlockHashListWithBlockSize(
-                        chain, self._hash_block_size, spec.block_size
-                    )
-                blocks = coordinator.single_type_managers[gid].find_longest_cache_hit(
-                    block_hashes=hashes,
-                    max_length=max(max_cache_hit_length, 0),
-                    kv_cache_group_ids=[gid],
-                    block_pool=coordinator.block_pool,
-                    kv_cache_spec=spec,
-                    drop_eagle_block=False,
-                    alignment_tokens=coordinator.scheduler_block_size,
-                )
-                parts.append(
-                    f"{type(spec).__name__}/bs{spec.block_size}/win"
-                    f"{getattr(spec, 'sliding_window', None)}="
-                    f"{len(blocks[0]) * spec.block_size}"
-                )
-            return " ".join(parts)
-        except Exception:  # noqa: BLE001  诊断失败不阻断 probe
-            return "diag-failed"
-
     def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         """对原生块池求最长命中(单真源)并落预留(等待数据面请求认领)。
 
@@ -194,9 +154,8 @@ class LwdPrefixCoordinator:
             chain,
         )
         logger.info(
-            "[Lwd][coord] probe req=%s hit_blocks=%d hit_tokens=%d groups[%s]",
+            "[Lwd][coord] probe req=%s hit_blocks=%d hit_tokens=%d",
             manifest.request_id, hit_blocks, hit_tokens,
-            self._lwd_group_hits(chain, manifest.prompt_tokens - 1),
         )
         return LwdProbeResult(
             request_id=manifest.request_id,

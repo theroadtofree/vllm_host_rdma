@@ -471,13 +471,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
         缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
         迟到载荷幂等丢弃。"""
-        _t = time.monotonic()
         result = future.result()
-        # [Lwd][perf] 临时探针:收割时长 = RPC 往返 + worker 执行全长
-        # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
-        logger.info(
-            "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
-        )
         # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
         # token,即该请求本步的生成内容;后续仅两处流向——
         # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
