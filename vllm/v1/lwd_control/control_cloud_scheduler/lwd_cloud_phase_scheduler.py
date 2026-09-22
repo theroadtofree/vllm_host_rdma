@@ -229,8 +229,8 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             )
         # 边侧是 prefill 切块权威,云侧按预告 chunk 钳制本步预算执行
         # (只收紧不放宽原生上限):num_scheduled_tokens == 公告量,边云
-        # 锁步;mamba align 的块对齐复切在原生路径内照常生效(边侧
-        # chunk 块对齐时为 no-op)。
+        # 锁步;长 prefill 阈值/mamba 块对齐等原生"再切"机制在跟随
+        # 模式下已由基类豁免(见 _lwd_schedule_for_visible_reqs)。
         out = self._lwd_schedule_for_visible_reqs(
             [notify.request_id] if notify is not None else [],
             token_budget_cap=notify.num_tokens if notify is not None else None,
@@ -242,6 +242,19 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             # 泄压后重新点名;本步不挂 lwd_batch,不向 worker 预告配对号
             self.prefill_notify_queue.appendleft(notify)
             return out
+        # 契约校验:本步调度窗口必须恰好等于公告量(HCCL numel 配对 +
+        # 注入窗口逐行对齐)。不等即上游还有未豁免的复切/截断机制,
+        # 在调度点报清根因,好过深埋在 worker 注入处才炸。
+        scheduled = out.num_scheduled_tokens.get(notify.request_id, 0)
+        if scheduled != notify.num_tokens:
+            raise RuntimeError(
+                f"[Lwd][cloud-sched] announced chunk not executed whole: "
+                f"req={notify.request_id} seqno={notify.seqno} announced="
+                f"{notify.num_tokens} scheduled={scheduled} (budget="
+                f"{self.max_num_scheduled_tokens}, block_size="
+                f"{self.cache_config.block_size}); edge is the chunk "
+                f"authority — check for unexempted native re-split"
+            )
         # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):批配对号直接
         # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
         # 的 UP recv 以此配对边侧发来的 embeds 张量。batch_meta 承载

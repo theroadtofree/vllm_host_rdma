@@ -52,20 +52,24 @@ class LwdBaseScheduler(AsyncScheduler):
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
         saved_token_budget = self.max_num_scheduled_tokens
         # 边侧是 prefill 切块权威:跟随模式(token_budget_cap 给定 = 云侧
-        # 照单执行边侧 chunk)下同步豁免长 prefill 阈值复切。原生调度会把
-        # 超过 long_prefill_token_threshold 的 prefill 再切小
-        # (max_num_partial_prefills>1 且未显式配置时自动取
-        # max_model_len*0.04,如 768),再切后调度窗口 != 预告 chunk 行数,
-        # UP 注入窗口失配直接挂死。云侧不复切边侧已定的 chunk;预算钳制
-        # (min)仍生效,内存上界不变。
+        # 照单执行边侧 chunk)下豁免原生调度的所有"再切"机制,否则调度
+        # 窗口 != 预告 chunk 行数,UP 注入窗口失配直接挂死:
+        # 1) long_prefill_token_threshold 复切(max_num_partial_prefills>1
+        #    且未显式配置时自动取 max_model_len*0.04);
+        # 2) mamba/混合注意力状态块对齐复切(_mamba_block_aligned_split,
+        #    mamba_cache_mode=align 时把 chunk 收到 block_size 整数倍;
+        #    边侧多模态整块发出,天然非对齐,云侧复切即失配)。
+        # 云侧不复切边侧已定的 chunk;预算钳制(min)仍生效,内存上界不变。
         saved_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold
         )
+        saved_mamba_align = self.need_mamba_block_aligned_split
         if token_budget_cap is not None:
             self.max_num_scheduled_tokens = min(
                 saved_token_budget, max(0, token_budget_cap)
             )
             self.scheduler_config.long_prefill_token_threshold = 0
+            self.need_mamba_block_aligned_split = False
         try:
             out = super().schedule()
         finally:
@@ -73,6 +77,7 @@ class LwdBaseScheduler(AsyncScheduler):
             self.scheduler_config.long_prefill_token_threshold = (
                 saved_long_prefill_threshold
             )
+            self.need_mamba_block_aligned_split = saved_mamba_align
             # 按原队列拼回:running 存活者接尾,waiting 被抢占者排队尾,
             # skipped 被跳过者排队首
             post = (self.running, self.waiting, self.skipped_waiting)
