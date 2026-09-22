@@ -33,6 +33,9 @@ logger = init_logger(__name__)
 class LwdReservation:
     manifest: LwdPrefixManifest
     hit_tokens: int
+    # 预约时 touch 命中的 KV 块(probe 防驱逐的 ref_cnt+1 记账),prefill 复用
+    # (create_kv_cache_blocks 已持有)后由 complete_request 释放,防块池泄漏。
+    touched_blocks: list | None = None
 
 
 class LwdPrefixCoordinator:
@@ -135,7 +138,7 @@ class LwdPrefixCoordinator:
         故边侧 chunk offset 与云侧 computed 恒等。预约命中块时 touch 一次
         (ref_cnt+1) 防驱逐:否则锚点请求 finish 后共享前缀块 ref_cnt 归零
         被回收,probe 命中 vs prefill 命中不一致导致 offset 错位、队首死循环。
-        注:此 touch 暂不释放(泄漏),先保证正确性。
+        该预约 touch 在 complete_request(prefill 复用后)释放,抵消 ref_cnt。
         无块池(单测/降级)回退摘要域记账。"""
         chain = self._coordination_block_hashes(manifest)
         hit_kv_blocks, hit_blocks, hit_tokens = self._pool_hit(
@@ -144,7 +147,9 @@ class LwdPrefixCoordinator:
         if hit_kv_blocks and self._kv_cache_manager is not None:
             self._kv_cache_manager.block_pool.touch(hit_kv_blocks)
         self._reservations[manifest.request_id] = LwdReservation(
-            manifest=manifest, hit_tokens=hit_tokens
+            manifest=manifest,
+            hit_tokens=hit_tokens,
+            touched_blocks=hit_kv_blocks or None,
         )
         # 留一份 prompt 链供收尾校验(边侧 LwdFinishNotify 到达时比对前缀未变)
         if len(self._prompt_chains) >= self._PROMPT_CHAIN_LIMIT:
@@ -180,6 +185,11 @@ class LwdPrefixCoordinator:
         reservation = self._reservations.get(request_id)
         if reservation is None:
             return
+        # 释放预约 touch:prefill 已复用(create_kv_cache_blocks 已对命中块
+        # ref_cnt+1),抵消 probe 时的预约 pin,避免块永久泄漏。幂等:释放后清空。
+        if reservation.touched_blocks and self._kv_cache_manager is not None:
+            self._kv_cache_manager.block_pool.free_blocks(reservation.touched_blocks)
+            reservation.touched_blocks = None
         chain = self._coordination_block_hashes(reservation.manifest)
         before = len(self._completed_hashes)
         self._completed_hashes.update(chain)
@@ -281,6 +291,16 @@ class LwdPrefixCoordinator:
         时交叉校验(apply_finish_chain);并顺带校验 prompt 长度与预留 manifest
         一致(参考 `_finish_requests` 的同款检查)。"""
         reservation = self._reservations.pop(request_id, None)
+        # 兜底释放预约 touch:abort/提前终止时 complete_request 未跑,预约 pin
+        # 仍未释放;此处是 reservation 的最终摘除点,统一收口防泄漏。正常路径
+        # complete_request 已释放并置 None,此处幂等跳过。
+        if (
+            reservation is not None
+            and reservation.touched_blocks
+            and self._kv_cache_manager is not None
+        ):
+            self._kv_cache_manager.block_pool.free_blocks(reservation.touched_blocks)
+            reservation.touched_blocks = None
         if reservation is not None and reservation.manifest.prompt_tokens != prompt_tokens:
             logger.warning(
                 "[Lwd][coord] finish prompt length drifted req=%s "
