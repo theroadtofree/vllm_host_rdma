@@ -45,6 +45,11 @@ class LwdEmbedBatch:
     cloud_id: int = 0
     # Absolute prompt offsets; cloud token_ids contain lengths-only placeholders.
     token_offsets: list[int] = field(default_factory=list)
+    # 多模态(image)适配:本 chunk 是否携带 mrope positions([n,3] 行序,
+    # 边调度器准入期一次性算好按 chunk 列切片);复用既有 token_offsets
+    # 表达 chunk 绝对偏移,不另设同义字段。
+    has_mrope: bool = False
+    mrope_positions: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
