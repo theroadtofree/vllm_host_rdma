@@ -114,6 +114,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         #   带不出哈希链——云侧 prompt 是占位零值 token,前缀缓存
         #   只能靠边侧按真实内容算出的哈希链命中。
         self.kv_cache_manager.enable_caching = False
+        # 引擎初始化对 0 KV 组的模型强制关 chunked prefill
+        # (core.py:136-141,"model without KVCache")——边侧恰是 0 KV 组
+        # (worker get_kv_cache_spec={}),该开关一关,原生 waiting 段对
+        # 超预算 prompt 直接 break 不截断(scheduler.py:696-702),chunk
+        # 切片无从谈起(逃生通道的"允许原生截断"同样依赖它)。原生关它
+        # 的理由(encoder 模型无 KV 不能分块前向)对边侧不成立:边侧
+        # forward 被 LWD 劫持,chunk 是纯调度记账,执行层只 embed 切片。
+        # 此处重新打开;flag 在 schedule() 时才被读取,构造期生效。
+        self.scheduler_config.enable_chunked_prefill = True
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
