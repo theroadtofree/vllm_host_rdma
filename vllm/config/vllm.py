@@ -869,6 +869,10 @@ class VllmConfig:
         # 云侧前缀复用协调:parse + validate(依赖 lwd_config 解析结果判边/云角色)。
         raw_coord = additional.get("lwd_coordination") or {}
         self.lwd_coordination = LwdCoordinationConfig.from_dict(raw_coord)
+        # 前缀协商(跨边 KV 共享)暂时禁用:probe 命中与 prefill 命中不一致
+        # (锚点请求 finish 后共享前缀块被回收)会导致边/云进度错位、
+        # 队首死循环。边侧发完整 prompt、云侧完整 prefill。
+        self.lwd_coordination.enabled = False
         if self.lwd_coordination.enabled:
             self.lwd_coordination.validate(
                 lwd_mode=self.lwd_config.mode,
