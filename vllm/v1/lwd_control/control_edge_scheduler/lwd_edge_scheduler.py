@@ -169,6 +169,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # len(链)==prompt//hash 粒度 恒成立,不再要求 prompt 为边块整数倍。
         # 未学习(首请求前)回退边块粒度,行为与学习前一致。
         self._lwd_hash_bs_by_cloud: dict[int, int] = {}
+        # 云侧 mamba 对齐网格学习缓存(cloud_id -> scheduler_block_size,
+        # 即云各 KV 组块大小 LCM):probe 响应头公告。学到即置
+        # need_mamba_block_aligned_split=True 并用网格覆写
+        # _mamba_block_aligned_split——边侧恢复上游"chunk 自动对齐"
+        # 语义,max_num_batched_tokens 回归纯性能旋钮;0/未学到不重切。
+        self._lwd_align_grid_by_cloud: dict[int, int] = {}
         # 按粒度缓存的 hasher(同租户密钥不同 block_size;数量极小,
         # 实际部署每云一个粒度)
         self._lwd_hasher_by_granularity: dict[int, Any] = {}
@@ -571,6 +577,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             learned = int(result.block_size)
             cloud_id = self._lwd_default_cloud_id()
             self._lwd_hash_bs_by_cloud[cloud_id] = learned
+            # 学习云侧 mamba 对齐网格并开启边侧自动对齐重切:此后原生
+            # 调度的两个重切点(scheduler.py:436/726)用网格自动收 chunk,
+            # 快照网格与 chunk 网格重合,max_num_batched_tokens 无需
+            # 再手工配成对齐倍数(根治"静默不命中")。
+            grid = int(getattr(result, "alignment_tokens", 0) or 0)
+            if grid > 0:
+                self._lwd_align_grid_by_cloud[cloud_id] = grid
+                if not self.need_mamba_block_aligned_split:
+                    self.need_mamba_block_aligned_split = True
+                    logger.info(
+                        "[Lwd][edge] mamba align grid learned: cloud=%d "
+                        "grid=%d (auto chunk alignment enabled)",
+                        cloud_id, grid,
+                    )
+                if grid > self.max_num_scheduled_tokens:
+                    logger.warning(
+                        "[Lwd][edge] align grid %d > max_num_batched_tokens "
+                        "%d: chunks smaller than one grid cannot be "
+                        "aligned (request would stall); raise "
+                        "max_num_batched_tokens",
+                        grid, self.max_num_scheduled_tokens,
+                    )
             if learned != build_bs:
                 cfg_pair = self._lwd_probe_coord_cfg()
                 if cfg_pair is not None:
@@ -630,6 +658,60 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             req.num_computed_tokens < req.num_prompt_tokens
             for req in self.running
         )
+
+    def _mamba_block_aligned_split(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+    ) -> int:
+        """用云侧公告的对齐网格重放原生 mamba 对齐重切(根治"1536 手工对齐")。
+
+        背景:边侧无 mamba 层(has_mamba_layers=False),原生开关恒关;
+        云侧 follow 模式又不能自行复切边侧 chunk——对齐责任只能落在
+        边侧。网格(scheduler_block_size = 云各 KV 组块大小 LCM)经
+        probe 响应头逐云学习;学到后 need_mamba_block_aligned_split
+        置真,原生调度的两个重切点自动走这里。
+
+        语义与原生 ``Scheduler._mamba_block_aligned_split`` 逐行一致
+        (中间块收到网格整数倍、末个对齐块强制收在 last_cache_position、
+        尾巴直通),仅块大小来源换成云侧公告网格。网格未学到时本方法
+        不被调用(开关恒关),行为与学习前完全一致。"""
+        cloud_id = self._lwd_binding.cloud_of(
+            request.request_id, default=self._lwd_default_cloud_id()
+        )
+        block_size = self._lwd_align_grid_by_cloud.get(cloud_id, 0)
+        if block_size <= 0:
+            return num_new_tokens
+        num_computed_tokens = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        if num_computed_tokens < max(
+            request.num_prompt_tokens, request.num_tokens - 1
+        ):
+            last_cache_position = (
+                request.num_tokens - request.num_tokens % block_size
+            )
+            if self.use_eagle:
+                last_cache_position = max(last_cache_position - block_size, 0)
+            num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
+            if num_computed_tokens_after_sched < last_cache_position:
+                # align to grid
+                num_new_tokens = num_new_tokens // block_size * block_size
+            elif (
+                num_computed_tokens
+                < last_cache_position
+                < num_computed_tokens_after_sched
+            ):
+                # force to cache the last aligned chunk
+                num_new_tokens = last_cache_position - num_computed_tokens
+            else:
+                # prefill the last few tokens
+                pass
+        return num_new_tokens
 
     @staticmethod
     def _lwd_request_has_mm(request: Request) -> bool:

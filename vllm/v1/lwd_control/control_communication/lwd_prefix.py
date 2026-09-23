@@ -32,6 +32,7 @@ HEADER_INSTANCE_ID = "X-Edge-Cloud-Instance-ID"
 HEADER_BLOCK_SIZE = "X-Edge-Cloud-Block-Size"
 HEADER_HIT_BLOCKS = "X-Edge-Cloud-Prefix-Hit-Blocks"
 HEADER_HIT_TOKENS = "X-Edge-Cloud-Prefix-Hit-Tokens"
+HEADER_ALIGNMENT_TOKENS = "X-Edge-Cloud-Alignment-Tokens"
 HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
 
 _FULL_BLOCK_DOMAIN = b"\x01"
@@ -356,6 +357,9 @@ class LwdProbeResult:
     block_size: int
     hit_blocks: int
     hit_tokens: int
+    # 云侧对齐网格(scheduler_block_size,各 KV 组块大小 LCM):边侧按它
+    # 对 chunk 做 mamba 对齐重切。0 = 未公告(旧版云/降级),边侧不重切
+    alignment_tokens: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.instance_id:
@@ -364,6 +368,8 @@ class LwdProbeResult:
             raise ValueError("invalid prefix hit values")
         if self.hit_tokens != self.hit_blocks * self.block_size:
             raise ValueError("hit_tokens must equal hit_blocks * block_size")
+        if self.alignment_tokens < 0:
+            raise ValueError("alignment_tokens must not be negative")
 
     def to_headers(self) -> dict[str, str]:
         return {
@@ -373,6 +379,7 @@ class LwdProbeResult:
             HEADER_BLOCK_SIZE: str(self.block_size),
             HEADER_HIT_BLOCKS: str(self.hit_blocks),
             HEADER_HIT_TOKENS: str(self.hit_tokens),
+            HEADER_ALIGNMENT_TOKENS: str(self.alignment_tokens),
         }
 
     @classmethod
@@ -394,6 +401,10 @@ class LwdProbeResult:
                 block_size=int(required(HEADER_BLOCK_SIZE)),
                 hit_blocks=int(required(HEADER_HIT_BLOCKS)),
                 hit_tokens=int(required(HEADER_HIT_TOKENS)),
+                # 旧版云无此头:缺省 0(不公告、不重切),向后兼容
+                alignment_tokens=int(values.get(
+                    HEADER_ALIGNMENT_TOKENS.lower(), "0"
+                )),
             )
         except ValueError as exc:
             raise ValueError("cloud prefix result contains invalid integers") from exc

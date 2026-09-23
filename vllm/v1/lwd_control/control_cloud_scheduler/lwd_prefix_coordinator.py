@@ -205,7 +205,16 @@ class LwdPrefixCoordinator:
             block_size=self._hash_block_size,
             hit_blocks=hit_blocks,
             hit_tokens=hit_tokens,
+            alignment_tokens=self._resolve_alignment_tokens(),
         )
+
+    def _resolve_alignment_tokens(self) -> int:
+        """云侧对齐网格(scheduler_block_size = 各 KV 组块大小 LCM),随
+        probe 响应公告给边侧做 mamba 对齐重切;无块池(降级)返回 0。"""
+        km = self._kv_cache_manager
+        if km is None:
+            return 0
+        return int(getattr(km.coordinator, "scheduler_block_size", 0))
 
     def complete_request(self, request_id: str) -> None:
         """数据面请求 prompt 算完后,把其 manifest 的全部满块协调摘要

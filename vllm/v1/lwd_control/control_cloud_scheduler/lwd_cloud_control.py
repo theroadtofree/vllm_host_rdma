@@ -236,6 +236,7 @@ def create_lwd_cloud_control_app(
                 "block_size": result.block_size,
                 "hit_blocks": result.hit_blocks,
                 "hit_tokens": result.hit_tokens,
+                "alignment_tokens": result.alignment_tokens,
             },
             headers=result.to_headers(),
         )
