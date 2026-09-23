@@ -87,6 +87,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 一次性消费 scheduler_cls,后设无效(注入失效,首请求即崩)
         vllm_config.scheduler_config.scheduler_cls = LwdEdgeScheduler
         super().__init__(*args, **kwargs)
+        # probe 完成唤醒钩:probe 线程完成回调经它敲 WAKEUP,使纯睡眠期
+        # 的引擎进步回灌结果(钩在 super 之后、任何请求之前安装,等价
+        # 构造注入;input_queue 由 super 创建,无构造期竞态)
+        self.scheduler.lwd_probe_wakeup = self._lwd_wakeup
         config = LwdConfig.from_env_and_config(vllm_config)
         # 层日志总开关:env 已开则不动,config 段开则补开(仅本进程)
         LwdLogBase.set_debug(config.debug)
@@ -304,9 +308,19 @@ class LwdEdgeEngineCore(EngineCoreProc):
         """c2e 载荷队列与待收割批队列都计入工作:WAKEUP 只能打断阻塞的
         get,轮询循环是否退出由本判据决定(core.py while not has_work)。
         批队列非空必须计入——否则最后一批派发后引擎睡眠,最终 token
-        永不收割交付。"""
+        永不收割交付。probe 完成队列/发布滞留队列同样计入:回灌与
+        补投都只发生在步循环里,不计入会在纯等待期睡死。"""
         return (super().has_work() or not self.lwd_c2e_meta_queue.empty()
-                or self._lwd_batch_queue)
+                or self._lwd_batch_queue
+                or self.scheduler.lwd_probe_results_pending()
+                or self.scheduler.lwd_has_pending_publishes())
+
+    def _lwd_wakeup(self) -> None:
+        """probe 完成唤醒(probe 线程经 scheduler.lwd_probe_wakeup 调用)。"""
+        try:
+            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+        except Exception:  # noqa: BLE001  队列关闭等关停竞态,丢弃无害
+            pass
 
     def _lwd_edge_step(self) -> tuple[dict[int, object] | None, bool]:
         """单步编排(批队列异步化+多批在飞,embed 优先):收割队首直至
@@ -324,6 +338,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
 
         [Lwd][sched] 三类日志(饿死分析锚点):每批 harvest(含队列滞留
         wait)、每批 dispatch(含 ahead 队列构成/c2e 水位)、每步汇总。"""
+        # 步首先回灌异步 probe 结果(完成入队,可能即刻产生可调度请求),
+        # 再补投背压滞留的控制消息(保序在一切新发布之前)
+        self.scheduler.lwd_edge_drain_probe_results()
+        self.scheduler.lwd_edge_flush_pending()
         outputs: list = []
         finished_reqs: set = set()
         prefill_work = False

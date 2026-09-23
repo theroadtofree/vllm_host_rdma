@@ -70,14 +70,17 @@ class LwdEdgePrefixClient:
         session: Any,
         request_id: str,
         prompt_token_ids: list[int],
+        manifest: LwdPrefixManifest | None = None,
     ) -> LwdProbeResult:
         """POST 探测并解析响应头命中;失败即抛(fail-closed,由边拒绝请求)。
 
-        命中结果由调用方(``LwdEdgeScheduler._lwd_probe_prefix``)消费:
-        命中时推进 request.num_computed_tokens,使边侧只 embed/发尾巴(续算)。"""
+        命中结果由调用方消费(命中时推进 request.num_computed_tokens,
+        使边侧只 embed/发尾巴)。manifest 可传入调用方已建好的链复用
+        (避免一次探测两次 O(N) 建链);缺省现建。"""
         import aiohttp
 
-        manifest = self.build_manifest(request_id, prompt_token_ids)
+        if manifest is None:
+            manifest = self.build_manifest(request_id, prompt_token_ids)
         headers, body = self.build_control_request(manifest)
         timeout = aiohttp.ClientTimeout(total=self._connect_timeout)
         async with session.post(

@@ -6,7 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from logging import DEBUG
+from collections import deque
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -69,10 +69,12 @@ logger = init_logger(__name__)
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 
-# 步元数据队满重试小睡:元数据不可丢(边侧据此预挂精确尺寸 recv)
-_LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
-# c2e 发布重试上限:边侧消费慢时避免无限重试卡死云 step(约 10s 兜底)
-_LWD_C2E_SEND_MAX_RETRIES = 200
+# c2e 滞留告警水位:pending 超过该量说明边侧消费持续滞后(不丢,
+# 步首持续补投,仅告警观测)
+_LWD_C2E_PENDING_WARN = 200
+# c2e 滞留 fail-fast 时限:队首超时视为边侧死亡(防无请求时热步旋
+# + 队列无界增长)
+_LWD_C2E_PENDING_FAIL_AFTER_S = 30.0
 
 # 云侧复用 consume 阻塞拍:空批时短暂等待,避免忙转
 _LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
@@ -95,6 +97,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 协调是否启用);后设会与之竞态(实测 AttributeError → EXECUTOR_FAILED)。
         self._lwd_prefix_coordinator: LwdPrefixCoordinator | None = None
         self._lwd_cloud_control_processor: LwdCloudControlProcessor | None = None
+        # probe 命令本地暂存(唤醒线程生产/主循环消费):super 前占位,
+        # has_work 覆写与 step 覆写随时可读
+        self._lwd_coord_pending: queue.Queue = queue.Queue()
+        # c2e 滞留队列(E4 根治):edge_id -> deque[(notify, t_enqueue)],
+        # 边侧背压时保序滞留、步首补投,替代旧版主循环 sleep 自旋
+        self._lwd_c2e_pending: dict[int, "deque"] = {}
         # 生成段链台账:rid -> (链粒度, 链)。**同样在 super() 前建**——
         # PRE_OUT IO 线程的分派分支要写它;交付调度器(读侧)在
         # _lwd_setup_coordination 里做(主线程,步循环之前,无竞态)。
@@ -139,9 +147,20 @@ class LwdCloudEngineCore(EngineCoreProc):
             instance_id=coord_cfg.instance_id,
             kv_cache_manager=getattr(self.scheduler, "kv_cache_manager", None),
         )
+        # probe 命令事件驱动(E3 根治):mp 命令队列由唤醒线程阻塞消费,
+        # 进本地线程安全队列 + WAKEUP 敲主循环——probe 应答不再等
+        # 50ms 空闲拍或下一个 step 边界(空闲时 WAKEUP 即醒,忙时
+        # step 头部 poll 照常)。块池操作仍只在主循环线程执行(无线程
+        # 安全问题,唤醒线程只搬命令不碰协调器)。pending 队列在
+        # super 前已建,此处直接使用。
         self._lwd_cloud_control_processor = LwdCloudControlProcessor(
-            self.cloud_control_command_queue, self.cloud_control_event_queue
+            self._lwd_coord_pending, self.cloud_control_event_queue
         )
+        threading.Thread(
+            target=self._lwd_coord_wake_loop,
+            name="lwd-ctrl-wake",
+            daemon=True,
+        ).start()
         # 生成段链台账交付调度器(引用交付:IO 线程写 / 调度线程读,dict 赋值
         # 原子,与 seqno registry 同款)。**只在此暴露**(而非 IO 线程的
         # _lwd_init_dispatch_state):此刻协调确实建成,步循环尚未开始,无竞态;
@@ -157,47 +176,44 @@ class LwdCloudEngineCore(EngineCoreProc):
             hash_block_size,
         )
 
+    def _lwd_coord_wake_loop(self) -> None:
+        """唤醒线程体:阻塞收 mp 命令队列,转本地队列 + WAKEUP 主循环。
+
+        只搬命令不执行(块池/probe 本体归主循环线程);WAKEUP 原生语义
+        即丢弃消息体,数据与唤醒分离,多投无害。"""
+        command_queue = self.cloud_control_command_queue
+        while True:
+            try:
+                command = command_queue.get()
+            except (EOFError, OSError):
+                return  # 队列随进程关停断裂,退出线程
+            self._lwd_coord_pending.put(command)
+            try:
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+            except Exception:  # noqa: BLE001  关停竞态,丢弃无害
+                pass
+
     def _lwd_poll_coordination(self) -> None:
-        """消费控制面 probe 命令(引擎步循环头部与空闲拍,非阻塞)。"""
+        """消费控制面 probe 命令(引擎步循环头部/WAKEUP 后,非阻塞)。
+
+        顺带扫预留 TTL:probe 落了预留但数据面请求永不到达(notify
+        丢失/边 crash)时释放 pin,防块池缓慢泄漏。"""
         processor = self._lwd_cloud_control_processor
         coordinator = self._lwd_prefix_coordinator
         if processor is not None and coordinator is not None:
             processor.poll(coordinator)
-
-    # 空闲拍控制面服务间隔:原生 _process_input_queue 在无请求时于
-    # input_queue 上无限阻塞,引擎不进 step,probe 消费点(步循环头部)
-    # 永不执行——云空闲时边侧同步 probe 必然干等到超时(表现为边侧
-    # hit_tokens=0/fail-open 或手动探针 TimeoutError)。改为有界等待,
-    # 每拍服务一次控制面命令队列,使 probe 与引擎步循环解耦。
-    _LWD_IDLE_WAIT_S = 0.05
+            coordinator.sweep_expired(time.monotonic())
 
     def _process_input_queue(self) -> None:
-        """空闲等待覆写:仅协调启用时生效(未启用走原生,零行为变化)。"""
+        """空闲等待覆写:仅协调启用时生效(未启用走原生,零行为变化)。
+
+        E3 根治后回归近原生:probe 命令到达即由唤醒线程敲 WAKEUP,
+        原生阻塞 get 立即返回;此处只在每轮客户端请求 drain 后补
+        一次命令消费(probe 执行归主循环线程,块池线程安全)。"""
         if getattr(self, "_lwd_cloud_control_processor", None) is None:
             return super()._process_input_queue()
-        waited = False
-        while not self.has_work() and self.is_running():
-            # 空闲拍先服务控制面:probe 命令不与「引擎有待办请求」耦合
-            self._lwd_poll_coordination()
-            self._notify_idle_state_callbacks()
-            if self.input_queue.empty():
-                # Drain aborts queue; all aborts are also processed via input_queue.
-                with self.aborts_queue.mutex:
-                    self.aborts_queue.queue.clear()
-                if logger.isEnabledFor(DEBUG):
-                    logger.debug("EngineCore waiting for work.")
-                    waited = True
-            try:
-                req = self.input_queue.get(timeout=self._LWD_IDLE_WAIT_S)
-                self._handle_client_request(*req)
-            except queue.Empty:
-                continue
-        if waited:
-            logger.debug("EngineCore loop active.")
-        # Handle any more client requests.
-        while not self.input_queue.empty():
-            req = self.input_queue.get_nowait()
-            self._handle_client_request(*req)
+        super()._process_input_queue()
+        self._lwd_poll_coordination()
 
     def _lwd_claim_reservation(self, request: Request) -> None:
         """认领前缀复用预留(admit 期,观测用;续算由 block_hasher 驱动)。"""
@@ -606,12 +622,25 @@ class LwdCloudEngineCore(EngineCoreProc):
         request.lwd_resume_cap_tokens = wire.prefix_hit_tokens
         return request
     
+    def has_work(self) -> bool:
+        """probe 命令与 c2e 滞留计入工作:原生 _process_input_queue 在
+        has_work 为假时阻塞循环,仅 WAKEUP 不会让它返回——必须让
+        「有待消费的 probe 命令/待补投的 c2e」直接撑起 has_work,
+        引擎才会进步执行 poll/flush(都在步内主线程完成)。"""
+        return (
+            super().has_work()
+            or not self._lwd_coord_pending.empty()
+            or any(self._lwd_c2e_pending.values())
+        )
+
     def step_with_batch_queue(self):
         self._lwd_poll_coordination()
+        self._lwd_flush_c2e_pending()
         return super().step_with_batch_queue()
 
     def step(self):
         self._lwd_poll_coordination()
+        self._lwd_flush_c2e_pending()
         return super().step()
 
     def lwd_handle_model_output(
@@ -706,9 +735,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         finish_reasons: list[int],
         usages: dict[str, LwdUsage] | None = None,
     ) -> None:
-        """步元数据(含逐请求 finish_reasons 完成码 + usage)发边:队满小睡
-        重试(元数据不可丢),关停(closed)退出。req_ids 出口剥离命名空间,
-        边侧只看原始 id。
+        """步元数据(含逐请求 finish_reasons 完成码 + usage)发边:背压进
+        有序滞留队列由步首补投(元数据不可丢,主循环零 sleep)。req_ids
+        出口剥离命名空间,边侧只看原始 id。
 
         usages:按云内包装 id 命中,与出口 req_ids 按位对齐;空 dict 项
         表示该请求本步无 usage。参考分支经探针 SSE 末 chunk 回 usage,我们
@@ -718,7 +747,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         down_seqno,一份 C2eNotify 严格配对一次 DOWN 发送),本方法只
         按分组结果定向发布:云侧复用经单通道 publish(dest=edge_id,
         per-identity FIFO 独立,某边消费慢只反压自己);1E1C 走单
-        publisher。"""
+        publisher。
+
+        失败语义(E4 根治):背压时 notify 进该边有序滞留队列,步首
+        flush 补投(保序,down_seqno 链无乱序),主循环零 sleep——
+        旧版队满小睡自旋会让云步循环被边侧消费滞后拖死,并反过来
+        加剧边侧 awaiting 堆积(双边正反馈)。"""
         usage_by_req = usages or {}
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
@@ -733,52 +767,66 @@ class LwdCloudEngineCore(EngineCoreProc):
                 for rid in meta.req_ids
             ],
         )
-        if self._lwd_channel is not None:
-            retries = 0
-            while not self._lwd_channel.closed:
-                if self._lwd_channel.publish(notify, edge_id):
-                    logger.info(
-                        "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
-                        "down_seqno=%s finish=%s hidden_elems=%s",
-                        edge_id,
-                        len(notify.req_ids),
-                        notify.down_seqno,
-                        finish_reasons,
-                        notify.hidden_num_elements,
-                    )
-                    return
-                # 背压等待期间仍服务边侧 probe:否则 _lwd_poll_coordination
-                # 只在 step 头部执行,会被本重试循环堵死,边侧 probe 干等超时,
-                # 形成 probe↔c2e 循环等待(边侧挂、云侧空转的直接原因)。
-                self._lwd_poll_coordination()
-                retries += 1
-                if retries > _LWD_C2E_SEND_MAX_RETRIES:
-                    logger.error(
-                        "[Lwd] c2e publish dropped after %d retries edge=%d",
-                        retries, edge_id,
-                    )
-                    return
-                time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+        pending = self._lwd_c2e_pending.setdefault(edge_id, deque())
+        if pending:
+            pending.append((notify, time.monotonic()))
+            self._lwd_c2e_warn_if_backlogged(edge_id)
             return
-        retries = 0
-        while not self._lwd_post_out.closed:
-            if self._lwd_post_out.publish(notify):
+        if self._lwd_c2e_send_once(edge_id, notify):
+            logger.info(
+                "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
+                "down_seqno=%s finish=%s hidden_elems=%s",
+                edge_id,
+                len(notify.req_ids),
+                notify.down_seqno,
+                finish_reasons,
+                notify.hidden_num_elements,
+            )
+            return
+        pending.append((notify, time.monotonic()))
+        self._lwd_c2e_warn_if_backlogged(edge_id)
+
+    def _lwd_c2e_send_once(self, edge_id: int, notify: LwdC2eNotify) -> bool:
+        """单发尝试(云侧复用按 dest 定向;1E1C 单 publisher)。"""
+        if self._lwd_channel is not None:
+            return self._lwd_channel.publish(notify, edge_id)
+        if self._lwd_post_out is not None:
+            return self._lwd_post_out.publish(notify)
+        return False
+
+    def _lwd_flush_c2e_pending(self) -> None:
+        """步首补投 c2e 滞留(按边 FIFO;元数据不可丢,失败留队下步再来)。
+
+        队首滞留超 _LWD_C2E_PENDING_FAIL_AFTER_S 视为边侧死亡
+        fail-fast:滞留期间 has_work 恒真、引擎以空步热旋(有界的
+        30s 满速自旋),到时即抛错而不是无限热旋+队列无界增长
+        (与边侧发布滞留同级语义)。"""
+        now = time.monotonic()
+        for edge_id, pending in self._lwd_c2e_pending.items():
+            while pending:
+                notify, t_enqueue = pending[0]
+                if now - t_enqueue > _LWD_C2E_PENDING_FAIL_AFTER_S:
+                    raise RuntimeError(
+                        f"[LWD] c2e publish to edge {edge_id} stalled for "
+                        f"{_LWD_C2E_PENDING_FAIL_AFTER_S}s "
+                        f"(down_seqno={notify.down_seqno} still pending; "
+                        "edge channel dead?)"
+                    )
+                if not self._lwd_c2e_send_once(edge_id, notify):
+                    break
+                pending.popleft()
                 logger.info(
-                    "[Lwd][cloud-ctrl] publish C2eNotify edge=%d reqs=%d "
-                    "down_seqno=%s finish=%s hidden_elems=%s",
-                    edge_id,
-                    len(notify.req_ids),
-                    notify.down_seqno,
-                    finish_reasons,
-                    notify.hidden_num_elements,
+                    "[Lwd][cloud-ctrl] deferred C2eNotify flushed: edge=%d "
+                    "down_seqno=%s lag=%.1fms",
+                    edge_id, notify.down_seqno,
+                    (now - t_enqueue) * 1000,
                 )
-                return
-            self._lwd_poll_coordination()
-            retries += 1
-            if retries > _LWD_C2E_SEND_MAX_RETRIES:
-                logger.error(
-                    "[Lwd] c2e publish dropped after %d retries edge=%d",
-                    retries, edge_id,
-                )
-                return
-            time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+
+    def _lwd_c2e_warn_if_backlogged(self, edge_id: int) -> None:
+        pending = self._lwd_c2e_pending.get(edge_id)
+        if pending is not None and len(pending) >= _LWD_C2E_PENDING_WARN:
+            logger.warning(
+                "[Lwd] c2e pending backlogged: edge=%d depth=%d "
+                "(edge consumption stalled?)",
+                edge_id, len(pending),
+            )

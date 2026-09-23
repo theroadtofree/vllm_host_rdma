@@ -17,6 +17,7 @@ trim 后随 notify 回传,云侧 resume 再被该 declared 封顶
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from vllm.logger import init_logger
@@ -36,6 +37,16 @@ class LwdReservation:
     # 预约时 touch 命中的 KV 块(probe 防驱逐的 ref_cnt+1 记账),prefill 复用
     # (create_kv_cache_blocks 已持有)后由 complete_request 释放,防块池泄漏。
     touched_blocks: list | None = None
+    # probe 时算好的协调链缓存(E5):coordination_hashes/complete_request
+    # 直接复用,消除 admit 期与每个 decode 步的重复 O(块数) 重建。
+    chain: list[bytes] | None = None
+    # TTL 清扫维度:落预留时刻(单调钟)与是否已被数据面认领。只有
+    # 「预约了但请求永不到达」(notify 丢失/边 crash)才需 sweep 兜底;
+    # 已认领预留的 pin 由 complete/finish 正常释放,不在此列。
+    created_at: float = 0.0
+    claimed: bool = False
+    # complete_request 幂等短路:首发布后置 True,后续 decode 步零开销
+    completed_published: bool = False
 
 
 class LwdPrefixCoordinator:
@@ -66,13 +77,20 @@ class LwdPrefixCoordinator:
         self._kv_cache_manager = kv_cache_manager
 
     _PROMPT_CHAIN_LIMIT = 4096
+    # 未认领预留的 TTL:probe 落预留后数据面请求应秒级到达(notify 与
+    # probe 同请求同通道);超时未到视为孤儿(notify 丢失/边 crash),
+    # 由 sweep_expired 释放 pin 并摘除
+    _RESERVATION_TTL_S = 60.0
 
     def coordination_hashes(self, request_id: str) -> list[bytes] | None:
         """返回该请求预留 manifest 的协调摘要链(续算/块哈希同源);无预留 None。"""
         reservation = self._reservations.get(request_id)
         if reservation is None:
             return None
-        return self._coordination_block_hashes(reservation.manifest)
+        # E5:优先复用 probe 时缓存的链(免重建);旧预留无缓存现算补齐
+        if reservation.chain is None:
+            reservation.chain = self._coordination_block_hashes(reservation.manifest)
+        return reservation.chain
 
     def _digest_hit(self, chain: list[bytes]) -> int:
         """摘要域最长命中块数(``complete_request`` 回填的集合)。
@@ -146,10 +164,24 @@ class LwdPrefixCoordinator:
         )
         if hit_kv_blocks and self._kv_cache_manager is not None:
             self._kv_cache_manager.block_pool.touch(hit_kv_blocks)
+        # 同键重复 probe(边侧重试):覆写前释放旧预留的 pin,防孤儿泄漏
+        old = self._reservations.get(manifest.request_id)
+        if (
+            old is not None
+            and old.touched_blocks
+            and self._kv_cache_manager is not None
+        ):
+            logger.warning(
+                "[Lwd][coord] duplicate probe req=%s: releasing stale pin",
+                manifest.request_id,
+            )
+            self._kv_cache_manager.block_pool.free_blocks(old.touched_blocks)
         self._reservations[manifest.request_id] = LwdReservation(
             manifest=manifest,
             hit_tokens=hit_tokens,
             touched_blocks=hit_kv_blocks or None,
+            chain=chain,
+            created_at=time.monotonic(),
         )
         # 留一份 prompt 链供收尾校验(边侧 LwdFinishNotify 到达时比对前缀未变)
         if len(self._prompt_chains) >= self._PROMPT_CHAIN_LIMIT:
@@ -185,14 +217,21 @@ class LwdPrefixCoordinator:
         reservation = self._reservations.get(request_id)
         if reservation is None:
             return
+        # E5 幂等短路:首发布后每个 decode 步零开销(不再重建链、不再
+        # 扫 O(块数) 的 set update)
+        if reservation.completed_published:
+            return
         # 释放预约 touch:prefill 已复用(create_kv_cache_blocks 已对命中块
         # ref_cnt+1),抵消 probe 时的预约 pin,避免块永久泄漏。幂等:释放后清空。
         if reservation.touched_blocks and self._kv_cache_manager is not None:
             self._kv_cache_manager.block_pool.free_blocks(reservation.touched_blocks)
             reservation.touched_blocks = None
-        chain = self._coordination_block_hashes(reservation.manifest)
+        if reservation.chain is None:
+            reservation.chain = self._coordination_block_hashes(reservation.manifest)
+        chain = reservation.chain
         before = len(self._completed_hashes)
         self._completed_hashes.update(chain)
+        reservation.completed_published = True
         # 幂等回填:prompt 算完后每个 decode 步都会被调一次,只有真新增
         # 摘要时才打日志(否则长生成把日志刷满,掩盖 probe 行)
         if len(self._completed_hashes) != before:
@@ -205,9 +244,40 @@ class LwdPrefixCoordinator:
         """数据面请求认领预留,返回命中续算起点(token 数);无预留返回 None。
 
         续算边界已由块池单真源闭环(probe 命中 == 块池 resume),本方法
-        仅保留 admit 期可观测(见 engine)。"""
+        仅保留 admit 期可观测(见 engine)。认领即标记:已认领预留不
+        参与 TTL 清扫(pin 由 complete/finish 正常释放)。"""
         reservation = self._reservations.get(request_id)
-        return None if reservation is None else reservation.hit_tokens
+        if reservation is None:
+            return None
+        reservation.claimed = True
+        return reservation.hit_tokens
+
+    def sweep_expired(self, now: float) -> int:
+        """清扫超 TTL 仍未认领的预留:释放 pin 并摘除,返回清扫数。
+
+        调用点:_lwd_poll_coordination(引擎步循环头部/WAKEUP 后,主循环
+        线程,与 probe/complete/finish 同线程,无竞态)。只清未认领的:
+        已认领预留可能处于长 decode,其 pin 早已在 complete 释放、
+        reservation 本体由 finish 摘除,与 TTL 无关。"""
+        expired = [
+            rid
+            for rid, res in self._reservations.items()
+            if not res.claimed
+            and res.created_at > 0
+            and now - res.created_at > self._RESERVATION_TTL_S
+        ]
+        for rid in expired:
+            res = self._reservations.pop(rid, None)
+            if res is None:
+                continue
+            if res.touched_blocks and self._kv_cache_manager is not None:
+                self._kv_cache_manager.block_pool.free_blocks(res.touched_blocks)
+            self._prompt_chains.pop(rid, None)
+            logger.warning(
+                "[Lwd][coord] reservation expired unclaimed req=%s: "
+                "pin released (notify lost or edge gone?)", rid,
+            )
+        return len(expired)
 
     def apply_finish_chain(
         self,

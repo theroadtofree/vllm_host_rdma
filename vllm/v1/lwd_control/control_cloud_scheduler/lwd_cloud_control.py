@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-import time
 from dataclasses import replace as dataclass_replace
 from typing import Any
 
@@ -38,18 +37,18 @@ logger = init_logger(__name__)
 class LwdCloudControlBridge:
     """父进程侧:把 HTTP 协程与子进程的 probe 事件用队列对接。
 
-    result 通过普通字典轮询回传(dispatch 线程写入、handler 协程 await sleep
-    轮询),刻意避开「跨线程 asyncio.Future + call_soon_threadsafe」——后者在
-    uvicorn 挂线程 + uvloop 环境下会出现 future 不 resolve、响应头迟迟不发的
-    诡异卡死。轮询简单、可观测、无跨线程事件循环依赖。
+    result 回传走 per-request 一次性 queue.Queue(dispatch 线程 put、
+    handler 协程经 run_in_executor 阻塞 get):既消掉字典轮询的
+    20ms 级延迟,又刻意避开「跨线程 asyncio.Future +
+    call_soon_threadsafe」——后者在 uvicorn 挂线程 + uvloop 环境下
+    会出现 future 不 resolve、响应头迟迟不发的诡异卡死。
+    queue.Queue.get 在线程池里阻塞,与事件循环零交互,简单可观测。
     """
-
-    _PROBE_POLL_INTERVAL = 0.02
 
     def __init__(self, command_queue: Any, event_queue: Any) -> None:
         self._command_queue = command_queue
         self._event_queue = event_queue
-        self._results: dict[str, tuple[bool, Any]] = {}
+        self._waiters: dict[str, queue.Queue] = {}
         self._lock = threading.Lock()
         self._closed = False
         self._dispatch_thread = threading.Thread(
@@ -65,20 +64,35 @@ class LwdCloudControlBridge:
     async def probe(
         self, manifest: LwdPrefixManifest, timeout: float = 60.0
     ) -> LwdProbeResult:
-        """发探针命令并同步轮询结果;超时抛 TimeoutError(由 handler 转 503)。"""
+        """发探针命令并阻塞等结果;超时抛 TimeoutError(由 handler 转 503)。
+
+        等待者先注册再发命令(无丢事件竞态);结果经一次性队列回传,
+        run_in_executor 阻塞等待不碰事件循环(见类 docstring)。"""
         logger.info("[Lwd][ctrl] bridge probe req=%s", manifest.request_id)
+        waiter: queue.Queue = queue.Queue(maxsize=1)
+        with self._lock:
+            self._waiters[manifest.request_id] = waiter
         self._command_queue.put({"type": "probe", "manifest": manifest})
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        loop = asyncio.get_running_loop()
+        try:
+            ok, payload = await asyncio.wait_for(
+                loop.run_in_executor(None, waiter.get), timeout
+            )
+        except asyncio.TimeoutError:
             with self._lock:
-                entry = self._results.pop(manifest.request_id, None)
-            if entry is not None:
-                ok, payload = entry
-                if ok:
-                    return payload
-                raise RuntimeError(payload or "probe failed")
-            await asyncio.sleep(self._PROBE_POLL_INTERVAL)
-        raise TimeoutError(f"prefix probe timed out after {timeout}s")
+                self._waiters.pop(manifest.request_id, None)
+            # 哨兵唤醒 executor 里阻塞的 waiter.get:否则线程永不返回,
+            # 默认线程池被超时泄漏耗尽后所有 run_in_executor 用户停摆
+            # (probe 超时恰是云卡死场景,雪崩叠加)。迟到事件因 waiter
+            # 已摘除直接丢弃;哨兵与迟到 put 竞争用 put_nowait 防堵。
+            try:
+                waiter.put_nowait((False, "probe timeout"))
+            except queue.Full:
+                pass
+            raise TimeoutError(f"prefix probe timed out after {timeout}s")
+        if ok:
+            return payload
+        raise RuntimeError(payload or "probe failed")
 
     def _dispatch_events(self) -> None:
         while not self._closed:
@@ -93,32 +107,36 @@ class LwdCloudControlBridge:
             kind = event.get("type")
             if kind == "probe":
                 with self._lock:
-                    self._results[event["request_id"]] = (
-                        bool(event.get("ok")),
-                        event.get("result") if event.get("ok") else event.get("error"),
-                    )
+                    waiter = self._waiters.pop(event["request_id"], None)
+                if waiter is not None:
+                    # put_nowait:超时探测已摘除 waiter 并放了哨兵,迟到的
+                    # 真实结果无人消费,阻塞 dispatch 线程只增尾延迟抖动
+                    try:
+                        waiter.put_nowait((
+                            bool(event.get("ok")),
+                            event.get("result")
+                            if event.get("ok") else event.get("error"),
+                        ))
+                    except queue.Full:
+                        pass
 
 
 class LwdCloudControlProcessor:
-    """子进程侧:step 循环头部非阻塞 poll,消费 probe 命令、回填事件。"""
+    """子进程侧:step 循环头部/WAKEUP 后非阻塞 poll,消费 probe 命令。
 
-    def __init__(self, command_queue: Any, event_queue: Any) -> None:
-        self._command_queue = command_queue
+    命令来源是本地线程安全队列(唤醒线程已从 mp 命令队列搬入并敲
+    过 WAKEUP):不再有 mp.Queue.get_nowait 的 feeder 竞态,旧的
+    sleep(0.002)x3 补偿随之删除——poll 纯 drain,零阻塞。"""
+
+    def __init__(self, pending_queue: Any, event_queue: Any) -> None:
+        self._pending_queue = pending_queue
         self._event_queue = event_queue
 
     def poll(self, coordinator: Any) -> None:
         while True:
-            command = None
-            # mp Queue 的 get_nowait 有 feeder 线程竞态:父进程刚 put、共享信号量
-            # 尚未被释放的瞬间会 spurious Empty,漏掉命令。短 sleep + 重试给
-            # feeder 腾出 flush 时间。
-            for _ in range(3):
-                try:
-                    command = self._command_queue.get_nowait()
-                    break
-                except queue.Empty:
-                    time.sleep(0.002)
-            if command is None:
+            try:
+                command = self._pending_queue.get_nowait()
+            except queue.Empty:
                 return
             logger.info("[Lwd][ctrl] poll consumed command type=%s", command.get("type"))
             if command.get("type") == "probe":

@@ -256,6 +256,41 @@ class LwdPrefixHasher:
         return [item for item in validated_items
                 if item[2] < block_end and block_start < item[2] + item[3]]
 
+    def chain_extend(
+        self,
+        prev_chain: Sequence[bytes],
+        token_ids: Sequence[int],
+    ) -> list[bytes]:
+        """增量续链(append-only):只对新增满块算 HMAC,消除逐步全量重建。
+
+        prev_chain 为已建满块链(末元素即链式 parent,空链用种子);
+        token_ids 为全量序列(prompt+生成)。只对
+        [len(prev_chain)*block_size, N) 内的新满块哈希,返回新增摘要
+        (不含 prev_chain)。与 build_manifest 的全量块循环逐字节同源
+        (同域分隔符/同 parent 链式),产出链与全量重建逐位相等。
+
+        仅支持纯文本路径(无 media_items):生成段链场景不含多模态
+        覆盖项;带 media 的调用方须走 build_manifest 全量重建。"""
+        full_total = len(token_ids) // self.block_size
+        done = len(prev_chain)
+        if full_total <= done:
+            return []
+        parent = prev_chain[-1] if prev_chain else self._seed
+        region = token_ids[done * self.block_size : full_total * self.block_size]
+        token_bytes = _encode_tokens(region)
+        encoded_block_size = _UINT32.pack(self.block_size)
+        out: list[bytes] = []
+        for index in range(full_total - done):
+            start = index * self.block_size * _UINT32.size
+            block_bytes = token_bytes[start : start + self.block_size * _UINT32.size]
+            parent = hmac.digest(
+                self._tenant_key,
+                _FULL_BLOCK_DOMAIN + parent + encoded_block_size + block_bytes,
+                "sha256",
+            )
+            out.append(parent)
+        return out
+
     def build_manifest(
         self,
         request_id: str,
