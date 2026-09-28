@@ -438,6 +438,45 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self.max_num_scheduled_tokens = decode_exact + sum(
             item.num_tokens for item in items
         )
+        # mamba/GDN 网格守卫:云模型有混合注意力时(原生
+        # need_mamba_block_aligned_split 为真),chunk 边界必须落在
+        # 云侧对齐网格上(边侧经 probe 学到网格后重切)。mixed 步豁免
+        # 原生复切的前提就是这个;边侧没学到网格(协调未启用/probe
+        # 失败)时 chunk 任意边界直上 GDN = 静默乱码,必须当场暴露。
+        if saved_mamba_align:
+            grid = int(
+                getattr(
+                    self.kv_cache_manager.coordinator,
+                    "scheduler_block_size",
+                    0,
+                )
+            )
+            if grid > 0:
+                for item in items:
+                    req = self.requests[item.request_id]
+                    end = item.offset + item.num_tokens
+                    last_chunk = end >= req.num_prompt_tokens
+                    if item.offset % grid != 0 or (not last_chunk and end % grid != 0):
+                        raise RuntimeError(
+                            f"[Lwd][cloud-sched] chunk not grid-aligned "
+                            f"req={item.request_id} seqno={notify.seqno}: "
+                            f"[{item.offset}, {end}) grid={grid} — edge "
+                            "never learned the cloud mamba grid "
+                            "(coordination disabled or probe failed); "
+                            "unaligned GDN state slices would corrupt "
+                            "silently"
+                        )
+        # 末位截断块的"预算耗尽复现"要求它最后消费:running 内
+        # 续传请求与 decode 按队列序交错,若它不在末尾,轮到自己时
+        # 剩余预算可能 > c_trunc(前序有人少消耗),拿到更多 → 步后
+        # 核验误炸(2E1C 在途翻倍后窗口显著放大)。移到 running 队尾
+        # 直接消掉该顺序假设(waiting 来源的截断块本就按 FCFS 末位,
+        # 天然正确)。截断块恒为 items 末位(边侧 picker 语义)。
+        last_id = items[-1].request_id
+        for i, req in enumerate(self.running):
+            if req.request_id == last_id and i != len(self.running) - 1:
+                self.running.append(self.running.pop(i))
+                break
         try:
             out = self._lwd_schedule_for_visible_reqs(req_ids)
         finally:
