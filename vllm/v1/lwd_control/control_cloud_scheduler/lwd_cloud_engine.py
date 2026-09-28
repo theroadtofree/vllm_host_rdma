@@ -24,6 +24,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
@@ -128,6 +129,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             num_speculative_tokens=(
                 getattr(spec_config, "num_speculative_tokens", None) or 0
             ),
+            # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
+            wire_version=LWD_WIRE_VERSION,
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -282,11 +285,13 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
             self.scheduler.prefill_notify_queue.append(msg)
             # [Lwd][pre-recv] 提前收①:预告到达即给云 worker 下发提示(seqno +
-            # flat token 数 + mrope 行数),worker 的通信线程收到就挂精确尺寸的
-            # UP irecv(主帧 hash 载荷 + aux 帧) —— 不再等这个批的
-            # SchedulerOutput 下发。num_tokens/aux_rows 取 items 逐条目之和
-            # (mixed 恒填 items;顶层字段只描述首条目);has_mrope 逐 item 透传,
-            # 纯文本批 aux_rows=0(零 aux 流量)。
+            # flat token 数),worker 的通信线程收到就挂精确尺寸的
+            # UP irecv(主帧 hash 载荷) —— 不再等这个批的
+            # SchedulerOutput 下发。num_tokens 取 items 逐条目之和
+            # (mixed 恒填 items;顶层字段只描述首条目)。mrope positions
+            # 已随 RangeNotify 走控制面(wire_version>=2),UP 数据面只有
+            # 主帧,aux_rows 恒 0——若残留非零,worker 会预挂一条永远收
+            # 不到数据的 aux irecv,水位停摆、闸门后的批永不下发。
             if self._lwd_early_recv:
                 from vllm_ascend.distributed.lwd_comm.pre_recv import (
                     make_recv_hint,
@@ -294,9 +299,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
 
                 num_tokens = sum(item.num_tokens for item in items)
-                aux_rows = sum(
-                    item.num_tokens for item in items if item.has_mrope
-                )
+                aux_rows = 0
                 # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
                 # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
                 logger.info(

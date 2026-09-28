@@ -45,12 +45,15 @@ class LwdEmbedBatch:
     #   mm 行切片窗口;与调度 offset 同源);
     # - has_mrope[i]:请求 i 是否携带 mrope 行(边侧准入时只对 MM
     #   请求算过 positions);
-    # - mrope_positions[i]:请求 i 本 chunk 的 mrope 行([[t,h,w],...],
-    #   无 mrope 为空 list);云侧不消费内容,只按 has_mrope 求 aux
-    #   帧尺寸(Σ n_i×3),注入行从 UP aux 帧按序取。
+    # - mrope_positions[i]:请求 i 本 chunk 的 mrope positions 原始
+    #   字节([3,n] int64,云调度器从 RangeNotify item 透传;无
+    #   mrope 为空 bytes)。仅云侧填充/消费:runner frombuffer 直写
+    #   req_state;边侧不再填充(positions 随控制面 notify 上行,
+    #   数据面 aux 帧退役)。bytes 是 msgspec 原生类型,随 SO 序列
+    #   化到云各 worker 无额外开销。
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
-    mrope_positions: list[list[list[int]]] = field(default_factory=list)
+    mrope_positions: list[bytes] = field(default_factory=list)
 
 
 @dataclass

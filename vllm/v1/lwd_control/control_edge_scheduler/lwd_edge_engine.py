@@ -57,6 +57,7 @@ from vllm.v1.lwd_control.control_communication.lwd_zmq_factory import (
 from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
@@ -426,6 +427,24 @@ class LwdEdgeEngineCore(EngineCoreProc):
         hellos.update(getattr(self, "_lwd_peer_hellos", None) or {})
         if not hellos:
             return
+        # mrope + 旧协议 fail-fast(wire_version=2 起 mrope positions 走控制面):
+        # wire_version<2 的云侧仍按数据面 aux 帧传 positions,而 msgspec 容忍
+        # 未知字段——协议不一致不会报错,只会让 positions 静默缺失。逐实例
+        # 校验,任一不满足即整体拒绝(部署要求两侧同版本)。
+        if self.vllm_config.model_config.uses_mrope:
+            stale = sorted(
+                iid for iid, h in hellos.items()
+                if h.wire_version < LWD_WIRE_VERSION
+            )
+            if stale:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] edge/cloud wire protocol mismatch: model uses "
+                    f"mrope but cloud HELLO wire_version<{LWD_WIRE_VERSION} "
+                    f"on instance(s) {stale}——云侧仍按数据面 aux 帧协议运行,"
+                    f"mrope positions 将静默缺失(msgspec 容忍未知字段,旧云"
+                    f"不会报错),两侧必须同版本部署"
+                )
         legacy = sorted(
             iid for iid, h in hellos.items()
             if h.max_num_batched_tokens == 0

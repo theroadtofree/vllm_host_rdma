@@ -12,6 +12,14 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
 
+# 控制面协议版本:1 = mrope positions 经数据面 UP aux 帧([n,3] int64
+# 第二 P2P 载荷);2 = mrope positions 经控制面 LwdRangeItem.mrope_
+# positions 原始字节直传(数据面 aux 帧自 mrope 退役;aux 机制本身
+# 保留,供 deepstack 等大数据量载荷扩展)。两侧必须同版本部署:
+# msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
+LWD_WIRE_VERSION = 2
+
+
 class LwdRangeItem(msgspec.Struct, gc=False):
     """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
     起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
@@ -19,13 +27,20 @@ class LwdRangeItem(msgspec.Struct, gc=False):
     的自限块;cap 截断块独占一批。
 
     has_mrope(pdmix 多模态):逐请求标记本 chunk 是否携带 mrope
-    positions 行(UP aux 帧,[n,3] int64 与主帧同 seqno)。混批可含
-    文本+图像混合,批级标记不够;纯文本恒 False,零 aux 流量。"""
+    positions;positions 自 wire_version 2 起以 mrope_positions 原始
+    字节随本通知走控制面,不再经数据面 UP aux 帧。混批可含文本+图像
+    混合,批级标记不够;纯文本恒 False + 空字节。"""
 
     request_id: str
     offset: int
     num_tokens: int
     has_mrope: bool = False
+    mrope_positions: bytes = b""
+    """本 chunk 的 mrope positions 原始字节:[3,num_tokens] int64 CPU
+    张量的连续字节流(边调度器全 prompt positions 的列切片 contiguous
+    后 tobytes)。CPU 产生、CPU 消费——云 runner frombuffer 成 [3,n]
+    后零转置直写 req_state。空 = 无 mrope;has_mrope=True 而字节为空
+    = 对端仍按 aux 帧协议运行(wire_version<2),云侧 fail-fast。"""
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
@@ -98,6 +113,12 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     max_num_batched_tokens: int = 0
     max_num_seqs: int = 0
     num_speculative_tokens: int = 0
+    wire_version: int = 0
+    """控制面协议版本(见 LWD_WIRE_VERSION):1=mrope 经数据面 aux 帧;
+    2=mrope 经控制面 RangeItem.mrope_positions 直传。缺省 0=旧版未
+    携带。mrope 模型下边侧构造期校验 >=LWD_WIRE_VERSION 并 fail-fast
+    ——msgspec 容忍未知字段,旧云对新字段静默丢弃,mrope 缺失不会
+    有任何报错,必须显式互校。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值

@@ -13,7 +13,10 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     SchedulerOutput,
 )
-from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
+from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_WIRE_VERSION,
+    LwdRangeNotify,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
@@ -179,6 +182,14 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # 的标记(相位模式单请求批,批级 ≡ 请求级);旧版无 items 的
         # 预告无 mrope 概念,恒 False。
         _item0 = notify.items[0] if notify.items else None
+        if _item0 is not None and _item0.has_mrope and not _item0.mrope_positions:
+            raise RuntimeError(
+                f"[Lwd][cloud-sched] mrope payload missing "
+                f"req={_item0.request_id} seqno={notify.seqno}: "
+                f"has_mrope=True 但控制面未携带 positions 字节——边侧仍按"
+                f"数据面 aux 帧协议运行(wire_version<{LWD_WIRE_VERSION}),"
+                f"两侧必须同版本部署"
+            )
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -187,6 +198,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 token_ids=[[0] * notify.num_tokens],
                 prompt_offsets=[_item0.offset if _item0 else notify.offset],
                 has_mrope=[_item0.has_mrope if _item0 else False],
+                mrope_positions=[_item0.mrope_positions if _item0 else b""],
             ),
         )
         return out
