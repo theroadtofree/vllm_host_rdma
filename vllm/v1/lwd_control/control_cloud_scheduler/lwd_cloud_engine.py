@@ -565,33 +565,31 @@ class LwdCloudEngineCore(EngineCoreProc):
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
 
     def _lwd_purge_prefill_notify(self, request_id: str) -> None:
-        """abort 清扫:摘除 prefill_notify_queue 里该请求的条目(条目
-        掏空则整条移除),并整体替换 deque(赋值原子,调度主线程的
-        peek/popleft 不受清扫影响)。"""
+        """abort 清扫:把 prefill_notify_queue 里该请求的条目**标记为幽灵**
+        (不摘除)。
+
+        为什么不能摘除/掏空:预告发布即配对一次 UP isend,张量已在
+        路上;摘除会让云侧 recv numel 与边侧 isend 不等(HCCL 通道
+        楔死),整条丢弃则该 seqno 成空洞(同样楔死)。唯一正确形态是
+        照收不注入:调度臂把幽灵条目挂 ghost_req_ids 建批(numel 按
+        原始 items 不变),runner 收后弃行。台账条目在消费时摘除。"""
         queue = getattr(self.scheduler, "prefill_notify_queue", None)
         if not queue:
             return
-        kept: deque = deque()
-        removed = 0
+        marked = 0
         for notify in queue:
-            if notify.items:
-                items = [
-                    item for item in notify.items
-                    if item.request_id != request_id
-                ]
-                removed += len(notify.items) - len(items)
-                if items:
-                    notify.items = items
-                    kept.append(notify)
-            elif notify.request_id != request_id:
-                kept.append(notify)
-            else:
-                removed += 1
-        if removed:
-            self.scheduler.prefill_notify_queue = kept
+            ids = (
+                [item.request_id for item in notify.items]
+                if notify.items else [notify.request_id]
+            )
+            if request_id in ids:
+                self.scheduler.lwd_ghost_req_ids.add(request_id)
+                marked += 1
+        if marked:
             logger.info(
-                "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
-                "aborted req=%s", removed, request_id,
+                "[Lwd][cloud-ctrl] marked %d pending notify item(s) as ghost "
+                "for aborted req=%s (recv-and-discard, numel preserved)",
+                marked, request_id,
             )
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:

@@ -55,6 +55,10 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[list[list[int]]] = field(default_factory=list)
+    # abort 幽灵条目:批内含已 abort 请求时,其 embeds 行仍在 UP 载荷里
+    # (边侧组帧先行,不可撤),云侧照收(保 HCCL numel 配对)但不注入、
+    # 不计入调度。runner 据此跳过这些行而不报"req not in batch"。
+    ghost_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass

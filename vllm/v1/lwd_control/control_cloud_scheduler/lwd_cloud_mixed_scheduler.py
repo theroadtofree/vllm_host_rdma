@@ -94,6 +94,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         from collections import OrderedDict
 
         self._lwd_recent_finished: OrderedDict[str, None] = OrderedDict()
+        # 当次消费的幽灵条目(classify 写入,建批/释放读取)
+        self._lwd_cur_ghost_items: list[LwdRangeItem] = []
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
@@ -198,15 +200,22 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
     def _lwd_classify_items(
         self, items: list[LwdRangeItem]
     ) -> tuple[list[LwdRangeItem], bool]:
-        """条目三分:ready(待 prefill)/ stale(已完结或重复预告,剔除)
-        / unknown(ADD 尚未落地)。返回 (ready, 是否有 unknown)。
+        """条目四分:ready(待 prefill)/ ghost(已 abort,照收不注入,
+        保 UP numel 配对)/ stale(已完结或重复预告,剔除)/ unknown
+        (ADD 尚未落地)。返回 (ready, 是否有 unknown);幽灵记入
+        self._lwd_cur_ghosts(仅本次消费有效,随批建完即清)。
 
         unknown 存在即整批 defer(all-or-nothing:一次 UP recv 对应整批
-        张量,不能只放行子集);abort 清扫(引擎侧)负责把永不落地的
-        条目摘除,队首不会被永久堵住。"""
+        张量,不能只放行子集);abort 经引擎幽灵台账(照收不注入),
+        队首不会被永久堵住。"""
         ready: list[LwdRangeItem] = []
         unknown = False
+        self._lwd_cur_ghost_items: list[LwdRangeItem] = []
         for item in items:
+            if item.request_id in self.lwd_ghost_req_ids:
+                # 已 abort 的在飞 chunk:行照收(保 numel 配对)不调度
+                self._lwd_cur_ghost_items.append(item)
+                continue
             request = self.requests.get(item.request_id)
             if request is None:
                 if item.request_id in self._lwd_recent_finished:
@@ -316,6 +325,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 queue = self.prefill_notify_queue
                 if queue and queue[0] is notify:
                     queue.popleft()
+                if self._lwd_cur_ghost_items:
+                    # 全幽灵批:张量仍在路上,必须照收(保 HCCL numel
+                    # 配对)但不注入;decode 照常
+                    out = self._lwd_schedule_for_visible_reqs(decode_ids)
+                    out.lwd_batch = self._lwd_build_embed_batch(
+                        notify, self._lwd_notify_items(notify)
+                    )
+                    self._lwd_release_ghosts(notify)
+                    return out
                 notify = None
             elif unknown:
                 # 请求 ADD 未落地(input_queue 次序滞后):预告留队首,
@@ -500,21 +518,57 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # prompt_offsets/has_mrope 逐 item 透传:worker 据此求 aux 帧
         # 尺寸(Σ 有 mrope 条目的 n_i×3),runner 据此对 MM 请求注入
         # mrope 行(文本请求零 aux 流量、零路径变化)。
-        out.lwd_batch = LwdBatch(
+        out.lwd_batch = self._lwd_build_embed_batch(
+            notify, self._lwd_notify_items(notify)
+        )
+        self._lwd_release_ghosts(notify)
+        return out
+
+    def _lwd_build_embed_batch(
+        self, notify: LwdRangeNotify, all_items: list[LwdRangeItem]
+    ) -> LwdBatch:
+        """组 EMBED 批(含幽灵条目)。
+
+        必须按原始 items(含幽灵)建 meta:边侧 UP 组帧含幽灵请求的
+        embeds 行(组帧先行不可撤),recv numel 按 meta.token_ids 逐
+        请求长度求和——少一行即 HCCL 两端 numel 不等(通道楔死)。
+        幽灵行由 runner 照收不注入(ghost_req_ids)。
+
+        UP 链 seqno 随批下发云 worker:批配对号直接取预告自带 seqno(与
+        边侧 EMBED 批派发号同源同值)。token_ids 为占位列表——长度
+        必须等于边侧实际发送的逐请求 token 数(HCCL P2P 要求两端
+        numel 严格相等)。prompt_offsets/has_mrope 逐 item 透传。"""
+        ghost_ids = [i.request_id for i in self._lwd_cur_ghost_items]
+        return LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=LwdEmbedBatch(
-                req_ids=[item.request_id for item in items],
-                token_ids=[[0] * item.num_tokens for item in items],
+                req_ids=[item.request_id for item in all_items],
+                token_ids=[[0] * item.num_tokens for item in all_items],
                 # 一条 RangeNotify 来自一条边(单 publish 原子),批内
                 # items 同属该边(入口已按同一 edge_id 包装);UP recv
                 # 选路维度取首条目解析值,与相位机同口径
-                edge_id=parse_edge_id(items[0].request_id)[0],
-                prompt_offsets=[item.offset for item in items],
-                has_mrope=[item.has_mrope for item in items],
+                edge_id=parse_edge_id(all_items[0].request_id)[0],
+                prompt_offsets=[item.offset for item in all_items],
+                has_mrope=[item.has_mrope for item in all_items],
+                ghost_req_ids=ghost_ids,
             ),
         )
-        return out
+
+    def _lwd_release_ghosts(self, notify: LwdRangeNotify) -> None:
+        """消费后摘除幽灵台账条目:仅当队列中再无该请求的其他待消费
+        预告时摘除(同一请求的后续 chunk 预告仍需按幽灵照收)。"""
+        ghost_ids = {i.request_id for i in self._lwd_cur_ghost_items}
+        self._lwd_cur_ghost_items = []
+        if not ghost_ids:
+            return
+        pending_ids = set()
+        for pending in self.prefill_notify_queue:
+            if pending.items:
+                pending_ids.update(i.request_id for i in pending.items)
+            else:
+                pending_ids.add(pending.request_id)
+        self.lwd_ghost_req_ids.difference_update(ghost_ids - pending_ids)
 
     def schedule(self) -> SchedulerOutput:
         # [Lwd][perf] 云侧每步 LWD 税分段之一:调度(容器交换)时长

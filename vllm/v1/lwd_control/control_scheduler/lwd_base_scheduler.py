@@ -28,6 +28,10 @@ class LwdBaseScheduler(AsyncScheduler):
         # _free_request 覆写里抓最小快照,由引擎侧消费(消费即摘除);超上限
         # 按插入序兜底淘汰残留。phase/mixed 两个云调度臂共用。
         self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        # abort 幽灵台账:已发布预告(UP 张量必随行)但请求已 abort 的
+        # request_id 集合。消费时这些条目照收不注入(保 HCCL numel
+        # 配对),由调度臂建批时挂 ghost_req_ids 并摘除台账条目。
+        self.lwd_ghost_req_ids: set[str] = set()
 
     def _free_request(self, request, delay_free_blocks: bool = False):
         """收尾快照(见 ``lwd_finished_records``):挂在**释放链唯一收口点**。

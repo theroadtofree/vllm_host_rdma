@@ -193,6 +193,39 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # 端按序 hold → 云侧 prefill 卡死、decode 停摆(边侧空闲、云侧
         # 空转的根因)。请求未准入时本步空排,等下一轮 ADD 处理后再消费。
         notify = q[0]
+        if notify.request_id in self.lwd_ghost_req_ids:
+            # 幽灵条目(请求已 abort 但 UP 张量已在路上):照收不注入,
+            # 保 HCCL numel 配对;本条预告消费掉,请求不调度。
+            q.popleft()
+            logger.info(
+                "[Lwd][cloud-sched] drain ghost prefill notify req=%s "
+                "seqno=%s num=%s (aborted in-flight chunk)",
+                notify.request_id, notify.seqno, notify.num_tokens,
+            )
+            out = self._lwd_schedule_for_visible_reqs([])
+            edge_id, _ = parse_edge_id(notify.request_id)
+            _item0 = notify.items[0] if notify.items else None
+            out.lwd_batch = LwdBatch(
+                batch_type=LwdBatchType.LWD_EMBED,
+                seqno=notify.seqno,
+                batch_meta=LwdEmbedBatch(
+                    req_ids=[notify.request_id],
+                    token_ids=[[0] * notify.num_tokens],
+                    edge_id=edge_id,
+                    prompt_offsets=[_item0.offset if _item0 else notify.offset],
+                    has_mrope=[
+                        _item0.has_mrope if _item0 else notify.has_mrope
+                    ],
+                    ghost_req_ids=[notify.request_id],
+                ),
+            )
+            # 台账摘除:仅当队列中再无该请求的其他待消费预告(同一
+            # 请求的后续 chunk 预告仍需按幽灵照收)
+            if not any(
+                n.request_id == notify.request_id for n in self.prefill_notify_queue
+            ):
+                self.lwd_ghost_req_ids.discard(notify.request_id)
+            return out
         if notify.request_id not in self.requests:
             return self._lwd_schedule_for_visible_reqs([])
         q.popleft()
