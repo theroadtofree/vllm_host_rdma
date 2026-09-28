@@ -94,24 +94,40 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
     # Phase primitives(容器交换;原生 schedule() 零改动)                  #
     # ------------------------------------------------------------------ #
     def _schedule_pure_prefill(self) -> SchedulerOutput:
-        """纯 prefill 步:取队首预告,按公告量钳制本步预算,照单执行。"""
+        """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
+        调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
+        空集进窗口,等价空步,三队列原样保留。"""
         notify = q.popleft() if (q := self.prefill_notify_queue) else None
+        if notify is not None and notify.request_id not in self.requests:
+            # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
+            notify = None
+        if notify is not None:
+            logger.info(
+                "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
+                notify.request_id, notify.seqno, notify.num_tokens,
+            )
+        req_ids = [notify.request_id] if notify is not None else []
+        out = self._lwd_schedule_for_visible_reqs(req_ids)
         if notify is None:
-            return self._lwd_schedule_for_visible_reqs([])
-        logger.info(
-            "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
-            notify.request_id, notify.seqno, notify.num_tokens,
-        )
-        out = self._lwd_schedule_for_visible_reqs(
-            [notify.request_id], token_budget_cap=notify.num_tokens
-        )
+            return out
+        if not out.num_scheduled_tokens:
+            # 未实际准入(典型 KV 压力空步):预告塞回队首原位,decode
+            # 泄压后重新点名;本步不挂 lwd_batch,不向 worker 预告配对号
+            self.prefill_notify_queue.appendleft(notify)
+            return out
+        # UP 链 seqno 随批下发云 worker(§9.12 数据面接缝):批配对号直接
+        # 取点名预告自带的 seqno(与边侧 EMBED 批派发号同源同值),worker
+        # 的 UP recv 以此配对边侧发来的 embeds 张量。batch_meta 承载
+        # worker 的 recv 尺寸与注入切行信息:req_ids 取预告请求(单请求
+        # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
+        # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
+        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=LwdEmbedBatch(
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
-                token_offsets=[notify.offset],
             ),
         )
         return out
