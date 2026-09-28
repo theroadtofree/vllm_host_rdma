@@ -50,6 +50,7 @@ class LwdUnembedBatch:
     recv_num_elements: int = 0  # total DOWN hidden elements for the whole batch = rows_total * hidden_size
     out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
+    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
 
 
 @dataclass

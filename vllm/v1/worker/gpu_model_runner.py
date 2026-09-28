@@ -879,9 +879,36 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # LWD-only: deferred per-request persist channel for
+        # num_accepted_tokens (pinned side buffer + req_ids snapshot),
+        # consumed by the phase-alternation fallback in _prepare_inputs.
+        # Isolated behind the LWD master switch so native (non-LWD)
+        # deployments keep the previous behavior bit-for-bit.
+        self._lwd_spec_persist_enabled = bool(
+            self.num_spec_tokens and self.parallel_config.lwd_config.enable_lwd
+        )
+        # LWD-only: per-request draft-token stash for phase-alternation
+        # resume. The batch-scoped _draft_token_ids is overwritten by every
+        # propose (including intervening prefill steps), and the
+        # prev_index-based refill in _prepare_input_ids only reaches one
+        # batch back -- a decode request returning after a prefill step
+        # would otherwise run its spec slots on stale placeholders. Rows
+        # are kept as device views (no copies); entries are refreshed every
+        # decode step the request participates in and pruned when the
+        # request leaves. Populated on the ascend runner side.
+        self._lwd_draft_stash: dict[str, torch.Tensor] = {}
+        self.num_accepted_tokens_persist_cpu: torch.Tensor | None = None
+        self._num_accepted_tokens_persist_req_ids: list[str] | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
+            if self._lwd_spec_persist_enabled:
+                self.num_accepted_tokens_persist_cpu = torch.empty(
+                    self.max_num_reqs,
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
@@ -1514,6 +1541,23 @@ class GPUModelRunner(
         else:
             return None
 
+    def _persist_num_accepted_tokens_to_req_states(self) -> None:
+        """Write the stashed accepted counts into ``CachedRequestState``.
+
+        The values were asynchronously copied device-to-host by
+        :meth:`_update_states_after_model_execute`; callers must synchronize
+        ``num_accepted_tokens_event`` first to guarantee the copy has landed.
+        """
+        req_ids = self._num_accepted_tokens_persist_req_ids
+        if req_ids is None:
+            return
+        assert self.num_accepted_tokens_persist_cpu is not None
+        counts = self.num_accepted_tokens_persist_cpu.numpy()
+        for i, req_id in enumerate(req_ids):
+            if (req_state := self.requests.get(req_id)) is not None:
+                req_state.num_accepted_tokens = int(counts[i])
+        self._num_accepted_tokens_persist_req_ids = None
+
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1533,6 +1577,21 @@ class GPUModelRunner(
         # tokens gives us the first -1 position (i.e., number of accepted).
         num_reqs = output_token_ids.size(0)
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
+        # Stash the per-request accepted count for deferred persistence
+        # (non-blocking; landed into CachedRequestState at the next
+        # _prepare_inputs after num_accepted_tokens_event confirms the copy),
+        # so it survives the batch-position buffer being overwritten by the
+        # next (possibly prefill) batch under prefill/decode phase
+        # alternation (prev_positions == -1) without a blocking sync here.
+        # LWD-only: native deployments never consume the persisted values.
+        if self._lwd_spec_persist_enabled:
+            assert self.num_accepted_tokens_persist_cpu is not None
+            self.num_accepted_tokens_persist_cpu[:num_reqs].copy_(
+                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+            )
+            self._num_accepted_tokens_persist_req_ids = list(
+                self.input_batch.req_ids[:num_reqs]
+            )
 
         if self.cache_config.mamba_cache_mode == "align":
             # Fused GPU postprocess: state copies + per-request accepted-token
@@ -1778,9 +1837,30 @@ class GPUModelRunner(
         max_flattened_index = -1
         total_num_spec_tokens = 0
 
+        resumed_spec_indices: list[int] = []
+        resumed_draft_rows: list[torch.Tensor] = []
         for cur_index in range(num_reqs):
             prev_index = prev_positions[cur_index]
             if prev_index < 0:
+                # LWD 相位交替恢复:上一步缺席的请求,批次级草稿 stash
+                # 已被中间步的 propose 覆写,且 prev_index 映射只够得着
+                # 上一批——改从按请求持久化的草稿 stash 重挂。该请求
+                # 缺席期间无新 token 提交,其最后一个 decode 步的草稿
+                # 仍合法。
+                if self._lwd_spec_persist_enabled:
+                    req_id = self.input_batch.req_ids[cur_index]
+                    draft_len = len(scheduled_spec_tokens.get(req_id, ()))
+                    row = self._lwd_draft_stash.get(req_id)
+                    if (
+                        draft_len > 0
+                        and row is not None
+                        and row.numel() >= draft_len
+                    ):
+                        last_index = cu_num_tokens[cur_index].item() - 1
+                        resumed_spec_indices.extend(
+                            range(last_index - draft_len + 1, last_index + 1)
+                        )
+                        resumed_draft_rows.append(row[:draft_len])
                 continue
             prev_indices.append(prev_index)
             req_id = self.input_batch.req_ids[cur_index]
@@ -1816,6 +1896,20 @@ class GPUModelRunner(
             if self.enable_prompt_embeds:
                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+        if resumed_spec_indices:
+            # LWD 相位交替恢复请求的草稿重挂:上面的全量拷贝刚把占位/
+            # 陈旧值带上卡,此处用按请求持久化 stash 里的真实草稿覆写
+            # 其 spec 槽位。resumed 请求存在时全量拷贝必然已执行
+            # (num_common < total_without_spec),顺序安全;且必须置于
+            # 下方 num_common_tokens == 0 的提前返回之前(纯恢复批
+            # 会走那里)。
+            resumed_idx = torch.tensor(
+                resumed_spec_indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            resumed_src = torch.cat(resumed_draft_rows).to(dtype=torch.int32)
+            self.input_ids.gpu.scatter_(
+                dim=0, index=resumed_idx, src=resumed_src
+            )
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
@@ -2070,6 +2164,8 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
             self.num_accepted_tokens_event.synchronize()
+            if self._lwd_spec_persist_enabled:
+                self._persist_num_accepted_tokens_to_req_states()
             # Async mode: condense() reordered indices, use prev_positions mapping
             if self.use_async_scheduling and prev_req_id_to_index:
                 prev_idx = self.prev_positions.np[:num_reqs]

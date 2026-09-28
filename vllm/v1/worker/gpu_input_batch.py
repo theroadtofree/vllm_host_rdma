@@ -59,6 +59,11 @@ class CachedRequestState:
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
 
+    # Last decode step's accepted-token count, persisted by
+    # _update_states_after_model_execute for hybrid models; consumed by the
+    # phase-alternation fallback (prev_positions == -1) in _prepare_inputs.
+    num_accepted_tokens: int = 0
+
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None

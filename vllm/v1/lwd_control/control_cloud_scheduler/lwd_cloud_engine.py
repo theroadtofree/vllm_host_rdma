@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -45,6 +46,12 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
 
 logger = init_logger(__name__)
+
+
+def _lwd_diag_token_passthrough_enabled() -> bool:
+    """诊断开关:SKIP_SAMPLE(边免采样)/ DISABLE_DOWN(全直通)任一开启。"""
+    return (os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1"
+            or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1")
 
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
@@ -364,13 +371,50 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
             _t = time.monotonic()
+            # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
+            # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
+            token_ids: list[list[int]] = []
+            if _lwd_diag_token_passthrough_enabled():
+                ids_by_req = self._lwd_step_token_ids(engine_core_outputs)
+                token_ids = [ids_by_req.get(rid, []) for rid in meta.req_ids]
             self._lwd_publish_c2e(
-                meta, self._lwd_c2e_finish_reasons(meta, engine_core_outputs)
+                meta,
+                self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                token_ids,
             )
             # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
             logger.info(
                 "[Lwd][perf] publish reqs=%d dur=%.2fms",
                 len(meta.req_ids), (time.monotonic() - _t) * 1000,
+            )
+        elif os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1":
+            # VLLM_ASCEND_LWD_DISABLE_DOWN=1 诊断:cloud runner 不做
+            # collect、不发 DOWN,但 c2e 通告必须照常驱动边侧交付——
+            # 逐请求 token ids 直传,hidden_num_elements=0 标记无张量;
+            # 仅进 finished_requests 的请求补空行以携带 ABORT 码。
+            ids_by_req = self._lwd_step_token_ids(engine_core_outputs)
+            for outputs in engine_core_outputs.values():
+                for rid in outputs.finished_requests or ():
+                    ids_by_req.setdefault(rid, [])
+            if not ids_by_req:
+                # 空步(无输出也无完结):空通告没有任何可交付内容,
+                # 发了只会让边侧白醒来一次并空派一个 UNEMBED 批占配额,
+                # 直接跳过。
+                return model_output
+            req_ids = list(ids_by_req)
+            from vllm.v1.outputs import LwdC2eMeta
+
+            meta = LwdC2eMeta(
+                hidden_num_elements=0,
+                top_id_ths=[],
+                num_accepted_tokens=[],
+                req_ids=req_ids,
+                down_seqno=-1,
+            )
+            self._lwd_publish_c2e(
+                meta,
+                self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                [ids_by_req[rid] for rid in req_ids],
             )
         else:
             logger.info(
@@ -396,10 +440,27 @@ class LwdCloudEngineCore(EngineCoreProc):
         return [reasons.get(request_id, LWD_NOT_FINISHED)
                 for request_id in meta.req_ids]
 
-    def _lwd_publish_c2e(self, meta: LwdC2eMeta, finish_reasons: list[int]) -> None:
+    @staticmethod
+    def _lwd_step_token_ids(
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> dict[str, list[int]]:
+        """本步逐请求 new_token_ids(request_id 索引),诊断旁路共用。"""
+        ids_by_req: dict[str, list[int]] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                ids_by_req[out.request_id] = list(out.new_token_ids)
+        return ids_by_req
+
+    def _lwd_publish_c2e(
+        self,
+        meta: LwdC2eMeta,
+        finish_reasons: list[int],
+        token_ids: list[list[int]] | None = None,
+    ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码)发边:队满小睡重试
         (元数据不可丢),关停(closed)退出。instance_id 与 DEALER identity
-        同源盖章,边侧据此分发到对应实例的 UNEMBED/数据面路径。"""
+        同源盖章,边侧据此分发到对应实例的 UNEMBED/数据面路径。token_ids 仅诊断旁路
+        (VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE)携带。"""
         notify = LwdC2eNotify(
             hidden_num_elements=meta.hidden_num_elements,
             top_id_ths=meta.top_id_ths,
@@ -408,6 +469,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
             instance_id=getattr(self, "_lwd_instance_id", 0),
+            token_ids=token_ids or [],
         )
         while not self._lwd_post_out.closed:
             if self._lwd_post_out.publish(notify):

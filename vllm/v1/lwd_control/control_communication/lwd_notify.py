@@ -94,6 +94,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """报告方云实例索引(与 DEALER identity 同源):边侧据此把本通告
     分发到对应实例的 UNEMBED/数据面路径;缺省 0 = 旧版云侧(additive
     兼容,单实例语义不变)。"""
+    token_ids: list[list[int]] = []
+    """诊断旁路载荷:云侧逐请求 accepted token ids(仅
+    VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1 时填充),与 req_ids 按位对齐。
+    空列表 = 未携带,边侧走原生 rank-replay(lm_head + top_id_ths)。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径

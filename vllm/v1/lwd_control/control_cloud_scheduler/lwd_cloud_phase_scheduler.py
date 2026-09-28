@@ -93,6 +93,51 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------------ #
     # Phase primitives(容器交换;原生 schedule() 零改动)                  #
     # ------------------------------------------------------------------ #
+
+    # 余量安全边际(块):碎片/哈希块粗放冗余
+    _LWD_HEADROOM_MARGIN_BLOCKS = 8
+
+    def _lwd_prefill_headroom_ok(self, notify) -> bool:
+        """prefill 准入水位(不超卖):空闲 KV 须同时覆盖
+        ① 新请求全程需求(prompt 剩余 + max_tokens);
+        ② 全部在跑请求的剩余 decode 增长(Σ max_tokens − 已生成)。
+        只查 ① 漏了 ②——KV 共享,满负荷时新请求虽装得下自己,却挤占
+        他人的增长配额,后续 decode 步照样触发原生抢占;而 LWD 云侧被
+        抢占 = 永久孤儿(重算 prefill 需边侧重发 embeds,边侧已完结不会
+        再发)。容量/水位不可知时放行(保守降级)。"""
+        request = self.requests.get(notify.request_id)
+        manager = getattr(self, "kv_cache_manager", None)
+        if request is None or manager is None:
+            return True
+        try:
+            sp = request.sampling_params
+            max_new = (sp.max_tokens if sp is not None else 0) or 0
+            needed = (
+                request.num_prompt_tokens
+                - request.num_computed_tokens
+                + max_new
+            )
+            for running_req in self.running:
+                rsp = running_req.sampling_params
+                running_max = (
+                    rsp.max_tokens if rsp is not None else 0
+                ) or 0
+                needed += max(
+                    0, running_max - running_req.num_output_tokens
+                )
+            block_size = int(self.cache_config.block_size)
+            total_blocks = int(self.cache_config.num_gpu_blocks or 0)
+            if block_size <= 0 or total_blocks <= 0:
+                return True
+            needed_blocks = (
+                -(-needed // block_size)
+                + self._LWD_HEADROOM_MARGIN_BLOCKS
+            )
+            free_blocks = round((1.0 - manager.usage) * total_blocks)
+            return free_blocks >= needed_blocks
+        except Exception:
+            return True
+
     def _schedule_pure_prefill(self) -> SchedulerOutput:
         """纯 prefill 步:prefill_notify_queue 有预告则取队首 msg,单独
         调度其请求(按原队列归位,waiting/skipped 来源走原生准入);没有则
@@ -101,6 +146,14 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         if notify is not None and notify.request_id not in self.requests:
             # 请求已被 abort 释放:丢弃陈旧预告,本步按空集走
             notify = None
+        if notify is not None and not self._lwd_prefill_headroom_ok(notify):
+            # KV 余量准入门:余量不足时推迟消费本预告(塞回队首,与 KV
+            # 压力重排同路径),本步转 decode 泄压,等排水腾出全程余量
+            # 再开工——从源头消除原生抢占(被抢占 = LWD 永久孤儿)
+            q.appendleft(notify)
+            return self._lwd_schedule_for_visible_reqs(
+                self._lwd_collect_decode_requests()
+            )
         if notify is not None:
             logger.info(
                 "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
