@@ -1034,7 +1034,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if self._lwd_pending_publishes.get(req_cloud):
                 self.lwd_edge_flush_pending()
                 if self._lwd_pending_publishes.get(req_cloud):
-                    return False
+                    # 弃批即该 chunk 永久丢失(进度已乐观推进,请求将
+                    # 永远 awaiting、云侧空转——实测 2E1C 症状),
+                    #  fail-fast 暴露背压失衡,不再静默丢批
+                    raise RuntimeError(
+                        f"[Lwd][edge-notify] pending publishes to cloud "
+                        f"{req_cloud} not drained; refusing to dispatch "
+                        f"batch (chunks would be silently dropped): "
+                        f"req={request_id} offset={request.num_computed_tokens - num_tokens} "
+                        f"num={num_tokens} pending={len(self._lwd_pending_publishes[req_cloud])}"
+                    )
             if cloud_id is None:
                 cloud_id = req_cloud
             elif req_cloud != cloud_id:
@@ -1082,7 +1091,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         first = items[0]
         # RangeNotify 直发不入滞留队列:入队后补投会让云侧登记一个
         # 对应批已被丢弃的 seqno,UP 数据面等永不来的张量而挂死。
-        # 失败语义与旧版一致(弃批,由通道不丢消息前提兜底)。
+        # 发布失败 = 批被弃但进度已推进 = 请求永久 awaiting 云侧空转,
+        # fail-fast 暴露背压失衡(实测 2E1C 静默症状的根源嫌疑)。
         # 顶层单请求字段 = 首条目:旧版云侧(不读 items)仍可消费单请求批
         if not self._lwd_publish(
             LwdRangeNotify(
@@ -1096,7 +1106,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ),
             cloud_id,
         ):
-            return False
+            raise RuntimeError(
+                f"[Lwd][edge-notify] RangeNotify publish failed "
+                f"(channel backpressure): seqno={seqno} cloud={cloud_id} "
+                f"reqs={[i.request_id for i in items]} "
+                f"tokens={sum(i.num_tokens for i in items)}"
+            )
         self._lwd_seqno[cloud_id] = seqno + 1
         logger.info(
             "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d cloud=%d "
