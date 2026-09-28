@@ -360,7 +360,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         )
         for item in items:
             request = self.requests[item.request_id]
-            if request.num_computed_tokens != item.offset:
+            computed = request.num_computed_tokens
+            if computed != item.offset and computed == 0 and item.offset > 0:
+                # 首 chunk 且边侧前缀命中 trim(offset>0):云侧 resume
+                # 要等原生准入(get_computed_blocks)才落 num_computed,
+                # 对账时点尚未生效——按块池实查的 resume 量对账(与准入
+                # 同源、含边侧声明封顶,纯读 lookup 幂等;代价是命中
+                # 统计双计一次)。
+                computed = self.kv_cache_manager.get_computed_blocks(request)[1]
+            if computed != item.offset:
                 # 诊断:抢占复位(num_preemptions>0 且 computed 归零)
                 # 与非抢占的断流/乱序分开报——LWD 占位 embeds 不可
                 # 重算,抢占即协议不可恢复,必须一眼可辨
@@ -375,12 +383,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     f"[Lwd][cloud-sched] chunk offset mismatch "
                     f"req={item.request_id} seqno={notify.seqno}: "
                     f"notify offset={item.offset} != cloud computed="
-                    f"{request.num_computed_tokens} "
+                    f"{computed} (resume-checked)"
                     f"(num_preemptions={getattr(request, 'num_preemptions', '?')}"
                     f"{', PREEMPTED—占位 embeds 不可重算,抢占不可恢复' if preempted else ''}"
                     f", status={request.status}, queue={in_queues}, "
                     f"prompt={request.num_prompt_tokens}; "
-                    f"chunk 断流/重复/乱序)"
+                    f"chunk 断流/重复/乱序或 resume 与边侧 trim 不一致)"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
         # decode 精确消耗:预算钳制的精确性依赖逐字复刻原生 running 段
