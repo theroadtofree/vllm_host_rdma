@@ -361,12 +361,26 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         for item in items:
             request = self.requests[item.request_id]
             if request.num_computed_tokens != item.offset:
+                # 诊断:抢占复位(num_preemptions>0 且 computed 归零)
+                # 与非抢占的断流/乱序分开报——LWD 占位 embeds 不可
+                # 重算,抢占即协议不可恢复,必须一眼可辨
+                preempted = getattr(request, "num_preemptions", 0) > 0
+                in_queues = (
+                    "running" if request in self.running
+                    else "waiting" if request in self.waiting
+                    else "skipped" if request in self.skipped_waiting
+                    else "none"
+                )
                 raise RuntimeError(
                     f"[Lwd][cloud-sched] chunk offset mismatch "
                     f"req={item.request_id} seqno={notify.seqno}: "
                     f"notify offset={item.offset} != cloud computed="
                     f"{request.num_computed_tokens} "
-                    f"(chunk 断流/重复/乱序)"
+                    f"(num_preemptions={getattr(request, 'num_preemptions', '?')}"
+                    f"{', PREEMPTED—占位 embeds 不可重算,抢占不可恢复' if preempted else ''}"
+                    f", status={request.status}, queue={in_queues}, "
+                    f"prompt={request.num_prompt_tokens}; "
+                    f"chunk 断流/重复/乱序)"
                 )
         req_ids = decode_ids + [item.request_id for item in items]
         # decode 精确消耗:预算钳制的精确性依赖逐字复刻原生 running 段

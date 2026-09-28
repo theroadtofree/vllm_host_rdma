@@ -55,6 +55,26 @@ class LwdBaseScheduler(AsyncScheduler):
             )
         return super()._free_request(request, delay_free_blocks)
 
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
+        """LWD 云侧禁抢占:请求的 prompt embeds 是占位零值(真实内容在
+        边侧,UP 通道一次性流转),抢占复位后云侧无法重 prefill,边侧
+        也不会重发已消费 chunk——抢占即协议级不可恢复。在原生日志点
+        之前 fail-fast,把"KV 不足"暴露在真正的故障点,而不是等到
+         chunk offset 对账时以错位报错收场(实测:抢占复位 computed=0,
+               下一 chunk offset=768 对账炸,根因不可辨)。
+
+        边侧(0-KV 组)分配恒成功,本路径不可达,不受影响。"""
+        raise RuntimeError(
+            f"[Lwd] cloud preemption is unrecoverable for LWD requests "
+            f"(placeholder embeds cannot be re-prefilled, edge will not "
+            f"resend consumed chunks): req={request.request_id} "
+            f"prompt={request.num_prompt_tokens} "
+            f"computed={request.num_computed_tokens} "
+            f"preemptions={request.num_preemptions} — cloud KV/budget "
+            f"insufficient for the admitted load; reduce concurrency or "
+            f"raise KV capacity"
+        )
+
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""
         queue = create_request_queue(self.policy)
