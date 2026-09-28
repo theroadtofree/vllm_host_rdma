@@ -449,6 +449,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
+
+        def _legal_chunk(request: Request, chunk: int) -> int:
+            """预测原生调度对 chunk 的全部合法改写,作为步后核验基准:
+            云公告 mamba 网格重切(边侧 chunk 权威的另一半,网格未学到
+            时恒等)。不预测即与核验冲突:picker 按 min(剩余,C)/cap
+            截断算的 expected,原生还会再按网格收边(实测 1514→768)。"""
+            return self._mamba_block_aligned_split(request, chunk)
+
         # Apply the limit before scheduling/publishing so RangeNotify and the
         # embeddings payload retain identical request sets and token counts.
         is_deepseek_v4 = (
@@ -470,14 +478,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
             if single_prefill and picked:
                 break
-            chunk = min(remaining, unit)
+            chunk = _legal_chunk(request, min(remaining, unit))
             if used + chunk > cap:
                 # 末位截断:批内最后一个条目允许被剩余额度截尾,
                 # 批收尾(预算耗尽,与集中式 chunked prefill 逐语义
                 # 对齐)。复现依据:截断块恒为末位,边侧预算钳制
                 # (§2.5)与云侧预算钳制(§2.3)都靠"预算耗尽"复现它;
                 # 非末位块由 R/C/T 定界,与截断块尺寸无关
-                c = cap - used
+                c = _legal_chunk(request, cap - used)
                 if c >= 1:
                     picked.append(request.request_id)
                     expected[request.request_id] = c
@@ -498,11 +506,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
             if single_prefill and picked:
                 break
-            chunk = min(request.num_prompt_tokens, unit)
+            # 前缀命中 trim 的请求 num_computed > 0,可调度量按剩余算
+            remaining = (
+                request.num_prompt_tokens - request.num_computed_tokens
+            )
+            if remaining <= 0:
+                continue
+            chunk = _legal_chunk(request, min(remaining, unit))
             if new_count >= free_seq:
                 break
             if used + chunk > cap:
-                c = cap - used
+                c = _legal_chunk(request, cap - used)
                 if c >= 1:
                     picked.append(request.request_id)
                     expected[request.request_id] = c
