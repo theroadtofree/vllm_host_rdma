@@ -55,7 +55,7 @@ class LwdConfig:
     post_out_port: int = LWD_POST_OUT_PORT_DEFAULT
     post_out_bind: str = "*"
     hello_timeout_s: float = LWD_HELLO_TIMEOUT_S_DEFAULT
-    scheduler_name: str = "prefill_first"
+    scheduler_name: str = "mixed"
     publish_queue_max: int = LWD_PUBLISH_QUEUE_MAX
     debug: bool = False
     registry_path: str | None = None
@@ -109,7 +109,7 @@ class LwdConfig:
             hello_timeout_s=float(
                 section.get("hello_timeout_s", LWD_HELLO_TIMEOUT_S_DEFAULT)
             ),
-            scheduler_name=str(section.get("scheduler", "prefill_first")),
+            scheduler_name=str(section.get("scheduler", "mixed")),
             publish_queue_max=int(
                 section.get("publish_queue_max", LWD_PUBLISH_QUEUE_MAX)
             ),

@@ -12,9 +12,29 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
 
+class LwdRangeItem(msgspec.Struct, gc=False):
+    """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
+    起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
+    offset == num_computed 对账。chunk 为 min(剩余 prompt, chunk 单元)
+    的自限块;cap 截断块独占一批。
+
+    has_mrope(pdmix 多模态):逐请求标记本 chunk 是否携带 mrope
+    positions 行(UP aux 帧,[n,3] int64 与主帧同 seqno)。混批可含
+    文本+图像混合,批级标记不够;纯文本恒 False,零 aux 流量。"""
+
+    request_id: str
+    offset: int
+    num_tokens: int
+    has_mrope: bool = False
+
+
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     """边->云调度范围预告(PRE_OUT);offset/num_tokens 取自原生调度决策,
-    重复预告按 (request_id, offset) 幂等登记(边侧队满重试天然产生重复)。"""
+    重复预告按 (request_id, offset) 幂等登记(边侧队满重试天然产生重复)。
+
+    items(mixed 组批):本批全部条目,一个批一个 seqno;空 = 旧版单请求
+    语义(顶层 request_id/offset/num_tokens)。新版边侧恒填 items 且顶层
+    字段 = 首条目;新云侧优先读 items。"""
 
     request_id: str
     offset: int
@@ -23,6 +43,7 @@ class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
     edge_id: int = 0
     """来源边 id(云侧据此做 req_id 命名空间包装);缺省 0 单边兼容。"""
     has_mrope: bool = False
+    items: list[LwdRangeItem] = []
 
 
 class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):
@@ -131,6 +152,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     cached_tokens),边侧据此把"复用省了多少 token"落到自身记账/前端。
     参考分支用探针 SSE 流末 chunk 承载;prefill_only 边侧探针是同步、
     不消费 body,故改挂步元数据通道(C2e),语义不变、零新管道。"""
+    token_ids: list[list[int]] = []
+    """诊断旁路载荷:云侧逐请求 accepted token ids(仅
+    VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1 时填充),与 req_ids 按位对齐。
+    空列表 = 未携带,边侧走原生 rank-replay(lm_head + top_id_ths)。"""
 
 
 class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):

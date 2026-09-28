@@ -11,9 +11,49 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
 from vllm.v1.request import Request
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # 收尾快照:request_id -> (prompt_tokens, completion_tokens)。
+        # 释放链唯一收口点是 ``_free_request``(常规终结 update_from_output 直接
+        # 调它,**不经 finish_requests**);而 LWD 的 finish/usage 结算发生在其后
+        # 的 lwd_handle_model_output —— 那时请求已从 self.requests 摘除。故在
+        # _free_request 覆写里抓最小快照,由引擎侧消费(消费即摘除);超上限
+        # 按插入序兜底淘汰残留。phase/mixed 两个云调度臂共用。
+        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+
+    def _free_request(self, request, delay_free_blocks: bool = False):
+        """收尾快照(见 ``lwd_finished_records``):挂在**释放链唯一收口点**。
+
+        常规终结(update_from_output 里 check_stop 命中)直接
+        ``self._free_request(request)``(**不经 finish_requests**),abort/error
+        走 ``finish_requests`` → ``_free_request``;两者都收口于本方法,故快照
+        必须挂这里(挂 finish_requests 会漏掉绝大多数正常结束)。此刻请求尚在、
+        长度已是最终值(update_from_output 先落 token 再终结);由引擎侧消费
+        (消费即摘除),超上限按插入序兜底淘汰残留。"""
+        try:
+            self.lwd_finished_records[request.request_id] = (
+                request.num_prompt_tokens,
+                request.num_tokens - request.num_prompt_tokens,
+            )
+            if len(self.lwd_finished_records) > 1024:
+                for stale in list(self.lwd_finished_records)[:256]:
+                    self.lwd_finished_records.pop(stale, None)
+                logger.warning(
+                    "[Lwd][coord] finished-record table full; evicted oldest"
+                )
+        except Exception:  # noqa: BLE001  快照失败不阻断释放
+            logger.warning(
+                "[Lwd][coord] finished snapshot failed (non-fatal)", exc_info=True
+            )
+        return super()._free_request(request, delay_free_blocks)
 
     def _lwd_new_queue(self, reqs: list[Request]) -> RequestQueue:
         """新建调度策略队列并装入 reqs。"""

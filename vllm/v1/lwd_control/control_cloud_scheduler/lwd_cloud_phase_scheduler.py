@@ -33,13 +33,8 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # 收尾快照:request_id -> (prompt_tokens, completion_tokens)。
-        # 释放链唯一收口点是 ``_free_request``(常规终结 update_from_output 直接
-        # 调它,**不经 finish_requests**);而 LWD 的 finish/usage 结算发生在其后
-        # 的 lwd_handle_model_output —— 那时请求已从 self.requests 摘除(旧实现
-        # 因此从不结算、预留泄漏)。故在 _free_request 覆写里抓最小快照,由引擎
-        # 侧消费(消费即摘除);超上限按插入序兜底淘汰残留。
-        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        # lwd_finished_records(收尾快照/usage 结算)已上提至
+        # LwdBaseScheduler(phase/mixed 两臂共用,引擎按基类属性消费)。
         # 块哈希粒度(与边侧链同域):用于生成段块登记窗口的 token 换算
         self._lwd_hash_block_size = resolve_kv_cache_block_sizes(
             self.kv_cache_config, self.vllm_config
@@ -62,31 +57,6 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
 
-    def _free_request(self, request, delay_free_blocks: bool = False):
-        """收尾快照(见 ``lwd_finished_records``):挂在**释放链唯一收口点**。
-
-        常规终结(update_from_output 里 check_stop 命中)是直接
-        ``self._free_request(request)``(**不经 finish_requests**),abort/error
-        走 ``finish_requests`` → ``_free_request``;两者都收口于本方法,故快照
-        必须挂这里(挂 finish_requests 会漏掉绝大多数正常结束)。此刻请求尚在、
-        长度已是最终值(update_from_output 先落 token 再终结);由引擎侧消费
-        (消费即摘除),超上限按插入序兜底淘汰残留。"""
-        try:
-            self.lwd_finished_records[request.request_id] = (
-                request.num_prompt_tokens,
-                request.num_tokens - request.num_prompt_tokens,
-            )
-            if len(self.lwd_finished_records) > 1024:
-                for stale in list(self.lwd_finished_records)[:256]:
-                    self.lwd_finished_records.pop(stale, None)
-                logger.warning(
-                    "[Lwd][coord] finished-record table full; evicted oldest"
-                )
-        except Exception:  # noqa: BLE001  快照失败不阻断释放
-            logger.warning(
-                "[Lwd][coord] finished snapshot failed (non-fatal)", exc_info=True
-            )
-        return super()._free_request(request, delay_free_blocks)
 
     def _lwd_capped_cache_tokens(self, request) -> int:
         """生成段块登记窗口:封顶到「边侧 HMAC 链已覆盖」的 token 数。
@@ -262,8 +232,12 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # worker 的 recv 尺寸与注入切行信息:req_ids 取预告请求(单请求
         # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
         # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
-        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
+        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。逃生通道的
+        # 多模态透传:新版边侧恒填 items,首条目的 has_mrope 即该请求
+        # 的标记(相位模式单请求批,批级 ≡ 请求级);旧版无 items 的
+        # 预告无 mrope 概念,恒 False。
         edge_id, _ = parse_edge_id(notify.request_id)
+        _item0 = notify.items[0] if notify.items else None
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -271,8 +245,10 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
                 edge_id=edge_id,
-                token_offsets=[notify.offset],
-                has_mrope=notify.has_mrope,
+                prompt_offsets=[_item0.offset if _item0 else notify.offset],
+                has_mrope=[
+                    _item0.has_mrope if _item0 else notify.has_mrope
+                ],
             ),
         )
         return out

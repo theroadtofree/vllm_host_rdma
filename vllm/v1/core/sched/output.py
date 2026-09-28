@@ -43,13 +43,18 @@ class LwdEmbedBatch:
     # 单边一云缺省 0,行为与原实现一致。
     edge_id: int = 0
     cloud_id: int = 0
-    # Absolute prompt offsets; cloud token_ids contain lengths-only placeholders.
-    token_offsets: list[int] = field(default_factory=list)
-    # 多模态(image)适配:本 chunk 是否携带 mrope positions([n,3] 行序,
-    # 边调度器准入期一次性算好按 chunk 列切片);复用既有 token_offsets
-    # 表达 chunk 绝对偏移,不另设同义字段。
-    has_mrope: bool = False
-    mrope_positions: list[list[int]] = field(default_factory=list)
+    # 多模态(逐请求,与 req_ids 对齐;pdmix 混批可含文本+图像混合,
+    # 批级标记不够,必须逐请求):
+    # - prompt_offsets[i]:请求 i 本 chunk 在 prompt 中的起点(边侧
+    #   mm 行切片窗口;与调度 offset 同源);
+    # - has_mrope[i]:请求 i 是否携带 mrope 行(边侧准入时只对 MM
+    #   请求算过 positions);
+    # - mrope_positions[i]:请求 i 本 chunk 的 mrope 行([[t,h,w],...],
+    #   无 mrope 为空 list);云侧不消费内容,只按 has_mrope 求 aux
+    #   帧尺寸(Σ n_i×3),注入行从 UP aux 帧按序取。
+    prompt_offsets: list[int] = field(default_factory=list)
+    has_mrope: list[bool] = field(default_factory=list)
+    mrope_positions: list[list[list[int]]] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +68,7 @@ class LwdUnembedBatch:
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
     # 边侧 DOWN recv 选路维度(该批来自哪朵云);单云缺省 0。
     cloud_id: int = 0
+    token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
 
 
 @dataclass

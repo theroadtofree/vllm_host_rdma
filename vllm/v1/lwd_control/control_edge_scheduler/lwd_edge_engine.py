@@ -25,6 +25,7 @@ embed 登记进度)-> prefill 编排(单请求组批 -> 范围预告 -> executor
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -67,6 +68,11 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 )
 
 logger = init_logger(__name__)
+
+
+def _lwd_disable_down_enabled() -> bool:
+    """VLLM_ASCEND_LWD_DISABLE_DOWN=1:云不 collect/不发 DOWN,边直通交付。"""
+    return os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1"
 
 
 # 云->边载荷队列容量:队满时接收线程阻塞在 put,背压沿 ZMQ 直达云侧
@@ -415,6 +421,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         云侧有活请求才产 meta(build_hidden_payload 空则返回 None),
         每条 entry 行数>=1——通告必有行,无需无行分流。
         云侧复用队列元素为 (cloud_id, notify, t),1E1C 为 (notify, t)。
+        DISABLE_DOWN 诊断:通告只携带 token_ids(hidden=0)时跳过 worker
+        派发,以 future=None 直通收割,不挂任何 recv。
         返回本步派发条数。"""
         quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
         entries: list[tuple[LwdC2eNotify, float]] = []
@@ -429,7 +437,21 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 notify, t_arrive = item
             entries.append((notify, t_arrive))
         for notify, t_arrive in entries:
-            future = self._lwd_dispatch_unembed(notify, t_arrive)
+            # 直通条件改为载荷驱动为主:hidden=0 + 携带 token_ids 即
+            # 直通(云侧 DISABLE_DOWN 开、边侧未开时也不会去挂一个
+            # numel=0/seqno=-1 的 recv 把引擎步炸掉);env 开关保留
+            # 兼容(SKIP_SAMPLE 等 hidden>0 场景)。
+            if notify.token_ids and (
+                notify.hidden_num_elements == 0 or _lwd_disable_down_enabled()
+            ):
+                logger.info(
+                    "[Lwd][sched] edge direct-deliver seqno=%s reqs=%d "
+                    "(token_ids passthrough, no unembed dispatch)",
+                    notify.down_seqno, len(notify.req_ids),
+                )
+                future = None
+            else:
+                future = self._lwd_dispatch_unembed(notify, t_arrive)
             self._lwd_batch_queue.append(
                 ("unembed", notify, time.monotonic(), future)
             )
@@ -448,9 +470,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         batch = scheduler_output.lwd_batch
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
-            "[Lwd][sched] edge dispatch-embed seqno=%d req=%s tokens=%d "
+            "[Lwd][sched] edge dispatch-embed seqno=%d reqs=%s tokens=%d "
             "ahead_unemb=%d ahead_emb=%d c2e_pending=%d",
-            batch.seqno, batch.batch_meta.req_ids[0],
+            batch.seqno, batch.batch_meta.req_ids,
             scheduler_output.total_num_scheduled_tokens,
             n_unemb, n_emb, self.lwd_c2e_meta_queue.qsize(),
         )
@@ -489,16 +511,29 @@ class LwdEdgeEngineCore(EngineCoreProc):
         按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
         缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
         迟到载荷幂等丢弃。"""
-        result = future.result()
-        # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
-        # token,即该请求本步的生成内容;后续仅两处流向——
-        # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
-        # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
-        # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
-        # 客户端,即最终输出的生成 token)。
-        sampled_token_map: dict[str, list[int]] = (
-            {} if result is None
-            else dict(zip(result.req_ids, result.sampled_token_ids))
+        _t = time.monotonic()
+        if future is None:
+            # DISABLE_DOWN 直通:无 worker 批,token 直接取自 c2e 通告。
+            sampled_token_map: dict[str, list[int]] = {
+                rid: list(toks)
+                for rid, toks in zip(notify.req_ids, notify.token_ids)
+            }
+        else:
+            result = future.result()
+            # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
+            # token,即该请求本步的生成内容;后续仅两处流向——
+            # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
+            # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
+            # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
+            # 客户端,即最终输出的生成 token)。
+            sampled_token_map = (
+                {} if result is None
+                else dict(zip(result.req_ids, result.sampled_token_ids))
+            )
+        # [Lwd][perf] 临时探针:收割时长 = RPC 往返 + worker 执行全长
+        # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
+        logger.info(
+            "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
         )
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
@@ -511,8 +546,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 request_id, sampled_token_ids, finish_reason,
                 self.vllm_config,
             )
-            if not sampled_token_ids:
-                # 行在批里但无 token = unembed 失败,ERROR 优先于云侧码
+            if not sampled_token_ids and not finished:
+                # 行在批里但无 token 且未完结 = unembed 失败,ERROR 优先于
+                # 云侧码(已完结的空行属正常,如 DISABLE_DOWN 下的 ABORT)
                 finish_reason = FinishReason.ERROR
                 finished = True
             if not self.scheduler.lwd_edge_deliver_tokens(

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -24,6 +25,7 @@ from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import (
+    parse_edge_id,
     unwrap_req_id,
     wrap_req_id,
 )
@@ -34,6 +36,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdFinishNotify,
     LwdGenChainNotify,
     LwdHelloNotify,
+    LwdRangeItem,
     LwdRangeNotify,
     LwdRequestNotify,
     lwd_decode_wire_notify,
@@ -49,6 +52,9 @@ from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_mixed_scheduler import (
+    LwdCloudMixedScheduler,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
 )
@@ -65,6 +71,12 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import LwdC2eMeta, ModelRunnerOutput
 
 logger = init_logger(__name__)
+
+
+def _lwd_diag_token_passthrough_enabled() -> bool:
+    """诊断开关:SKIP_SAMPLE(边免采样)/ DISABLE_DOWN(全直通)任一开启。"""
+    return (os.environ.get("VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE") == "1"
+            or os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1")
 
 # PRE_OUT recv 超时拍:仅作关停响应上限(HELLO 首拍一次,无重发)
 LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
@@ -89,8 +101,17 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 依赖 lwd_serve_guard 注入不可靠——guard 只在 headless serve 入口
         # 执行,完整 serve 路径的 EngineCore 子进程不经 guard,缺注入会让
         # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
+        # mixed(默认)= 整体 prefill 组批混排;prefill_first/decode_first
+        # = 旧相位调度器(A/B 对照与逃生通道,见 lwd_mixed_batch_design.md)。
         vllm_config = kwargs["vllm_config"]
-        vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        scheduler_name = LwdConfig.from_env_and_config(
+            vllm_config
+        ).scheduler_name
+        vllm_config.scheduler_config.scheduler_cls = (
+            LwdCloudPhaseScheduler
+            if scheduler_name in ("prefill_first", "decode_first")
+            else LwdCloudMixedScheduler
+        )
         # 前缀复用协调:协调器 + 处理器(队列由父进程传入,None = 未启用)。
         # **必须在 super() 之前占位**:super 内即启动 PRE_OUT IO 线程,该线程经
         # _lwd_setup_zmq → _lwd_init_dispatch_state 读这些属性(以及按配置判断
@@ -436,12 +457,32 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
             # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
             # 重试天然产生重复预告,重试复用同一号不产生新登记)。
-            seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
-            if not seqnos or msg.seqno > seqnos[-1]:
-                seqnos.append(msg.seqno)
+            # mixed 组批:items 逐请求登记同一批号;空 items = 旧版单请求
+            if msg.items:
+                # D2 多边:items 内是边侧原始 id,逐条命名空间包装
+                # (顶层 request_id 上面已包;云内只认包装 id)
+                msg = msgspec.structs.replace(
+                    msg,
+                    items=[
+                        msgspec.structs.replace(
+                            item, request_id=wrap_req_id(edge_id, item.request_id)
+                        )
+                        for item in msg.items
+                    ],
+                )
+            items = msg.items or [
+                LwdRangeItem(msg.request_id, msg.offset, msg.num_tokens)
+            ]
+            for item in items:
+                seqnos = self._lwd_seqno_registry.setdefault(
+                    item.request_id, []
+                )
+                if not seqnos or msg.seqno > seqnos[-1]:
+                    seqnos.append(msg.seqno)
             logger.info(
-                "[Lwd][cloud-ctrl] RangeNotify req=%s edge=%d num=%s seqno=%s",
-                msg.request_id, edge_id, msg.num_tokens, msg.seqno,
+                "[Lwd][cloud-ctrl] RangeNotify reqs=%d edge=%d num=%s seqno=%s",
+                len(items), edge_id, sum(item.num_tokens for item in items),
+                msg.seqno,
             )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
@@ -455,6 +496,11 @@ class LwdCloudEngineCore(EngineCoreProc):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_edge_chains.pop(msg.request_id, None)
+            self._lwd_seqno_registry.pop(msg.request_id, None)
+            # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
+            # "ADD 未落地"的预告是留队首等落地, aborted 请求永不落地,
+            # 不清扫会把队首永久堵住(条目掏空则整条移除)
+            self._lwd_purge_prefill_notify(msg.request_id)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
@@ -517,6 +563,36 @@ class LwdCloudEngineCore(EngineCoreProc):
             self._lwd_claim_reservation(request)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
+
+    def _lwd_purge_prefill_notify(self, request_id: str) -> None:
+        """abort 清扫:摘除 prefill_notify_queue 里该请求的条目(条目
+        掏空则整条移除),并整体替换 deque(赋值原子,调度主线程的
+        peek/popleft 不受清扫影响)。"""
+        queue = getattr(self.scheduler, "prefill_notify_queue", None)
+        if not queue:
+            return
+        kept: deque = deque()
+        removed = 0
+        for notify in queue:
+            if notify.items:
+                items = [
+                    item for item in notify.items
+                    if item.request_id != request_id
+                ]
+                removed += len(notify.items) - len(items)
+                if items:
+                    notify.items = items
+                    kept.append(notify)
+            elif notify.request_id != request_id:
+                kept.append(notify)
+            else:
+                removed += 1
+        if removed:
+            self.scheduler.prefill_notify_queue = kept
+            logger.info(
+                "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
+                "aborted req=%s", removed, request_id,
+            )
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。
@@ -690,11 +766,18 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
                 LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
                 _t = time.monotonic()
+                # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
+                # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
+                token_ids: list[list[int]] = []
+                if _lwd_diag_token_passthrough_enabled():
+                    ids_by_req = self._lwd_step_token_ids(engine_core_outputs)
+                    token_ids = [ids_by_req.get(rid, []) for rid in meta.req_ids]
                 self._lwd_publish_c2e(
                     edge_id,
                     meta,
                     self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
                     usages,
+                    token_ids,
                 )
                 # prompt 算完的请求发布其 manifest 摘要 → 后续 probe 可命中
                 self._lwd_publish_completed_prefixes(meta.req_ids)
@@ -703,6 +786,41 @@ class LwdCloudEngineCore(EngineCoreProc):
                     "[Lwd][perf] publish edge=%d reqs=%d dur=%.2fms",
                     edge_id, len(meta.req_ids),
                     (time.monotonic() - _t) * 1000,
+                )
+        elif os.environ.get("VLLM_ASCEND_LWD_DISABLE_DOWN") == "1":
+            # VLLM_ASCEND_LWD_DISABLE_DOWN=1 诊断:cloud runner 不做
+            # collect、不发 DOWN,但 c2e 通告必须照常驱动边侧交付——
+            # 逐请求 token ids 直传,hidden_num_elements=0 标记无张量;
+            # 仅进 finished_requests 的请求补空行以携带 ABORT 码。
+            # 多云适配:按 parse_edge_id 分组定向发布,每边只收自己的行。
+            ids_by_req = self._lwd_step_token_ids(engine_core_outputs)
+            for outputs in engine_core_outputs.values():
+                for rid in outputs.finished_requests or ():
+                    ids_by_req.setdefault(rid, [])
+            if not ids_by_req:
+                # 空步(无输出也无完结):空通告没有任何可交付内容,
+                # 发了只会让边侧白醒来一次并空派一个 UNEMBED 批占配额,
+                # 直接跳过。
+                return model_output
+            from vllm.v1.outputs import LwdC2eMeta
+
+            by_edge: dict[int, list[str]] = {}
+            for rid in ids_by_req:
+                by_edge.setdefault(parse_edge_id(rid)[0], []).append(rid)
+            for edge_id, req_ids in by_edge.items():
+                meta = LwdC2eMeta(
+                    hidden_num_elements=0,
+                    top_id_ths=[],
+                    num_accepted_tokens=[],
+                    req_ids=req_ids,
+                    down_seqno=-1,
+                )
+                self._lwd_publish_c2e(
+                    edge_id,
+                    meta,
+                    self._lwd_c2e_finish_reasons(meta, engine_core_outputs),
+                    None,
+                    [ids_by_req[rid] for rid in req_ids],
                 )
         else:
             logger.info(
@@ -728,12 +846,24 @@ class LwdCloudEngineCore(EngineCoreProc):
         return [reasons.get(request_id, LWD_NOT_FINISHED)
                 for request_id in meta.req_ids]
 
+    @staticmethod
+    def _lwd_step_token_ids(
+        engine_core_outputs: dict[int, EngineCoreOutputs],
+    ) -> dict[str, list[int]]:
+        """本步逐请求 new_token_ids(request_id 索引),诊断旁路共用。"""
+        ids_by_req: dict[str, list[int]] = {}
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                ids_by_req[out.request_id] = list(out.new_token_ids)
+        return ids_by_req
+
     def _lwd_publish_c2e(
         self,
         edge_id: int,
         meta: LwdC2eMeta,
         finish_reasons: list[int],
         usages: dict[str, LwdUsage] | None = None,
+        token_ids: list[list[int]] | None = None,
     ) -> None:
         """步元数据(含逐请求 finish_reasons 完成码 + usage)发边:背压进
         有序滞留队列由步首补投(元数据不可丢,主循环零 sleep)。req_ids
@@ -742,6 +872,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         usages:按云内包装 id 命中,与出口 req_ids 按位对齐;空 dict 项
         表示该请求本步无 usage。参考分支经探针 SSE 末 chunk 回 usage,我们
         改挂本通道(边侧已按步消费,零新管道)。
+
+        token_ids:仅诊断旁路(VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1)携带,
+        边侧据此跳过 lm_head/rank-replay 直接交付。
 
         按边分组已在云 worker 的 down carrier 完成(每 edge 独立
         down_seqno,一份 C2eNotify 严格配对一次 DOWN 发送),本方法只
@@ -766,6 +899,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 (u.to_openai_dict() if (u := usage_by_req.get(rid)) else {})
                 for rid in meta.req_ids
             ],
+            token_ids=token_ids or [],
         )
         pending = self._lwd_c2e_pending.setdefault(edge_id, deque())
         if pending:
