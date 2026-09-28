@@ -54,6 +54,7 @@ from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
 from vllm.v1.lwd_debug import LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdC2eNotify,
     LwdHelloNotify,
     lwd_decode_cloud_notify,
@@ -320,6 +321,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
         hello = self._lwd_peer_hellos.get(cloud_id)
         if hello is None:
             return
+        if (
+            self.vllm_config.model_config.uses_mrope
+            and hello.wire_version < LWD_WIRE_VERSION
+        ):
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[LWD] edge/cloud wire protocol mismatch: model uses "
+                f"mrope but cloud HELLO wire_version="
+                f"{hello.wire_version} < {LWD_WIRE_VERSION}——云侧仍按数据面"
+                f" aux 帧协议运行,mrope positions 将静默缺失(msgspec 容忍"
+                f"未知字段,旧云不会报错),两侧必须同版本部署"
+            )
         if hello.max_num_batched_tokens == 0:
             logger.warning(
                 "[Lwd] cloud%d HELLO carries no scheduling triple "

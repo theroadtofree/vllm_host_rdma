@@ -1396,7 +1396,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         token_slices: list[list[int]] = []
         prompt_offsets: list[int] = []
         has_mrope: list[bool] = []
-        mrope_slices: list[list[list[int]]] = []
         cloud_id: int | None = None
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
@@ -1437,16 +1436,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
             # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
-            # 恒携带 mrope 行(key 在即恒真);[3,N] 切本 chunk 列 ->
-            # [n,3] 行序与 token 轴对齐,随批下发 worker 组 aux 帧
+            # 恒携带 mrope(key 在即恒真);[3,N] 切本 chunk 列并序列化
+            # 为原始字节随 item 走控制面(wire_version>=2,数据面 aux
+            # 帧已退役)
             positions = self._lwd_mrope_positions_dict.get(request_id)
             req_has_mrope = positions is not None
+            mrope_bytes = b""
+            if req_has_mrope:
+                assert positions is not None
+                mrope_bytes = (
+                    positions[:, offset : offset + num_tokens]
+                    .contiguous()
+                    .numpy()
+                    .tobytes()
+                )
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
+                    mrope_positions=mrope_bytes,
                 )
             )
             req_ids.append(request_id)
@@ -1455,13 +1465,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             prompt_offsets.append(offset)
             has_mrope.append(req_has_mrope)
-            if req_has_mrope:
-                assert positions is not None
-                mrope_slices.append(
-                    positions[:, offset : offset + num_tokens].t().tolist()
-                )
-            else:
-                mrope_slices.append([])
         if not items:
             return True
         assert cloud_id is not None
@@ -1504,7 +1507,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
         # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
         # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化);
-        # mrope 行同序携带(仅 MM 请求非空),worker 据此组 aux 帧
+        # mrope positions 已随 RangeNotify 走控制面,边 worker 不再
+        # 组 aux 帧
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -1515,7 +1519,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 cloud_id=cloud_id,
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
-                mrope_positions=mrope_slices,
             ),
         )
         return True

@@ -33,6 +33,7 @@ from vllm.v1.lwd_control.control_communication.lwd_id_adapter import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
+    LWD_WIRE_VERSION,
     LwdAbortNotify,
     LwdC2eNotify,
     LwdFinishNotify,
@@ -391,6 +392,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             prefix_use_eagle=bool(getattr(self.scheduler, "use_eagle", False)),
             prefix_alignment_tokens=prefix_alignment_tokens,
             prefix_alignment_required=prefix_alignment_required,
+            # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
+            wire_version=LWD_WIRE_VERSION,
         )
         if config.is_cloud_reuse:
             registry = get_role_registry()
