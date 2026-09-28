@@ -197,6 +197,35 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             ready.append(item)
         return ready, unknown
 
+    def _lwd_pre_recv_ready(self, notify: LwdRangeNotify) -> bool:
+        """提前收闸门:该批(本 chunk 批)的 UP 数据收完了没。
+
+        收完才允许下发这个 prefill 批 —— 此时 embeds(主帧)与 mrope(aux 帧)
+        都已在云 worker 的接收 buffer 里,注入侧 future.wait() 立刻返回;没收完
+        就本步只下 decode(notify 留队首,下步再判),不把等待塞进 worker 前向。
+
+        判据是引擎维护的每通道水位(worker 通信线程上报收完的 seqno):完成序
+        = seqno 序(通道 FIFO),所以 seqno <= 水位 即精确判据。一条 seqno 覆盖
+        主帧 + aux 帧(``LwdCommRequest`` 的 aux 约定),故水位天然覆盖两帧。
+        """
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            is_irecv_complete,
+            watermark,
+        )
+        from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+
+        ready = is_irecv_complete(LwdChannelType.UP, notify.seqno)
+        # [Lwd][pre-recv] 闸门读数:与 HINT/SUBMIT/DONE/REPORT/POST 用同一单调钟,
+        # 可把"预告到达->worker挂recv->worker收完上报->引擎放行"四段直接相减。
+        logger.info(
+            "[Lwd][pre-recv] gate seqno=%d watermark=%d ready=%s ts=%.3f",
+            notify.seqno,
+            watermark(LwdChannelType.UP),
+            ready,
+            time.monotonic(),
+        )
+        return ready
+
     def _lwd_preflight_ok(
         self, items: list[LwdRangeItem], num_decode: int
     ) -> bool:
@@ -287,8 +316,22 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     notify.seqno,
                 )
                 notify = None
+            elif not self._lwd_pre_recv_ready(notify):
+                # 提前收闸门:UP 张量还没收完 -> 本步不下发这个 prefill 批
+                # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
+                # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
+                notify = None
             elif not self._lwd_preflight_ok(items, len(decode_ids)):
-                # 预算/名额/KV 不足:预告留队首,decode 泄压后重试
+                # 预算/名额/KV 不足:预告留队首,decode 泄压后重试。
+                # 这条必须打日志:它是"数据都收完了、闸门也放行了,prefill 却
+                # 一直不下发"的唯一静默出口(现场排查尾部停摆时,先看这条)。
+                logger.info(
+                    "[Lwd][cloud-sched] notify seqno=%d deferred: preflight "
+                    "rejected (reqs=%d tokens=%d decode=%d pending_notify=%d)",
+                    notify.seqno, len(items),
+                    sum(item.num_tokens for item in items), len(decode_ids),
+                    len(self.prefill_notify_queue),
+                )
                 notify = None
             else:
                 return self._schedule_mixed(notify, items, decode_ids)

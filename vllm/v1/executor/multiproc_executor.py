@@ -162,6 +162,8 @@ class MultiprocExecutor(Executor):
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        # LWD 提前收:建下行提示 MQ(必须在 worker 被创建之前,handle 走环境变量)
+        self._lwd_init_early_recv_mq()
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -253,6 +255,11 @@ class MultiprocExecutor(Executor):
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
 
+            # LWD 提前收:挂上行完成上报 MQ 的 reader(worker 是 writer,handle
+            # 随 READY 握手回传)。此处不做 wait_until_ready:writer 在 worker
+            # 的 init_device 之后才开始上报,而 init_device 晚于 READY。
+            self._lwd_attach_irecv_done_mq()
+
             self.futures_queue = deque[FutureWrapper]()
 
             self._post_init_executor()
@@ -286,6 +293,52 @@ class MultiprocExecutor(Executor):
 
     def _post_init_executor(self) -> None:
         pass
+
+    # ------------------------------------------------------------------ #
+    # LWD 提前收(pre-recv)的旁路消息队列                                   #
+    # ------------------------------------------------------------------ #
+    def _lwd_init_early_recv_mq(self) -> None:
+        """建下行提示 MQ(writer),并把 handle 交给即将创建的 worker。
+
+        为什么必须是**独立 MQ**、不能借 ``rpc_broadcast_mq``:
+        ``worker_busy_loop`` 是单线程的,它会在 ``execute_model`` 里为一个
+        prefill 批阻塞几百毫秒;提示排在那条队列上,就要等这一步跑完才会被
+        取走 —— 提前挂 recv 的重叠就没了。所以走一条只由 worker 侧通信线程
+        消费的旁路。
+
+        只有云侧(LWD 且非边节点)建;边侧/非 LWD 保持 None,不导 handle。
+        上行的完成上报 MQ 方向相反(worker 建 writer、handle 随 READY 回传),
+        见 ``_lwd_attach_irecv_done_mq``。
+        """
+        self.lwd_recv_hint_mq: MessageQueue | None = None
+        self.lwd_irecv_done_mq: MessageQueue | None = None
+        lwd = self.parallel_config.lwd_config
+        if not (lwd.enable_lwd and not lwd.is_edge_node):
+            return
+        from vllm_ascend.distributed.lwd_comm.pre_recv import create_hint_mq
+
+        self.lwd_recv_hint_mq = create_hint_mq()
+        logger.info(
+            "[Lwd][pre-recv] hint MQ created on cloud executor "
+            "(local_world_size=%d)", self.local_world_size,
+        )
+
+    def _lwd_attach_irecv_done_mq(self) -> None:
+        """从 worker 的 READY 载荷里收完成上报 MQ 的 reader。
+
+        只有云端点 rank 会建 writer(它才真的收跨机数据),故取那个非 None 的
+        句柄即可;其余 rank 的 MQ 恒空、也不上报。
+        """
+        if self.lwd_recv_hint_mq is None:
+            return
+        for worker in self.workers:
+            if worker.irecv_done_mq is not None:
+                self.lwd_irecv_done_mq = worker.irecv_done_mq
+                break
+        logger.info(
+            "[Lwd][pre-recv] done MQ attached on cloud executor: %s",
+            "OK" if self.lwd_irecv_done_mq is not None else "NONE",
+        )
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
@@ -593,6 +646,9 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    # LWD 提前收:worker 通信线程上报"哪条 recv 收完了"的 MQ(worker 建
+    # writer,本进程挂 reader)。只有云端点 rank 非 None。
+    irecv_done_mq: MessageQueue | None = None
 
     @classmethod
     def from_unready_handle(
@@ -600,6 +656,7 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
+        irecv_done_mq: MessageQueue | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -607,6 +664,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            irecv_done_mq=irecv_done_mq,
         )
 
 
@@ -616,6 +674,8 @@ class WorkerProc:
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
+    # LWD 提前收:worker 侧建的上报 MQ(writer),READY 时把 handle 回传引擎
+    irecv_done_mq: MessageQueue | None
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
@@ -730,6 +790,10 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
+        # LWD 提前收:云端点 worker 在 init_device 里建好了完成上报 MQ(writer),
+        # 取到它并随 READY 载荷回传,引擎据此挂 reader。
+        self.irecv_done_mq = getattr(self.worker, "irecv_done_mq", None)
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -804,10 +868,16 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
+        # LWD 提前收:worker 侧建的完成上报 MQ(1 读 1 写),此处挂 reader。
+        irecv_done_handle = handles.get("irecv_done_handle")
+        irecv_done_mq: MessageQueue | None = None
+        if irecv_done_handle is not None:
+            irecv_done_mq = MessageQueue.create_from_handle(irecv_done_handle, 0)
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
+            irecv_done_mq=irecv_done_mq,
         )
 
     @staticmethod
@@ -955,6 +1025,12 @@ class WorkerProc:
                     "status": WorkerProc.READY_STR,
                     "handle": worker.worker_response_mq.export_handle(),
                     "peer_response_handles": worker.peer_response_handles,
+                    # LWD 提前收:完成上报 MQ 的 handle(仅云端点 worker 非 None)
+                    "irecv_done_handle": (
+                        worker.irecv_done_mq.export_handle()
+                        if worker.irecv_done_mq is not None
+                        else None
+                    ),
                 }
             )
 

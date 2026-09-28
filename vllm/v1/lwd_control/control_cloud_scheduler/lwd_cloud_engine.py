@@ -85,6 +85,16 @@ class LwdCloudEngineCore(EngineCoreProc):
             if scheduler_name in ("prefill_first", "decode_first")
             else LwdCloudMixedScheduler
         )
+        # [Lwd][pre-recv] 提前收只挂在 PD_mix(默认分支)上:该分支按
+        # "UP embeds 收完才下发 prefill 批"的闸门调度,提示与水位都由它消费。
+        # 相位调度是逃生通道,不设闸门,也就不发提示(避免无人排空的旁路 MQ)。
+        self._lwd_early_recv = scheduler_name not in (
+            "prefill_first", "decode_first",
+        )
+        logger.info(
+            "[Lwd][pre-recv] armed=%s scheduler=%s",
+            self._lwd_early_recv, scheduler_name,
+        )
         super().__init__(*args, **kwargs)
         # 通信面构造期装配(与边侧 _lwd_setup_zmq 同构):subscriber 自带
         # 搬运线程后,socket 不再受泵线程的 zmq 单线程亲和约束;建站失败
@@ -130,6 +140,30 @@ class LwdCloudEngineCore(EngineCoreProc):
         # registry 引用交付调度器(泵线程登记 / 主循环读,dict 赋值原子)。
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
+        # [Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker 通信线程。
+        # 走 executor 上的旁路 MQ(不是 rpc_broadcast_mq:那条由 busy_loop 单线程
+        # 消费,会被几百毫秒的 prefill 前向堵住,提示就"早"不起来了)。引擎在
+        # super().__init__ 里就把 executor 建好了,故此处直接取。
+        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
+        if self._lwd_early_recv and hint_mq is not None:
+            from vllm_ascend.distributed.lwd_comm.pre_recv import (
+                register_hint_sender,
+            )
+
+            # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
+            # 水位不前进,闸门后的批永不下发。
+            register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
+            logger.info(
+                "[Lwd][pre-recv] hint sender registered (PD_mix -> hint MQ)"
+            )
+        else:
+            # armed=False 是相位调度分支的正常形态;armed=True 却没有 hint MQ
+            # 就是接线坏了(提示发不出去 ⇒ 闸门永不放行),必须显式可见。
+            logger.warning(
+                "[Lwd][pre-recv] hint sender NOT registered armed=%s "
+                "hint_mq=%s",
+                self._lwd_early_recv, hint_mq is not None,
+            )
         threading.Thread(
             target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
         ).start()
@@ -247,6 +281,32 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
             # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
             self.scheduler.prefill_notify_queue.append(msg)
+            # [Lwd][pre-recv] 提前收①:预告到达即给云 worker 下发提示(seqno +
+            # flat token 数 + mrope 行数),worker 的通信线程收到就挂精确尺寸的
+            # UP irecv(主帧 hash 载荷 + aux 帧) —— 不再等这个批的
+            # SchedulerOutput 下发。num_tokens/aux_rows 取 items 逐条目之和
+            # (mixed 恒填 items;顶层字段只描述首条目);has_mrope 逐 item 透传,
+            # 纯文本批 aux_rows=0(零 aux 流量)。
+            if self._lwd_early_recv:
+                from vllm_ascend.distributed.lwd_comm.pre_recv import (
+                    make_recv_hint,
+                    post_irecv_hint,
+                )
+
+                num_tokens = sum(item.num_tokens for item in items)
+                aux_rows = sum(
+                    item.num_tokens for item in items if item.has_mrope
+                )
+                # 先打点再入队:worker 通信线程 0.5ms 就能取走,若打点在入队之后,
+                # 跨进程写日志的次序会让 hint2sub 出现负值,看着像时序错乱。
+                logger.info(
+                    "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d aux_rows=%d "
+                    "ts=%.3f",
+                    msg.seqno, num_tokens, aux_rows, time.monotonic(),
+                )
+                post_irecv_hint(
+                    make_recv_hint(msg.seqno, num_tokens, aux_rows)
+                )
             return
         if isinstance(msg, LwdAbortNotify):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
@@ -385,6 +445,7 @@ class LwdCloudEngineCore(EngineCoreProc):
     def step_with_batch_queue(self):
         """步骤执行时长打点(开始执行→执行结束;不含引擎空等)。"""
         _t0 = time.monotonic()
+        self._lwd_drain_irecv_completions()
         out = super().step_with_batch_queue()
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
@@ -395,12 +456,48 @@ class LwdCloudEngineCore(EngineCoreProc):
     def step(self):
         """同步步路径同款打点。"""
         _t0 = time.monotonic()
+        self._lwd_drain_irecv_completions()
         out = super().step()
         logger.info(
             "[Lwd][perf] cloud-step exec=%.2fms",
             (time.monotonic() - _t0) * 1000,
         )
         return out
+
+    def _lwd_drain_irecv_completions(self) -> None:
+        """[Lwd][pre-recv] 提前收③:把 worker 上报的收完项并进水位(每步一次)。
+
+        云 worker 的通信线程每收完一条 UP recv 就上报 (channel, seqno);本处
+        在每步开头排空 done MQ,水位随即成为 PD_mix 闸门
+        (``_lwd_pre_recv_ready``) 的就绪判据 —— 收完的批本步就能下发,
+        没收完的本步只跑 decode。
+        """
+        done_mq = getattr(self.model_executor, "lwd_irecv_done_mq", None)
+        if done_mq is None:
+            return
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            record_irecv_completions,
+        )
+
+        items = []
+        while True:
+            try:
+                items.append(done_mq.dequeue(timeout=0))
+            except TimeoutError:
+                break
+            except Exception:
+                # 关停时 ring 被取消:记一条即可,水位停在原处不影响收尾
+                logger.exception("[Lwd][pre-recv] done MQ drain failed")
+                break
+        if not items:
+            return
+        for channel, seqno in record_irecv_completions(items):
+            # 引擎侧收到上报的落点(与 worker 的 REPORT 行对减 = 上报过 MQ +
+            # 等到本步排空的延迟)
+            logger.info(
+                "[Lwd][pre-recv] watermark advanced channel=%s seqno=%d ts=%.3f",
+                channel.value, seqno, time.monotonic(),
+            )
 
     def lwd_handle_model_output(
         self,
