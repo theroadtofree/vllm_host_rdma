@@ -431,6 +431,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         chunk 语义(lwd_chunked_prefill_design.md §3.1):
         - 每个 chunk 自限:c = min(剩余 prompt, chunk 单元 C),云侧原生
           调度在阈值复现(T=批内最大)下逐请求推出同一边界;
+        - 批内非末位 chunk 同质(T 复现的前提):云侧复现非末位块只靠
+          阈值从上压,尺寸 < T 的非末位块会被阈值放过、被预算超排
+          (实测:网格收边产出 768 非末位块与 1536 块同批,T=1536
+          压不住 1512 的 prompt,整段 1512 被排进,步后核验炸)。
+          网格收边(_legal_chunk)会按 prompt 长度产出 < 单元的非末位
+          块,故组批强制:非末位块同尺寸且不小于任何末位块,违例即
+          收批留待下一条 notify(空批恒合法,无饿死);唯一例外是
+          批尾的预算截断块(预算耗尽复现,见下);
         - 续传(先收尾再开新):running 中未发完的 prefill 按 FCFS 序取
           c = min(剩余, C),Σ ≤ cap;
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
@@ -477,6 +485,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
+        # 批内同质性跟踪(见 docstring「批内非末位 chunk 同质」):
+        # nonlast_size = 批内非末位块的统一尺寸(未定 None);
+        # batch_max = 批内最大 chunk(末位块也计入,T 由它决定)
+        nonlast_size: int | None = None
+        batch_max = 0
 
         def _legal_chunk(request: Request, chunk: int) -> int:
             """预测原生调度对 chunk 的全部合法改写,作为步后核验基准:
@@ -507,6 +520,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if single_prefill and picked:
                 break
             chunk = _legal_chunk(request, min(remaining, unit))
+            # 同质性门控:违例即收批(本请求留下一条 notify)。
+            # 末位截断分支不受此限:截断块恒为批尾,由预算耗尽复现
+            if chunk < remaining:
+                # 非末位块:须与批内已有非末位块同尺寸,且不小于任何
+                # 已入批末位块(否则 T 被抬高,本块被阈值放过而超排)
+                if (
+                    nonlast_size is not None and chunk != nonlast_size
+                ) or chunk < batch_max:
+                    break
+                nonlast_size = chunk
+            elif nonlast_size is not None and chunk > nonlast_size:
+                # 末位块(收尾):可调度量 == 剩余,天然精确;但不得把
+                # T 抬过已有非末位块尺寸
+                break
+            batch_max = max(batch_max, chunk)
             if used + chunk > cap:
                 # 末位截断:批内最后一个条目允许被剩余额度截尾,
                 # 批收尾(预算耗尽,与集中式 chunked prefill 逐语义
@@ -541,6 +569,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if remaining <= 0:
                 continue
             chunk = _legal_chunk(request, min(remaining, unit))
+            # 同质性门控:同续传循环(违例收批,保 FCFS 前缀语义)
+            if chunk < remaining:
+                if (
+                    nonlast_size is not None and chunk != nonlast_size
+                ) or chunk < batch_max:
+                    break
+                nonlast_size = chunk
+            elif nonlast_size is not None and chunk > nonlast_size:
+                break
+            batch_max = max(batch_max, chunk)
             if new_count >= free_seq:
                 break
             if used + chunk > cap:

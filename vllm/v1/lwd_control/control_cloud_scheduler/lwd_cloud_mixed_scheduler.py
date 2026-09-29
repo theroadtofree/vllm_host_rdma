@@ -388,7 +388,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         关闭前提下调度时刻即真实水位)——不等即 chunk 断流(>)/
         重复(<)/乱序,协议级事故 fail-fast,不当场炸就会把
         embeddings 注入错位窗口静默错算。
-        双钳制复现(设计 §2.3/§2.4 修订):① 阈值复现——临时覆写
+        双钳制复现(设计 §2.3/§2.4 修订,前提:批内非末位 chunk 同尺寸,
+        由边侧 picker 同质性门控保证——网格收边会产出 < 单元的非末位
+        块,异尺寸混批时 T 压不住小块所属请求的余量,会被预算超排):① 阈值复现——临时覆写
         long_prefill_token_threshold = max(items.num_tokens),非末位
         自限块由 R/C/T 定界逐请求复现;② 预算钳制——临时把
         max_num_scheduled_tokens 压到 decode 精确消耗 + Σ chunk,
