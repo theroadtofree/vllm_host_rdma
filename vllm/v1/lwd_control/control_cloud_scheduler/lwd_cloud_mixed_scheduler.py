@@ -107,6 +107,16 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_recent_finished: OrderedDict[str, None] = OrderedDict()
         # 当次消费的幽灵条目(classify 写入,建批/释放读取)
         self._lwd_cur_ghost_items: list[LwdRangeItem] = []
+        # KV preflight 的分组块粒度:混合模型块池跨组共享,一个 chunk 的
+        # 实际占用 = Σ_g cdiv(tokens, g.block_size)(768-token chunk =
+        # 48 attn(16) + 1 mamba(768) = 49 块)。用 self.block_size
+        # (=scheduler_block_size,混合下为组块 LCM 网格)按单粒度估会
+        # 少算 ~组数倍,preflight 失守放进批 → allocate_slots 失败 →
+        # 步后核验以 scheduled=0 炸(实测 seqno=195)
+        self._lwd_group_block_sizes = [
+            group.kv_cache_spec.block_size
+            for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups
+        ]
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """先累计 spec 接受率(镜像原生 update_from_output 的统计分支),
@@ -262,7 +272,9 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         """放行三检:token 预算 / 并发名额 / KV 保守预估。
 
         预算与名额本由边侧 cap 保证(设计 §2),此处是双保险;KV 预估
-        忽略前缀缓存命中(命中只降占用,高估是安全方向)。decode 占用
+        按各 KV 组块粒度分别求和(混合模型块池跨组共享,单粒度估计会
+        按 LCM 倍率少算),且忽略前缀缓存命中(命中只降占用,高估是
+        安全方向)。decode 占用
         按 1+k 计(MTP 草稿 token 同样吃预算;KV 块预留同系数上取整)。"""
         need_tokens = (
             sum(item.num_tokens for item in items)
@@ -301,9 +313,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
-        need_blocks = (
-            sum(cdiv(item.num_tokens, self.block_size) for item in items)
-            + num_decode * cdiv(self._lwd_spec_factor, self.block_size)
+        need_blocks = sum(
+            cdiv(item.num_tokens, bs)
+            for item in items
+            for bs in self._lwd_group_block_sizes
+        ) + num_decode * sum(
+            cdiv(self._lwd_spec_factor, bs) for bs in self._lwd_group_block_sizes
         )
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
