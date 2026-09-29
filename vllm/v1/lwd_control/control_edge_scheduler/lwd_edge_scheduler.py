@@ -489,14 +489,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         上 wire 的批:
         - peek-then-advance:发布成功才进位计数器;
         - 单 notify 前提:本方法每步至多发一条(批量条目全部装在同
-          一条里),发布原子性即整批原子性,不存在部分成功。
+          一条里),发布原子性即整批原子性,不存在部分成功;
+        - 多实例:批恒属当前绑定实例(调度步 switch 后不回切,notify
+          同步跟随),经 _lwd_publish 定向路由到该实例的云 DEALER;
+          instance_id 同时 stamp 进 lwd_batch,驱动 UP 通道对路由。
 
         前提:控制面发布通道不丢消息,publish 恒成功——步末回退
         对账已按此前提移除。若前提被破坏返回 False,调用方本步不
         派发但进度不回退,该批永久丢失;重复预告在云侧按
         (request_id, offset) 幂等登记。"""
-        publisher = self.lwd_edge_publisher
         scheduled = scheduler_output.num_scheduled_tokens
+        # 实例戳 = 本步绑定实例:_lwd_seqno/requests 都是当前桶的,
+        # 批内条目 pin 别的实例即路由/seqno 空间发散,fail-fast
+        idx = self._cur_instance
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
         token_slices: list[list[int]] = []
@@ -506,25 +511,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 continue
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
-            seqno = self._lwd_seqno
-            # 实例戳 = 请求 pin 的实例(发布路由到对应云 DEALER);
-            # _lwd_seqno 是当前绑定桶的计数器,与请求所属实例一致
-            idx = self._req_id_to_instance.get(request_id, 0)
-            if not self._lwd_publish(
-                LwdRangeNotify(
-                    request_id=request_id,
-                    offset=offset,
-                    num_tokens=num_tokens,
-                    seqno=seqno,
-                ),
-                idx,
-            ):
-                return False
-            self._lwd_seqno = seqno + 1
-            logger.info(
-                "[Lwd][edge-notify] req=%s inst=%d offset=%d num=%d seqno=%d",
-                request_id, idx, offset, num_tokens, seqno,
-            )
+            pinned = self._req_id_to_instance.get(request_id, 0)
+            if pinned != idx:
+                raise RuntimeError(
+                    f"[Lwd][edge-notify] req={request_id} pinned instance "
+                    f"{pinned} != bound instance {idx}"
+                )
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
@@ -541,33 +533,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         seqno = self._lwd_seqno
         first = items[0]
         # 顶层单请求字段 = 首条目:旧版云侧(不读 items)仍可消费单请求批
-        if not publisher.publish(
+        if not self._lwd_publish(
             LwdRangeNotify(
                 request_id=first.request_id,
                 offset=first.offset,
                 num_tokens=first.num_tokens,
                 seqno=seqno,
-                batch_meta=LwdEmbedBatch(
-                    req_ids=[request_id],
-                    token_ids=[
-                        list(
-                            request.prompt_token_ids[offset : offset + num_tokens]
-                        )
-                    ],
-                ),
-                instance_id=idx,
                 items=items,
-            )
+            ),
+            idx,
         ):
             return False
         self._lwd_seqno = seqno + 1
         logger.info(
-            "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d",
-            len(items), sum(item.num_tokens for item in items), seqno,
+            "[Lwd][edge-notify] batch reqs=%d inst=%d tokens=%d seqno=%d",
+            len(items), idx, sum(item.num_tokens for item in items), seqno,
         )
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
-        # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
-        # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化)
+        # 配对键(与云侧 RangeNotify 登记同值,本批一个号一次 UP
+        # send,云侧混排步按队首通知同号配对),embed 载荷为本
+        # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化,
+        # instance_id stamp 决定 UP 通道对的路由)
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -575,6 +561,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 req_ids=req_ids,
                 token_ids=token_slices,
             ),
+            instance_id=idx,
         )
         return True
 
