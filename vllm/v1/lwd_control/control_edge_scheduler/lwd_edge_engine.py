@@ -106,6 +106,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self._lwd_c2e_pending: dict[int, deque] = {}
         # 实例数标记:泵线程 c2e 越界防御用(与屏障/通道的 N 同源)
         self._lwd_instance_count = config.instance_count
+        # HELLO 载荷按实例留存(router 泵线程收首个 HELLO 时写入,
+        # 构造线程 _lwd_cross_check_hello 在集合屏障后消费;dict 单键
+        # 赋值原子,重复 HELLO 幂等跳过)
+        self._lwd_peer_hellos: dict[int, LwdHelloNotify] = {}
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
         # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
@@ -166,6 +170,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 f"(bind {config.lwd_post_out_bind_endpoint()}; check cloud "
                 f"master_addr connectivity and POST_OUT port)"
             )
+        self._lwd_cross_check_hello()
 
     def _lwd_pump_cloud_messages_push_pull(
         self,
@@ -196,6 +201,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                             "[Lwd] cloud discovered via HELLO: PRE_OUT -> %s",
                             endpoint,
                         )
+                        # 载荷留存供构造线程互校(调度三元组,
+                        # 见 _lwd_cross_check_hello)
+                        self._lwd_peer_hello = msg
                     while not publisher.retarget(endpoint):
                         if receiver.closed:
                             break
@@ -261,6 +269,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 sorted(ready_instances),
                 sorted(wire_ready),
             )
+        # 集合屏障收齐后做调度三元组互校(逐实例 vs 本地 + 实例间互检)
+        self._lwd_cross_check_hello()
 
     def _lwd_pump_cloud_messages_router_dealer(
         self,
@@ -295,6 +305,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         continue
                     if iid not in ready_instances:
                         ready_instances.add(iid)
+                        # 载荷按实例留存供构造线程互校(调度三元组,
+                        # 见 _lwd_cross_check_hello);重复 HELLO 幂等跳过
+                        self._lwd_peer_hellos[iid] = msg
                         logger.info(
                             "[Lwd] cloud instance %d ready via HELLO (%d/%d)",
                             iid,
@@ -356,6 +369,117 @@ class LwdEdgeEngineCore(EngineCoreProc):
         publisher = getattr(self, "_edge_sender", None)
         if publisher is not None:
             publisher.shutdown()
+
+    def _lwd_cross_check_hello(self) -> None:
+        """HELLO 调度三元组互校(构造线程;push_pull 单云/集合屏障之后)。
+
+        max_num_batched_tokens/max_num_seqs 是边 cap 公式与云 preflight
+        的同源输入(设计 §2.2/§5.2 的部署对齐前提),不一致即构造期
+        fail-fast——不一致不会让链路报错,只会让云 preflight 恒 hold、
+        prefill 被 decode 静默串行(真机实录:边 factor=1/云 factor=4
+        时 chunk 8191 + decode 4 > 预算 8192,prefill 积压 280 步)。
+
+        多实例扩展:各云实例三元组先做实例间互检——边 cap 公式读的
+        是一份本地预算,异构实例下部分实例的 preflight 与边 cap 永久
+        错位,等于把单实例的静默串行 bug 换成多实例版本;云集群部署
+        本就要求同构,互检不一致即 fail-fast(spec 亦然:_lwd_
+        spec_factor 是全局单值,无按实例采纳的空间)。
+        num_speculative_tokens 与本地不一致时以对端为准采纳(边本地
+        取不到合法来源)并复核活性下界。对端为旧版(三值全 0)时
+        仅告警不拦截。"""
+        hellos: dict[int, LwdHelloNotify] = {}
+        peer = getattr(self, "_lwd_peer_hello", None)
+        if peer is not None:
+            hellos[0] = peer
+        hellos.update(getattr(self, "_lwd_peer_hellos", None) or {})
+        if not hellos:
+            return
+        legacy = sorted(
+            iid for iid, h in hellos.items()
+            if h.max_num_batched_tokens == 0
+        )
+        if legacy:
+            logger.warning(
+                "[Lwd] HELLO from instance(s) %s carries no scheduling "
+                "triple (legacy peer); edge/cloud config alignment "
+                "UNCHECKED for them",
+                legacy,
+            )
+        live = {
+            iid: h for iid, h in hellos.items()
+            if h.max_num_batched_tokens != 0
+        }
+        if not live:
+            return
+        triples = {
+            iid: (
+                h.max_num_batched_tokens,
+                h.max_num_seqs,
+                h.num_speculative_tokens,
+            )
+            for iid, h in live.items()
+        }
+        # 实例间互检(先于逐实例 vs 本地:异构即整簇拒绝)
+        ref_iid = min(triples)
+        divergent = sorted(
+            iid for iid, t in triples.items() if t != triples[ref_iid]
+        )
+        if divergent:
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[LWD] cloud instances disagree on the scheduling "
+                f"triple (max_num_batched_tokens, max_num_seqs, "
+                f"num_speculative_tokens): inst {ref_iid}="
+                f"{triples[ref_iid]} vs "
+                f"{[(iid, triples[iid]) for iid in divergent]}; "
+                f"边 cap 公式读一份本地预算,异构实例的 preflight 将"
+                f"永久错位——云集群须同构拉起"
+            )
+        sched = self.vllm_config.scheduler_config
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
+        local = (
+            sched.max_num_batched_tokens,
+            sched.max_num_seqs,
+            getattr(spec_config, "num_speculative_tokens", None) or 0,
+        )
+        remote = triples[ref_iid]
+        if local[:2] != remote[:2]:
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[LWD] edge/cloud scheduling config mismatch: "
+                f"(max_num_batched_tokens, max_num_seqs) "
+                f"edge={local[:2]} != cloud={remote[:2]}; "
+                f"cap/preflight 公式两侧同源输入不一致会让 preflight 恒 "
+                f"hold、prefill 被 decode 静默串行——两侧拉起配置须同值"
+            )
+        if local[2] != remote[2]:
+            # spec 系数以云为准:它预留的是云 decode 步的草稿预算,边侧
+            # 本地取不到合法来源(边实例带 spec 配置会拖起 draft 机制)。
+            # 采纳对端值而非 fail-fast——部署上边侧无需再配 spec。
+            logger.warning(
+                "[Lwd] adopt cloud spec_factor=%d over edge local %d "
+                "(edge has no legitimate local source for it)",
+                remote[2] + 1, local[2] + 1,
+            )
+            self.scheduler._lwd_spec_factor = remote[2] + 1
+            # 采纳后复核活性下界(构造期检查用的是本地 factor,见
+            # LwdEdgeScheduler.__init__)
+            if (
+                self.scheduler.max_num_scheduled_tokens
+                - self.scheduler.max_num_running_reqs * (remote[2] + 1) < 1
+            ):
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] 死锁配置: 采纳云侧 spec_factor={remote[2] + 1} "
+                    f"后 cap 恒 < 1(预算 {self.scheduler.max_num_scheduled_tokens}"
+                    f" − 满员 {self.scheduler.max_num_running_reqs} × "
+                    f"{remote[2] + 1});请增大 max_num_batched_tokens "
+                    f"或减小 max_num_seqs"
+                )
+        logger.info(
+            "[Lwd] HELLO scheduling triple verified: %s (instances %s)",
+            local, sorted(triples),
+        )
 
     # ------------------------------------------------------------------ #
     # 引擎接口覆写                                                        #

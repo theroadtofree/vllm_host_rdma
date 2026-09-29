@@ -107,8 +107,17 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
+        sched_config = self.vllm_config.scheduler_config
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host, pre_out_port=config.pre_out_port
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            max_num_batched_tokens=sched_config.max_num_batched_tokens,
+            max_num_seqs=sched_config.max_num_seqs,
+            num_speculative_tokens=(
+                getattr(spec_config, "num_speculative_tokens", None) or 0
+            ),
         )
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -163,10 +172,18 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 收发同通道:泵线程/发布方共用同一对象
         self._lwd_subscriber = channel
         self._lwd_post_out = channel
+        sched_config = self.vllm_config.scheduler_config
+        spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=config.pre_out_port,
             instance_id=config.instance_id,
+            # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
+            max_num_batched_tokens=sched_config.max_num_batched_tokens,
+            max_num_seqs=sched_config.max_num_seqs,
+            num_speculative_tokens=(
+                getattr(spec_config, "num_speculative_tokens", None) or 0
+            ),
         )
         # 业务层就绪通告:通道 HELLO/WELCOME 只证明 TCP 连通,本通告
         # 证明云全量初始化(权重/KV/图编译)完成,边侧以此放行
