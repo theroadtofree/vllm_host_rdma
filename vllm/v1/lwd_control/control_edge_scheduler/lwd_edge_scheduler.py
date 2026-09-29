@@ -27,10 +27,12 @@ seqno = 一次 UP send,数据面 chunk 流按批连续,跨请求交错/重组复
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -81,6 +83,22 @@ _LWD_PENDING_FAIL_AFTER_S = 30.0
 # probe 看门狗时限:远大于钳制后的 connect_timeout(3s)+云侧处理余量,
 # 只兜「probe 线程静默死亡」的底,正常 RTT 不会触发
 _LWD_PROBE_WATCHDOG_S = 15.0
+
+
+@dataclass(frozen=True)
+class _LwdMediaIdentity:
+    """协议层 ``_MediaItem`` 的边侧实现:多模态内容身份进 HMAC 链。
+
+    digest 取 ``MultiModalFeatureSpec.identifier``(encoder 缓存键,含
+    LoRA 前缀)的 sha256——同图同配置同 digest,换图/换 LoRA 即分叉;
+    ``mm_position`` 的 offset/length 即该 item 在 prompt 中的占位区间。
+    图像占位展开 token 与内容无关,不掺身份则不同图共享块哈希,
+    云侧会跨图误命中并复用旧图 KV。"""
+
+    modality: str
+    digest: bytes
+    offset: int
+    length: int
 
 
 class _LwdProbeRuntime:
@@ -165,6 +183,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 累积生成 ids,终结即用租户密钥建全量块哈希链上报云侧并清理。
         self._lwd_finish_prompt_ids: dict[str, list[int]] = {}
         self._lwd_finish_gen_ids: dict[str, list[int]] = {}
+        # 多模态内容身份留档(request_id -> media items):Request 终结后
+        # mm_features 不可达,add_request 入口一次提取供 probe/finish/
+        # 生成段建链续用;与 prompt_ids 同生命周期(finish/abort 摘除)。
+        # 三处建链共用同一份快照,保证查链与存链口径一致。
+        self._lwd_finish_media_items: dict[str, list[Any]] = {}
+        # processor 指纹惰性缓存(sha256(模型 + mm_processor_kwargs)):
+        # 只掺入媒体覆盖块的 HMAC——纯文本链逐位不变,新旧边混布兼容。
+        # 协议要求带 media_items 的建链必须持指纹,probe client 与
+        # _lwd_prefix_hasher 两个构造点都要传,缺一侧即建链必抛。
+        self._lwd_processor_fp: bytes | None = None
         # 生成段链增量上报水位(request_id -> 已上报满块数):只在满块数
         # 增加时发一条(全量替换语义),避免逐步刷控制面。
         self._lwd_gen_chain_sent: dict[str, int] = {}
@@ -595,6 +623,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_finish_prompt_ids[request.request_id] = list(
             request.prompt_token_ids
         )
+        # 多模态内容身份同一入口留档(主循环线程提取,probe 协程只读
+        # 快照不触碰 Request):probe/finish/生成段三处建链共用这一份
+        # 快照,保证查链与存链口径一致。纯文本请求留档为空,不入字典。
+        media_items = self._lwd_media_items(request)
+        if media_items:
+            self._lwd_finish_media_items[request.request_id] = media_items
         if request.abort_immediately:
             # 立即终结请求不付 probe RTT,也不给云侧制造必被 TTL 清扫
             # 的孤儿预留:直接本地终结(与 finalize 后再 abort 同终态)
@@ -646,6 +680,46 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------------ #
     # 前缀 probe(异步两阶段)                                             #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _lwd_media_items(request: Request) -> list[_LwdMediaIdentity]:
+        """提取多模态内容身份(mm_features -> 协议层 media item)。
+
+        主循环线程调用(probe 协程只拿快照列表,不触碰 Request)。仅取
+        协议 ABI 已支持的 modality(当前 ``image``;audio/video 协议
+        预留未开,掺入会被 _validate_media_items 拒绝使 probe fail-open
+        丢命中——不支持模态暂保持盲链,待协议扩展)。无匹配项返回空表,
+        纯文本路径建链与旧版逐位一致。"""
+        return [
+            _LwdMediaIdentity(
+                modality=feature.modality,
+                digest=hashlib.sha256(
+                    feature.identifier.encode("utf-8")
+                ).digest(),
+                offset=feature.mm_position.offset,
+                length=feature.mm_position.length,
+            )
+            for feature in request.mm_features
+            if feature.modality == "image"
+        ]
+
+    def _lwd_processor_fingerprint(self) -> bytes:
+        """处理器指纹(32B):模型 + mm_processor_kwargs 的 sha256。
+
+        掺入媒体覆盖块 HMAC,保证换模型/换 processor 配置即链分叉。
+        云侧不复算指纹(链值即块池键,边侧单边稳定即可),无需与云
+        对齐。"""
+        if self._lwd_processor_fp is None:
+            model_cfg = self.vllm_config.model_config
+            material = "|".join((
+                str(model_cfg.model),
+                # InitVar 可能不在实例属性上,缺省 None 参与摘要
+                repr(getattr(model_cfg, "mm_processor_kwargs", None)),
+            ))
+            self._lwd_processor_fp = hashlib.sha256(
+                material.encode("utf-8")
+            ).digest()
+        return self._lwd_processor_fp
+
     def _lwd_probe_coord_cfg(self):
         """协调配置可用则返回 (coord_cfg, vllm_config),否则 None(直通)。"""
         vllm_config = getattr(self, "vllm_config", None)
@@ -676,6 +750,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 consumer_id=coord_cfg.consumer_id,
                 # 总超时钳到 3s:死锁残余时快速 fail-open
                 connect_timeout=min(coord_cfg.connect_timeout, 3.0),
+                # 指纹与 _lwd_prefix_hasher 同源:probe 查链侧也要建
+                # media 覆盖块,协议要求带 media_items 的建链必持指纹,
+                # 缺此参数 mm 请求 probe 建链必抛(fail-open 丢命中)
+                processor_fingerprint=self._lwd_processor_fingerprint(),
             )
             self._lwd_probe_client_cache = client
         return client
@@ -701,12 +779,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         client = self._lwd_probe_client(coord_cfg, build_bs)
         request_id = request.request_id
         prompt_ids = list(request.prompt_token_ids)
+        # 媒体身份取入口留档快照(主循环线程):协程只读列表,不触碰
+        # Request;纯文本/无图请求留档为空。
+        media_items = self._lwd_finish_media_items.get(request_id) or ()
 
         async def _job():
             session = await runtime.ensure_session()
-            manifest = client.build_manifest(request_id, prompt_ids)
+            manifest = client.build_manifest(
+                request_id, prompt_ids, media_items=media_items
+            )
             result = await client.negotiate(
-                session, request_id, prompt_ids, manifest=manifest
+                session, request_id, prompt_ids, manifest=manifest,
+                media_items=media_items,
             )
             return result, list(manifest.full_block_hashes)
 
@@ -830,7 +914,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         self._lwd_prefix_hasher(
                             coord_cfg, vllm_config, learned
                         ).build_manifest(
-                            request_id, list(request.prompt_token_ids)
+                            request_id, list(request.prompt_token_ids),
+                            # 与 probe 建链同一份媒体快照
+                            media_items=(
+                                self._lwd_finish_media_items.get(request_id)
+                                or ()
+                            ),
                         ).full_block_hashes
                     )
             # 记账本请求 probe 的建链粒度(注意是 build_bs 而非学习值):
@@ -842,6 +931,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "hash_bs=%d",
                 request_id, result.hit_tokens, len(chain), learned,
             )
+            # 多模态命中与文本同权:mm 链已掺图像内容身份,不同图在图像
+            # 首个覆盖块即分叉必不命中;同图任意边界(含半图)复用的 KV
+            # 与锚点请求逐位一致,无需位置截断。
             self._lwd_finalize_add_request(request, chain, result.hit_tokens)
             completed += 1
         return completed
@@ -900,7 +992,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         语义与原生 ``Scheduler._mamba_block_aligned_split`` 逐行一致
         (中间块收到网格整数倍、末个对齐块强制收在 last_cache_position、
         尾巴直通),仅块大小来源换成云侧公告网格。网格未学到时本方法
-        不被调用(开关恒关),行为与学习前完全一致。"""
+        不被调用(开关恒关),行为与学习前完全一致。
+
+        多模态请求照常参与对齐重切:mm 链已掺图像内容身份(不同图链
+        分叉,不会跨图误命中),同图任意边界(含半图)复用放行——与
+        文本命中同权;对齐保证的 mamba 快照正是命中前缀可复用的前提,
+        全量新算的图像段不受 chunk 边界影响。"""
         cloud_id = self._lwd_binding.cloud_of(
             request.request_id, default=self._lwd_default_cloud_id()
         )
@@ -1216,6 +1313,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # 收尾备料随 abort 一并清理(不再上报 finish)
             self._lwd_finish_prompt_ids.pop(request_id, None)
             self._lwd_finish_gen_ids.pop(request_id, None)
+            self._lwd_finish_media_items.pop(request_id, None)
             self._lwd_gen_chain_sent.pop(request_id, None)
             self._lwd_gen_chain_state.pop(request_id, None)
             self._lwd_probe_bs_by_req.pop(request_id, None)
@@ -1269,6 +1367,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         路径(记账缺失不影响数据面正确性)。"""
         prompt_ids = self._lwd_finish_prompt_ids.pop(request_id, None)
         gen_ids = self._lwd_finish_gen_ids.pop(request_id, None)
+        media_items = self._lwd_finish_media_items.pop(request_id, None) or ()
         self._lwd_gen_chain_sent.pop(request_id, None)
         self._lwd_gen_chain_state.pop(request_id, None)
         if prompt_ids is None:
@@ -1289,7 +1388,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config, probe_bs)
             completion_ids = gen_ids or []
             manifest = hasher.build_manifest(
-                request_id, list(prompt_ids) + completion_ids
+                request_id, list(prompt_ids) + completion_ids,
+                # 收尾存链与 probe 查链同一媒体口径
+                media_items=media_items,
             )
             message = LwdFinishNotify(
                 request_id=request_id,
@@ -1347,6 +1448,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             ):
                 return
             state = self._lwd_gen_chain_state.setdefault(request_id, [])
+            # prompt 段按媒体感知链播种(与 probe/finish 同源),此后
+            # chain_extend 纯增量;纯文本请求播种与旧链逐位一致
+            # (chain_extend 空链与 build_manifest 同源)。
+            if not state:
+                state.extend(hasher.build_manifest(
+                    request_id, list(prompt_ids),
+                    media_items=(
+                        self._lwd_finish_media_items.get(request_id) or ()
+                    ),
+                ).full_block_hashes)
             state.extend(hasher.chain_extend(state, tokens))
             blocks = list(state)
             cloud_id = self._lwd_binding.cloud_of(
@@ -1401,7 +1512,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdPrefixHasher,
         )
 
-        hasher = LwdPrefixHasher(tenant_key, hash_block_size)
+        hasher = LwdPrefixHasher(
+            tenant_key,
+            hash_block_size,
+            # 指纹只影响媒体覆盖块(纯文本链逐位不变);与 probe client
+            # 同源,保证查链/存链两侧媒体块哈希一致
+            self._lwd_processor_fingerprint(),
+        )
         self._lwd_hasher_by_granularity[hash_block_size] = hasher
         return hasher
 
