@@ -83,11 +83,21 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
 
     instance_id: 报告方云实例索引(边侧 N-HELLO 集合屏障按此收齐 N 个
-    不同实例);缺省 0 = 旧版云侧(additive 兼容,单实例语义不变)。"""
+    不同实例);缺省 0 = 旧版云侧(additive 兼容,单实例语义不变)。
+
+    调度三元组(max_num_batched_tokens/max_num_seqs/num_speculative_
+    tokens)供边侧互校:三者是 cap/preflight 公式两侧的同源输入,
+    不一致不会让链路报错,只会让 preflight 恒 hold、prefill 被 decode
+    静默串行(真机实录:边 factor=1 云 factor=4 时 chunk 8191 +
+    decode 4 > 预算 8192)。多实例下边侧还按此做实例间互检(云集群
+    须同构)。0 = 旧版未携带,边侧仅告警不拦截。"""
 
     pre_out_host: str
     pre_out_port: int
     instance_id: int = 0
+    max_num_batched_tokens: int = 0
+    max_num_seqs: int = 0
+    num_speculative_tokens: int = 0
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
