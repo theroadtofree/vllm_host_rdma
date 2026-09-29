@@ -103,7 +103,15 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 承担;桶水位是消费滞后的本地读数(正常远低于通道 FIFO)。
         # 数据面经 UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读桶
         # (单消费者语义)
-        self._lwd_c2e_pending: dict[int, deque] = {}
+        # 桶集合构造期一次建全、永不增删、属性永不重绑:泵线程的
+        # setdefault 恒命中既有键(取桶与 append 之间无 detach 窗口),
+        # 引擎侧遍历时也不会因新键插入抛 dict-changed-size——若消费后
+        # 整体重绑 self._lwd_c2e_pending,泵线程可能把 append 落在旧
+        # 字典对象上,该 c2e 通告永久丢失(请求 finish 丢失即永不返回)。
+        # 键数 = 实例数,有界,不存在膨胀问题
+        self._lwd_c2e_pending: dict[int, deque] = {
+            iid: deque() for iid in range(config.instance_count)
+        }
         # 实例数标记:泵线程 c2e 越界防御用(与屏障/通道的 N 同源)
         self._lwd_instance_count = config.instance_count
         # HELLO 载荷按实例留存(router 泵线程收首个 HELLO 时写入,
@@ -629,12 +637,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     break
             if not progressed:
                 break
-        # 清掉取空的桶,防长期运行字典膨胀
-        self._lwd_c2e_pending = {
-            iid: bucket
-            for iid, bucket in self._lwd_c2e_pending.items()
-            if bucket
-        }
+        # 不删空桶、不重绑字典:键数 = 实例数恒定,无膨胀;重绑会让泵
+        # 线程的 append 落在旧字典对象上,c2e 通告静默丢失(见 __init__)
         for notify, t_arrive in notifies:
             if _lwd_disable_down_enabled() and notify.token_ids:
                 logger.info(
@@ -736,16 +740,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
         logger.info(
             "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
-        )
-        # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
-        # token,即该请求本步的生成内容;后续仅两处流向——
-        # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
-        # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
-        # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
-        # 客户端,即最终输出的生成 token)。
-        sampled_token_map: dict[str, list[int]] = (
-            {} if result is None
-            else dict(zip(result.req_ids, result.sampled_token_ids))
         )
         routing = self.scheduler._req_id_to_instance
         for index, request_id in enumerate(notify.req_ids):
