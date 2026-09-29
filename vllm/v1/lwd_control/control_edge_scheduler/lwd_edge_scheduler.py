@@ -529,6 +529,29 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
         return out
 
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        """边侧直通:不排 encoder 输入、不耗预算、不回滚。
+
+        边侧视觉塔执行与编码缓存由 edge worker 自管(惰性编码 +
+        _lwd_mm_hash_embeds,mm 特征登记走 scheduled_new_reqs),调度侧
+        原生 encoder 预算/缓存簿记对边侧纯冗余;而其预算/缓存耗尽时
+        的合法回滚(只排图像占位之前的文本,scheduler.py:1270-1289)
+        会破坏 picker 的 chunk 契约——picker 切块必须被原生调度逐字
+        复现(_lwd_schedule_batch 步后核验),回滚一改窗口即触发
+        fail-fast 炸引擎(真机实录:双缓存全关 + 同图并发时,请求级
+        uuid 使 encoder cache 条目不再共享,在途请求的非 freeable
+        条目占满 8192 容量后,后续图像请求被回滚到图像起点)。
+        直通后 mm 占位 token 与文本同等切块,真实编码压力由 worker
+        侧承担;encode/dec cache 簿记恒空,finish 时 free() 为空操作。"""
+        return [], num_new_tokens, encoder_compute_budget, []
+
     def lwd_edge_max_num_seqs_check(self) -> bool:
         """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否
         还有名额,True=可开新请求。
