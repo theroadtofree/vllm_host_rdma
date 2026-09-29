@@ -419,27 +419,60 @@ class LwdCloudEngineCore(EngineCoreProc):
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
             pinned, req_ids, hidden_numel, seqno = carrier
+            # 界定点[云侧/管线]:DOWN seqno 逐实例必须严格 +1 连续——
+            # 跳号=有步的 payload 被覆盖未发(单槽覆盖写被踩)、重复=
+            # 同一 payload 被发两次(边侧 DOWN 配对将错位)。两种都会
+            # 以"内容看似正常但步序错乱"的形态出现,先于内容对账暴露
+            _last_seq = getattr(self, "_lwd_down_seqno_last", None) or {}
+            _expect = _last_seq.get(0, None)
+            if _expect is not None and seqno != _expect + 1:
+                logger.error(
+                    "[LWD][diag][cloud/pipe] down seqno=%d but last=%d "
+                    "(expect %d) — DOWN 序号不连续:跳号=有步 payload "
+                    "被覆盖未发,重复=同 payload 发两次;边侧 recv 配对"
+                    "将错位,疑 worker 单槽/异步重叠",
+                    seqno, _expect, _expect + 1,
+                )
+            _last_seq[0] = seqno
+            self._lwd_down_seqno_last = _last_seq
             n_req = len(req_ids)
             vals = pinned.tolist()
             counts = vals[-2 * n_req : -n_req]
             seg_lens = vals[-n_req:]
             ranks_flat = vals[: -2 * n_req]
-            # 界定点[云侧/数据面源头]:pinned 布局自洽性——counts 与
-            # seg_lens 逐请求应满足 count>=1 且 count<=seg_len(decode
-            # 步每请求至少 1 个接受 token;被拒行在 seg_len 里、不在
-            # count 里)。violate 即 rank-replay 布局/解析错位:此时
-            # hidden 行数与 c2e meta 不再对齐,边侧 DOWN recv 将错读帧
-            if n_req and (
-                any(c < 1 for c in counts)
-                or any(c > s for c, s in zip(counts, seg_lens))
-            ):
+            # 界定点[云侧/数据面源头]:双对账定位错位。
+            # ① 行数对账:wire 真实行数(hidden_numel/hidden_size)应
+            #    等于布局自洽行数 len(vals)-2n——不等即 req_ids 与
+            #    meta 数组长度错位,差值 misalign 就是错位量(生产点
+            #    req_ids 比 meta 多/少几个);
+            # ② 语义对账:count>=1 且 count<=seg(被拒行在 seg 里);
+            #    count 含 rank 量级大数 = 切片窗滑进 ranks 区,同属
+            #    错位特征。violate 时边侧将错判 ERROR 或错读 DOWN 帧
+            try:
+                _hidden_size = (
+                    self.vllm_config.model_config.get_hidden_size()
+                )
+                rows_wire = hidden_numel // _hidden_size
+            except Exception:  # noqa: BLE001
+                rows_wire = -1
+            rows_implied = len(vals) - 2 * n_req
+            zero_idx = [i for i, c in enumerate(counts) if c < 1]
+            over_idx = [
+                i for i, (c, s) in enumerate(zip(counts, seg_lens))
+                if c > s
+            ]
+            if n_req and (rows_wire != rows_implied or zero_idx or over_idx):
                 logger.error(
-                    "[LWD][diag][cloud/data] down seqno=%d reqs=%s "
-                    "counts=%s seg_lens=%s — rank-replay pinned 布局"
-                    "自洽性破坏(0 接受行或 count>seg_len):边侧将"
-                    "错判 ERROR 或错读 DOWN 帧,疑云 runner carrier "
-                    "组包,与边侧无关",
-                    seqno, list(req_ids), list(counts), list(seg_lens),
+                    "[LWD][diag][cloud/data] down seqno=%d n=%d "
+                    "rows_wire=%d rows_implied=%d misalign=%d "
+                    "zeros@%s over@%s cnt[h=%s t=%s] seg[h=%s t=%s] "
+                    "— meta 错位或损坏:misalign!=0=req_ids 与 meta "
+                    "长度错位(生产点问题);=0 但 over/zeros=meta 内容"
+                    "损坏(传输/缓冲问题)",
+                    seqno, n_req, rows_wire, rows_implied,
+                    rows_wire - rows_implied,
+                    zero_idx[:6], over_idx[:6],
+                    counts[:6], counts[-6:], seg_lens[:6], seg_lens[-6:],
                 )
             top_id_ths: list[list[int]] = []
             off = 0

@@ -725,12 +725,13 @@ class LwdEdgeEngineCore(EngineCoreProc):
         if _c2e_zero_rows:
             logger.error(
                 "[LWD][diag][cloud/ctrl] c2e seqno=%s inst=%d reqs=%d "
-                "zero_accept_rows=%d counts=%s — 云侧通告含 0 接受行,"
-                "该批对应请求在边侧将判 ERROR(疑云侧 rank-replay "
-                "counts/pinned 布局异常,非边侧问题)",
+                "zero_accept_rows=%d cnt[h=%s t=%s] — 云侧通告含 0 "
+                "接受行,该批对应请求在边侧将判 ERROR(疑云侧 "
+                "rank-replay counts/pinned 布局异常,非边侧问题)",
                 notify.down_seqno, notify.instance_id,
                 len(notify.req_ids), _c2e_zero_rows,
-                list(notify.num_accepted_tokens),
+                list(notify.num_accepted_tokens[:6]),
+                list(notify.num_accepted_tokens[-6:]),
             )
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
@@ -823,19 +824,16 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     logger.error(
                         "[LWD][diag][edge/data] req=%s seqno=%s inst=%d "
                         "— worker 结果缺行(notify 有该请求、worker "
-                        "req_ids 无):批内对齐错位,疑边 worker/"
-                        "数据面;worker reqs=%s",
+                        "req_ids 无):批内对齐错位,疑边 worker/数据面",
                         request_id, notify.down_seqno, notify.instance_id,
-                        list(getattr(result, "req_ids", None) or []),
                     )
                 else:
                     logger.error(
                         "[LWD][diag][cloud/ctrl] req=%s seqno=%s inst=%d "
-                        "— worker 行为空(云侧 num_accepted=0):"
-                        "counts=%s,疑云侧 c2e meta",
+                        "— worker 行为空(云侧 num_accepted=0),"
+                        "疑云侧 c2e meta",
                         request_id, notify.down_seqno,
                         notify.instance_id,
-                        list(notify.num_accepted_tokens),
                     )
                 finish_reason = FinishReason.ERROR
                 finished = True
