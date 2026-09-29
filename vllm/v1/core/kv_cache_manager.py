@@ -224,13 +224,39 @@ class KVCacheManager:
         # 「边未裁/裁得少、云侧块池却命中更多」会在注入起点处错位。
         # 缺省 0 = 边侧未裁剪 = 不续算(与边侧恒发整段 embed 一致)。
         lwd_declared_hit = getattr(request, "lwd_resume_cap_tokens", None)
-        if lwd_declared_hit is not None:
+        if lwd_declared_hit is not None and lwd_declared_hit > 0:
+            # eagle/MTP 混合协调器对 attention 组"多查一块再丢尾块"
+            # (前瞻余量):帽恰好等于命中值时余量被钳死,丢尾块后
+            # 网格对齐循环会把命中压塌(实测 probe 768 / resume 0)。
+            # 帽放宽一个 hash 块恢复余量;命中是网格倍数、声明值也是
+            # 网格倍数,放宽 < 一个网格时结果不会越过声明值。
+            # 声明为 0(未命中不续算)不放宽:帽恒 0,查窗零宽。
+            hash_bs = getattr(self.coordinator, "hash_block_size", None) or (
+                self.coordinator.scheduler_block_size
+            )
+            max_cache_hit_length = min(
+                max_cache_hit_length, lwd_declared_hit + hash_bs
+            )
+        elif lwd_declared_hit is not None:
             max_cache_hit_length = min(max_cache_hit_length, lwd_declared_hit)
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if (
+            lwd_declared_hit is not None
+            and num_new_computed_tokens > lwd_declared_hit
+        ):
+            # 余量恢复后命中可能越过声明值(unitary 场景 margin==grid):
+            # resume 绝不超过边侧 trim 边界,越界部分截断(网格倍数,
+            # 截断安全)
+            groups = self.kv_cache_config.kv_cache_groups
+            computed_blocks = [
+                blocks[: lwd_declared_hit // g.kv_cache_spec.block_size]
+                for blocks, g in zip(computed_blocks, groups)
+            ]
+            num_new_computed_tokens = lwd_declared_hit
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
