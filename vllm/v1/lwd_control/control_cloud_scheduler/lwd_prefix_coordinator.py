@@ -47,6 +47,13 @@ class LwdReservation:
     claimed: bool = False
     # complete_request 幂等短路:首发布后置 True,后续 decode 步零开销
     completed_published: bool = False
+    # probe 时原生分组命中布局的只读快照(每 KV 组一个 KVCacheBlock 元组)。
+    # 准入(get_computed_blocks)直接复用这份快照,不再重查——probe 已按
+    # EAGLE/MTP 尾块回退查过一次,再拿命中值当上限重查会二次回退,云侧续算
+    # 起点比边侧声明少一个对齐单元,边侧已按旧命中裁剪的 embeddings 会被零
+    # 向量顶替。冻结成元组:准入与分配路径可能多次消费同一份快照。
+    # None = 未命中 / 无块池(降级),准入须 fail-closed。
+    pool_blocks: tuple[tuple, ...] | None = None
 
 
 class LwdPrefixCoordinator:
@@ -75,6 +82,11 @@ class LwdPrefixCoordinator:
         self._expected_counts: dict[str, tuple[int, int]] = {}
         # 原生 KV 缓存管理器(用于命中块 touch 防逐出);None = 单测/降级,仅摘要域
         self._kv_cache_manager = kv_cache_manager
+        # 反挂回块池管理器的准入路径:get_computed_blocks 要按 request_id 取回
+        # probe 时 pin 住的分组命中布局(不得拿声明命中值当上限重查,见
+        # pinned_computed_blocks)。
+        if kv_cache_manager is not None:
+            kv_cache_manager.lwd_prefix_coordinator = self
 
     _PROMPT_CHAIN_LIMIT = 4096
     # 未认领预留的 TTL:probe 落预留后数据面请求应秒级到达(notify 与
@@ -92,6 +104,24 @@ class LwdPrefixCoordinator:
             reservation.chain = self._coordination_block_hashes(reservation.manifest)
         return reservation.chain
 
+    def pinned_computed_blocks(
+        self, request_id: str
+    ) -> tuple[tuple[tuple, ...], int] | None:
+        """准入用:取回 probe 时 pin 住的原生分组命中布局快照。
+
+        返回 (分组块布局, 命中 token 数);无预留或该次命中为 0/无块池(降级)
+        返回 None,调用方须 fail-closed,不得退回重查。
+
+        probe 已按 EAGLE/MTP 尾块回退查过一次,准入必须复用这一次的结果:拿
+        命中值当上限再查一次会二次回退(每查一次退一个对齐单元,H 恰为一个
+        对齐单元时直接退成 0),而边侧已按旧命中裁剪 embeddings——续算起点
+        前移一个单元即用零 embeddings 重算,静默错算。
+        """
+        reservation = self._reservations.get(request_id)
+        if reservation is None or reservation.pool_blocks is None:
+            return None
+        return reservation.pool_blocks, reservation.hit_tokens
+
     def _digest_hit(self, chain: list[bytes]) -> int:
         """摘要域最长命中块数(``complete_request`` 回填的集合)。
 
@@ -107,31 +137,37 @@ class LwdPrefixCoordinator:
 
     def _pool_hit(
         self, chain: list[bytes], max_cache_hit_length: int
-    ) -> tuple[list, int, int]:
-        """原生块池最长命中(单真源):返回 (命中 KV 块列表, 命中块数, 命中 token 数)。
+    ) -> tuple[list, tuple[list, ...] | None, int, int]:
+        """原生块池最长命中(单真源):返回
+        (命中 KV 块扁平列表, 分组命中布局, 命中块数, 命中 token 数)。
 
-        max_cache_hit_length 与云侧请求 resume(get_computed_blocks)同值
-        (prompt_tokens-1,末 token 必重算以产 logits),同一
-        find_longest_cache_hit、同一链;且云侧该次查找另有边侧 declared
-        封顶(见 kv_cache_manager),本函数只作「边侧可声明的上界」。
+        max_cache_hit_length 取 prompt_tokens-1(末 token 必重算以产 logits)。
+        该次查找的内部块尺寸决定了命中粒度,故命中值即「边侧可声明的上界」，
+        分组布局原样透出供准入复用(见 pinned_computed_blocks)。
         只读查找(get_cached_block 不改 ref_cnt),不产生池副作用。
         无块池(单测/降级)回退摘要域记账。
         """
         km = self._kv_cache_manager
         if km is None:
             hit = self._digest_hit(chain)
-            return [], hit, hit * self._hash_block_size
+            return [], None, hit, hit * self._hash_block_size
         blocks_by_group, num_computed_tokens = km.coordinator.find_longest_cache_hit(
             chain, max_cache_hit_length=max(max_cache_hit_length, 0),
         )
         if num_computed_tokens <= 0:
-            return [], 0, 0
+            return [], None, 0, 0
         # 块池命中的 token 数按 hash_block_size 整除对齐(块池按满块记录),
         # 商即命中块数,与 LwdProbeResult 的 hit_tokens == hit_blocks*bs 一致。
         hit_blocks = num_computed_tokens // self._hash_block_size
         # 收集各组命中的 KVCacheBlock,供 probe 预约时 touch 防驱逐。
         hit_kv_blocks = [blk for group in blocks_by_group for blk in group]
-        return hit_kv_blocks, hit_blocks, hit_blocks * self._hash_block_size
+        # 原始分组布局一并透出:准入复用它即 probe 当时的命中,免二次回退。
+        return (
+            hit_kv_blocks,
+            blocks_by_group,
+            hit_blocks,
+            hit_blocks * self._hash_block_size,
+        )
 
     def _coordination_block_hashes(
         self, manifest: LwdPrefixManifest
@@ -152,14 +188,14 @@ class LwdPrefixCoordinator:
         """对原生块池求最长命中(单真源)并落预留(等待数据面请求认领)。
 
         命中边界即边侧可声明的续算上界;数据面按此值 trim 后,云侧
-        resume 又被该 declared 封顶(kv_cache_manager.get_computed_blocks),
+        resume 复用本次 pin 住的分组布局(不再重查,见 kv_cache_manager),
         故边侧 chunk offset 与云侧 computed 恒等。预约命中块时 touch 一次
         (ref_cnt+1) 防驱逐:否则锚点请求 finish 后共享前缀块 ref_cnt 归零
         被回收,probe 命中 vs prefill 命中不一致导致 offset 错位、队首死循环。
         该预约 touch 在 complete_request(prefill 复用后)释放,抵消 ref_cnt。
         无块池(单测/降级)回退摘要域记账。"""
         chain = self._coordination_block_hashes(manifest)
-        hit_kv_blocks, hit_blocks, hit_tokens = self._pool_hit(
+        hit_kv_blocks, pool_blocks, hit_blocks, hit_tokens = self._pool_hit(
             chain, max_cache_hit_length=manifest.prompt_tokens - 1
         )
         if hit_kv_blocks and self._kv_cache_manager is not None:
@@ -181,6 +217,11 @@ class LwdPrefixCoordinator:
             hit_tokens=hit_tokens,
             touched_blocks=hit_kv_blocks or None,
             chain=chain,
+            pool_blocks=(
+                tuple(tuple(group) for group in pool_blocks)
+                if pool_blocks is not None
+                else None
+            ),
             created_at=time.monotonic(),
         )
         # 留一份 prompt 链供收尾校验(边侧 LwdFinishNotify 到达时比对前缀未变)
