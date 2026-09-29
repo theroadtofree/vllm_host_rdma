@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import torch
@@ -26,6 +27,7 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdAbortNotify,
     LwdC2eNotify,
     LwdHelloNotify,
+    LwdRangeItem,
     LwdRangeNotify,
     LwdRequestNotify,
     lwd_decode_notify,
@@ -36,6 +38,9 @@ from vllm.v1.lwd_control.control_communication.lwd_zmq_factory import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_mixed_scheduler import (
+    LwdCloudMixedScheduler,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_phase_scheduler import (
     LwdCloudPhaseScheduler,
 )
@@ -69,8 +74,17 @@ class LwdCloudEngineCore(EngineCoreProc):
         # 依赖 lwd_serve_guard 注入不可靠——guard 只在 headless serve 入口
         # 执行,完整 serve 路径的 EngineCore 子进程不经 guard,缺注入会让
         # IO 线程把 RangeNotify 写进裸 AsyncScheduler 而崩溃。
+        # mixed(默认)= 整体 prefill 组批混排;prefill_first/decode_first
+        # = 旧相位调度器(A/B 对照与逃生通道,见 lwd_mixed_batch_design.md)。
         vllm_config = kwargs["vllm_config"]
-        vllm_config.scheduler_config.scheduler_cls = LwdCloudPhaseScheduler
+        scheduler_name = LwdConfig.from_env_and_config(
+            vllm_config
+        ).scheduler_name
+        vllm_config.scheduler_config.scheduler_cls = (
+            LwdCloudPhaseScheduler
+            if scheduler_name in ("prefill_first", "decode_first")
+            else LwdCloudMixedScheduler
+        )
         super().__init__(*args, **kwargs)
         # 通信面构造期装配(与边侧 _lwd_setup_zmq 同构):subscriber 自带
         # 搬运线程后,socket 不再受泵线程的 zmq 单线程亲和约束;建站失败
@@ -197,12 +211,20 @@ class LwdCloudEngineCore(EngineCoreProc):
             # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
             # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
             # 重试天然产生重复预告,重试复用同一号不产生新登记)。
-            seqnos = self._lwd_seqno_registry.setdefault(msg.request_id, [])
-            if not seqnos or msg.seqno > seqnos[-1]:
-                seqnos.append(msg.seqno)
+            # mixed 组批:items 逐请求登记同一批号;空 items = 旧版单请求
+            items = msg.items or [
+                LwdRangeItem(msg.request_id, msg.offset, msg.num_tokens)
+            ]
+            for item in items:
+                seqnos = self._lwd_seqno_registry.setdefault(
+                    item.request_id, []
+                )
+                if not seqnos or msg.seqno > seqnos[-1]:
+                    seqnos.append(msg.seqno)
             logger.info(
-                "[Lwd][cloud-ctrl] RangeNotify req=%s num=%s seqno=%s",
-                msg.request_id, msg.num_tokens, msg.seqno,
+                "[Lwd][cloud-ctrl] RangeNotify reqs=%d num=%s seqno=%s",
+                len(items), sum(item.num_tokens for item in items),
+                msg.seqno,
             )
             # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
             # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
@@ -212,6 +234,11 @@ class LwdCloudEngineCore(EngineCoreProc):
         if isinstance(msg, LwdAbortNotify):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
+            self._lwd_seqno_registry.pop(msg.request_id, None)
+            # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
+            # "ADD 未落地"的预告是留队首等落地, aborted 请求永不落地,
+            # 不清扫会把队首永久堵住(条目掏空则整条移除)
+            self._lwd_purge_prefill_notify(msg.request_id)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
@@ -231,6 +258,36 @@ class LwdCloudEngineCore(EngineCoreProc):
             request = self._lwd_build_request(wire)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
+
+    def _lwd_purge_prefill_notify(self, request_id: str) -> None:
+        """abort 清扫:摘除 prefill_notify_queue 里该请求的条目(条目
+        掏空则整条移除),并整体替换 deque(赋值原子,调度主线程的
+        peek/popleft 不受清扫影响)。"""
+        queue = getattr(self.scheduler, "prefill_notify_queue", None)
+        if not queue:
+            return
+        kept: deque = deque()
+        removed = 0
+        for notify in queue:
+            if notify.items:
+                items = [
+                    item for item in notify.items
+                    if item.request_id != request_id
+                ]
+                removed += len(notify.items) - len(items)
+                if items:
+                    notify.items = items
+                    kept.append(notify)
+            elif notify.request_id != request_id:
+                kept.append(notify)
+            else:
+                removed += 1
+        if removed:
+            self.scheduler.prefill_notify_queue = kept
+            logger.info(
+                "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
+                "aborted req=%s", removed, request_id,
+            )
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。
@@ -257,7 +314,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         sampling_params.update_from_generation_config({}, wire.eos_token_id)
         LwdDebug.cloud_request_admitted(wire, sampling_params)  # [lwd-debug]
         # 不传真实 ids 也不造占位:按原生 prompt-embeds 语义挂零缓冲,
-        # 行数即 prompt 长度(UP chunk 注入直接写该缓冲的对应窗口);
+        # 行数即 prompt 长度(UP 注入直接写该缓冲的对应窗口);
         # ids=None 时 input_batch 自动把 prompt 段 is_token_ids 置 False,
         # M-RoPE 走纯文本直通构造(与扫描结果逐值一致)。
         prompt_ids: list[int] | None = None
