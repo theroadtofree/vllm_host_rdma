@@ -63,8 +63,8 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # 边调度器需要按实例隔离的状态:请求队列/登记表、每实例 seqno 空间、
-# 待云结果 awaiting 台账。KV cache manager 跨实例共享(边云目标是
-# embedding-only,不按实例切 KV 池)。
+# 待云结果 awaiting 台账、pending chunk(seqno)跟踪。KV cache manager
+# 跨实例共享(边云目标是 embedding-only,不按实例切 KV 池)。
 _LWD_INSTANCE_DOMAIN_ATTRS = (
     "waiting",
     "skipped_waiting",
@@ -73,6 +73,7 @@ _LWD_INSTANCE_DOMAIN_ATTRS = (
     "finished_req_ids",
     "_lwd_seqno",
     "_lwd_awaiting",
+    "_lwd_batch_requests",
 )
 
 # 需经策略工厂重建的队列属性(其余属性按类型造空值)。
@@ -90,6 +91,15 @@ def _fresh_instance_value(value):
 # add 预告发布重试:次数 x 递增间隔(共约 3s),耗尽即请求级报错
 _LWD_ADD_RETRY_STEPS = 5
 _LWD_ADD_RETRY_INTERVAL_S = 0.2
+
+# 云侧 pending 上限,按未消费 chunk(seqno)计:一条 seqno = 一个云步
+# 消费单位。边侧记录 seqno -> 批内请求列表,批内全部请求收到首 token
+# 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
+# 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
+# 排空后闸门自开。多实例:seqno 空间与云侧 prefill_notify_queue 均
+# 按实例独立,跟踪表随之按实例分桶(见 _LWD_INSTANCE_DOMAIN_ATTRS),
+# 闸门只约束当前绑定实例。
+_LWD_MAX_PENDING_CHUNKS = 3
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -128,6 +138,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
+        # 云侧尚未消费到其 prefill(pending_notify 的边侧本地估计,
+        # 免新增协议字段);首个 c2e 到达即标记,完结/abort 时清除。
+        # 全局集合(key 为全局唯一 request_id,不入实例分桶表)。
+        self._lwd_first_token_seen: set[str] = set()
+        # seqno -> 批内 request_id 列表(chunk 粒度 pending 跟踪):
+        # 批内全部请求收到首 token 即整条移除;abort 时按请求摘除,
+        # 摘空即移除。云侧 pending_notify 的边侧本地镜像,免协议改动。
+        # 多实例:入 _LWD_INSTANCE_DOMAIN_ATTRS 按实例分桶——notify
+        # 在步内绑定下写,abort/deliver 按请求绑定清理,读写自动落
+        # 所属实例桶。
+        self._lwd_batch_requests: dict[int, list[str]] = {}
+        # pending 闸门状态(仅作开/关转换日志用);按实例记——各实例
+        # 闸门独立开合,全局单布尔会把别实例的开合串进日志。
+        # 不入分桶表(bool 会被 _fresh_instance_value 折叠成 0,按
+        # 实例号 key 的全局 dict 等价且安全)。
+        self._lwd_prefill_gate_held: dict[int, bool] = {}
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 同样占预算与 KV);k = num_speculative_tokens(配置解析期已
         # 求值,缺省 None 按 0),无 spec 配置即 1。
@@ -302,13 +329,41 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return out
 
     def _lwd_schedule_bound_instance(self) -> SchedulerOutput:
-        """对当前绑定实例做闸门判断 + 单请求组批。"""
+        """对当前绑定实例做闸门判断 + 组批。
+
+        闸门按序:① 云侧满员(max_num_seqs,原有);② 云侧 pending
+        chunk 积压(未消费 seqno 数,按本实例计)。两者都只挡新开,
+        续传豁免(先收尾再开新,亦防上限=1 时自锁)。"""
         LwdControlLog.flight(len(self.running), len(self._lwd_awaiting))
         if (
             not self.lwd_edge_max_num_seqs_check()
             and not self._lwd_has_prefill_chunk_inflight()
         ):
             return SchedulerOutput.make_empty()
+        idx = self._cur_instance
+        if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
+            # 云侧 pending 闸门(组批的产生机制,按本实例计):未消费
+            # chunk(seqno)数 = 本实例云侧尚未消费的 prefill 步(一条
+            # seqno = 一个云步消费单位)。达到上限即停止新开 prefill,
+            # 请求在边侧 waiting 攒批(picker FCFS 前缀天然组多请求
+            # 批),云侧 pending 排空后闸门自开。仅约束本实例——别的
+            # 实例不受影响(round-robin 下一步自然换实例)。
+            pending_chunks = len(self._lwd_batch_requests)
+            if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
+                if not self._lwd_prefill_gate_held.get(idx):
+                    self._lwd_prefill_gate_held[idx] = True
+                    logger.info(
+                        "[Lwd][edge-sched] prefill gate HOLD: inst=%d "
+                        "pending_chunks=%d >= %d",
+                        idx, pending_chunks, _LWD_MAX_PENDING_CHUNKS,
+                    )
+                return SchedulerOutput.make_empty()
+            if self._lwd_prefill_gate_held.pop(idx, None):
+                logger.info(
+                    "[Lwd][edge-sched] prefill gate OPEN: inst=%d "
+                    "pending_chunks=%d",
+                    idx, pending_chunks,
+                )
         return self._lwd_schedule_batch()
 
     def _lwd_pick_prefill_batch(
@@ -329,6 +384,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
           迭代序取前缀,c = min(prompt, C),满足 Σchunk ≤ cap 且
           新增请求数 ≤ free_seq;不跳过队首(保 FCFS 与 seqno 链次序);
+        - DeepSeek V4 总 prompt 长度 >=8000 的请求独占 prefill 批
+          (含续传);短请求允许合批,不限制云侧 decode 混排;
         - 末位截断(续传/新开共用):批内最后一个条目允许被剩余额度
           截尾成 cap−used,与集中式 chunked prefill 的"预算耗尽截断"
           逐语义对齐——截断块恒为末位,边侧(§2.5)与云侧(§2.3)的
@@ -357,13 +414,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cap < 1:
             return picked, expected, cap
         unit = self._lwd_chunk_unit
+        # Apply the limit before scheduling/publishing so RangeNotify and the
+        # embeddings payload retain identical request sets and token counts.
+        is_deepseek_v4 = (
+            self.vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
+        )
+        single_prefill = False
         # 1) 续传优先(先收尾再开新)
         for request in self.running:
+            if single_prefill and picked:
+                break
             remaining = (
                 request.num_prompt_tokens - request.num_computed_tokens
             )
             if remaining <= 0:
                 continue
+            # Use the full prompt length, not this chunk's remaining length.
+            # If a long request follows short ones, close the batch here and
+            # leave it for the next batch; do not bypass it with waiting work.
+            single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
+            if single_prefill and picked:
+                break
             chunk = min(remaining, unit)
             if used + chunk > cap:
                 # 末位截断:批内最后一个条目允许被剩余额度截尾,
@@ -387,6 +458,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         new_count = 0
         candidates = list(self.skipped_waiting) + list(self.waiting)
         for request in candidates:
+            if single_prefill and picked:
+                break
+            single_prefill = is_deepseek_v4 and request.num_prompt_tokens >= 8000
+            if single_prefill and picked:
+                break
             chunk = min(request.num_prompt_tokens, unit)
             if new_count >= free_seq:
                 break
@@ -551,6 +627,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
+        _t_mrope = time.monotonic()
         positions, _delta = self._lwd_mrope_positions_fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
@@ -561,9 +638,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
+        # [Lwd][perf] mrope 全 prompt 计算逐请求耗时(在边引擎主线程上,
+        # 期间调度循环停转;MM 劣化归因)
         logger.info(
-            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
+            "[Lwd][perf] mrope-compute req=%s prompt=%d dur=%.2fms",
             request.request_id, request.num_prompt_tokens,
+            (time.monotonic() - _t_mrope) * 1000,
         )
 
     def _lwd_publish(self, message, idx: int) -> bool:
@@ -656,6 +736,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ):
             return False
         self._lwd_seqno = seqno + 1
+        # chunk 粒度 pending 跟踪(本实例桶):批内全部请求收到首
+        # token 即该 seqno 已消费,pending 闸门据此计数
+        self._lwd_batch_requests[seqno] = list(req_ids)
         logger.info(
             "[Lwd][edge-notify] batch reqs=%d inst=%d tokens=%d seqno=%d "
             "mrope=%d",
@@ -757,7 +840,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             idx = self._req_id_to_instance.get(request_id, 0)
             with self._instance_binding(idx):
                 self._lwd_awaiting.pop(request_id, None)
+                self._lwd_first_token_seen.discard(request_id)
                 self._lwd_mrope_positions_dict.pop(request_id, None)
+                # pending 跟踪摘除该请求;摘空或批内全部已见首 token
+                # 即整条移除(本实例桶)
+                seen = self._lwd_first_token_seen
+                for seqno, rids in list(self._lwd_batch_requests.items()):
+                    rids = [rid for rid in rids if rid != request_id]
+                    if not rids or all(rid in seen for rid in rids):
+                        del self._lwd_batch_requests[seqno]
+                    else:
+                        self._lwd_batch_requests[seqno] = rids
             if publisher is None:
                 continue
             if not self._lwd_publish(LwdAbortNotify(request_id=request_id), idx):
@@ -823,8 +916,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     request_id,
                 )
                 return False
+            self._lwd_first_token_seen.add(request_id)
+            # 首 token 到达即可能消费掉整条 chunk(本实例桶):批内
+            # 全部请求已见首 token 的 seqno 整条移除
+            seen = self._lwd_first_token_seen
+            for seqno, rids in list(self._lwd_batch_requests.items()):
+                if all(rid in seen for rid in rids):
+                    del self._lwd_batch_requests[seqno]
             if finished:
                 del self._lwd_awaiting[request_id]
+                self._lwd_first_token_seen.discard(request_id)
             logger.info(
                 "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
                 request_id, len(token_ids), finished,
