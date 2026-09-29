@@ -1036,6 +1036,20 @@ class WorkerProc:
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
+        # LWD: meta pinned 槽是 4 深轮换环——本步响应若在输出线程滞留
+        # 超过环深步数(高负载下 async 输出队列/GIL 争用可致),后续步
+        # 的 sample_tokens 会覆写本步槽位,response 序列化即拷到后步
+        # meta(真机实录:counts 出现 rank 量级值、前导假 0、尾部
+        # count>seg,边侧随之空行 ERROR)。synchronize 之后此处已是
+        # 本步完整内容,立即克隆私有拷贝(小 memcpy,输出线程非关键
+        # 路径),从此环复用不再能污染引擎读到的 meta
+        _lwd_carrier = getattr(output, "lwd_down_carrier", None)
+        if _lwd_carrier is not None:
+            _pinned, _req_ids, _numel, _seqno = _lwd_carrier
+            output.lwd_down_carrier = (
+                _pinned.clone(), _req_ids, _numel, _seqno,
+            )
+
         if getattr(output, "lwd_c2e_meta", None) is not None:
             logger.info(
                 "[Lwd][trace] worker response enqueued: c2e_meta reqs=%s",
