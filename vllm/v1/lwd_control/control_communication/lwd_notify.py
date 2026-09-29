@@ -115,12 +115,25 @@ class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):
 
 class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云->边发现通告(POST_OUT,首拍一次);pre_out_* 是边侧连接云端点的
-    唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。"""
+    唯一事实源,pre_out_host 须为边可路由真实 IP(0.0.0.0 不可作通告值)。
+
+    调度三元组(max_num_batched_tokens/max_num_seqs/num_speculative_
+    tokens)供边侧互校:三者是 cap/preflight 公式两侧的同源输入,
+    不一致不会让链路报错,只会让 preflight 恒 hold、prefill 被 decode
+    静默串行(真机实录:边 factor=1 云 factor=4 时 chunk 8191 +
+    decode 4 > 预算 8192)。0 = 旧版未携带,边侧仅告警不拦截。
+    云侧复用(多边)下经 ROUTER 通道按边定向送达,cloud_id 即来源云。"""
 
     pre_out_host: str
     pre_out_port: int
     cloud_id: int = 0
     """多云发现:边据此建 cloud_id -> 端点本地路由表;缺省 0 单云兼容。"""
+    max_num_batched_tokens: int = 0
+    """云侧调度生效预算(max_num_scheduled_tokens);0 = 旧版未携带。"""
+    max_num_seqs: int = 0
+    """云侧生效并发名额(max_num_running_reqs);0 = 旧版未携带。"""
+    num_speculative_tokens: int = 0
+    """云侧 spec k(边侧 spec_factor = k+1 以其为准);0 = 旧版未携带。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -192,7 +205,8 @@ LwdNotify = Union[  # noqa: UP007
 # 驱动);重同步消息在此 union 上 additive 扩展
 LwdCloudNotify = Union[LwdHelloNotify, LwdC2eNotify]  # noqa: UP007
 # 双向全集(ROUTER-ROUTER 单通道收两个方向的载荷,按 tag 区分):
-# 边->云五类通告 + 云->边步元数据;HELLO/WELCOME 为通道层帧不进解码器。
+# 边->云五类通告 + 云->边步元数据与 HELLO(三元组互校);通道层的
+# HELLO/WELCOME 握手帧(裸 bytes)不进解码器。
 # **本 union 是通道解码的唯一依据**,任何新增 notify 必须同时加进这里,
 # 否则解码失败按坏包丢弃(实测:_lwd_dispatch 里 isinstance 永远不成立,
 # 两端日志都看不到该消息)。
@@ -203,6 +217,8 @@ LwdWireNotify = Union[  # noqa: UP007
     LwdFinishNotify,
     LwdGenChainNotify,
     LwdC2eNotify,
+    # 云->边 HELLO(调度三元组互校,多边下经 ROUTER 按边定向送达)
+    LwdHelloNotify,
 ]
 # 数据面批型定义归 vllm/v1/core/sched/output.py(LwdBatch/LwdBatchType/
 # LwdEmbedBatch/LwdUnembedBatch,f8182fd5 定稿),协议层不重复声明

@@ -78,6 +78,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             "spec_factor=%d)",
             self._lwd_spec_factor,
         )
+        # 生效预算探针(preflight hold 排查用):max_num_scheduled_tokens
+        # 是调度器真正读的值(config 显式设置则覆盖 batched_tokens);
+        # 两者不一致即配置/派生错位,启动期一行可见
+        logger.info(
+            "[Lwd] cloud mixed scheduler budgets: "
+            "max_num_scheduled_tokens=%d max_num_batched_tokens=%d "
+            "max_num_seqs=%d",
+            self.max_num_scheduled_tokens,
+            self.scheduler_config.max_num_batched_tokens,
+            self.max_num_running_reqs,
+        )
         # spec 接受率累计器(引擎进程内直出):LWD 云前端没有注册请求,
         # 前端 stats 链(output_processor 丢弃未知请求输出 + lifespan
         # 周期任务)在云侧不可靠;接受率数据的源头本来就在调度器里,
@@ -257,6 +268,20 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             sum(item.num_tokens for item in items)
             + num_decode * self._lwd_spec_factor
         )
+        items_only = sum(item.num_tokens for item in items)
+        if items_only > self.max_num_scheduled_tokens:
+            # 永久超限(单批条目合计 > 云预算):等多久 decode 泄压都
+            # 不会过——边侧 cap 读的本地预算比云侧大(边云
+            # max_num_batched_tokens 未对齐时只能靠这里拦),hold 会
+            # 永久堵队首空转。当场报错。
+            raise RuntimeError(
+                f"[Lwd][cloud-sched] prefill batch can never fit: "
+                f"items_total={items_only} > cloud budget "
+                f"{self.max_num_scheduled_tokens} — edge/cloud "
+                f"max_num_batched_tokens misaligned (edge caps by its "
+                f"local budget); align the two sides' "
+                f"max_num_batched_tokens"
+            )
         if need_tokens > self.max_num_scheduled_tokens:
             logger.info(
                 "[Lwd][cloud-sched] preflight hold: tokens %d > budget %d",

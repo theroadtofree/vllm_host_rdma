@@ -318,6 +318,23 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_cloud_id = getattr(
             self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
         )
+        # HELLO(含调度三元组)两种模式都要建:1E1C 经 POST_OUT 首拍;
+        # 云侧复用经 ROUTER 按边定向送达(pre_out_* 在复用模式为占位,
+        # 边侧只读三元组)。三元组取调度器**生效值**而非配置原值:
+        # 派生/缺省差异(max_num_scheduled_tokens 覆盖链)只有生效值可信。
+        self._lwd_hello = LwdHelloNotify(
+            pre_out_host=config.pre_out_host,
+            pre_out_port=config.pre_out_port,
+            cloud_id=self._lwd_cloud_id,
+            max_num_batched_tokens=self.scheduler.max_num_scheduled_tokens,
+            max_num_seqs=self.scheduler.max_num_running_reqs,
+            num_speculative_tokens=(
+                getattr(
+                    getattr(self.vllm_config, "speculative_config", None),
+                    "num_speculative_tokens", None,
+                ) or 0
+            ),
+        )
         if config.is_cloud_reuse:
             registry = get_role_registry()
             if registry is None:
@@ -348,11 +365,6 @@ class LwdCloudEngineCore(EngineCoreProc):
             bind=False,
             encoder=lwd_encode_cloud_notify,
         )
-        self._lwd_hello = LwdHelloNotify(
-            pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
-            cloud_id=self._lwd_cloud_id,
-        )
         self._lwd_init_dispatch_state()
         # 首拍即通告(边侧可能已 bind 等待)
         self._lwd_announce()
@@ -376,6 +388,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         # registry 引用交付调度器(IO 线程登记 / 主循环读,dict 赋值原子)。
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
+        # 云侧复用下已按边送达 HELLO 的登记(调度三元组互校;首次收到
+        # 该边消息时定向送达一次,发布失败不登记,下条消息重试)
+        self._lwd_hello_sent: set[int] = set()
 
     def process_input_sockets(
         self,
@@ -407,6 +422,21 @@ class LwdCloudEngineCore(EngineCoreProc):
         if self._lwd_channel is not None:
             channel = self._lwd_channel
             while not channel.closed:
+                # 边连接就绪即送达 HELLO(三元组互校在启动期完成,
+                # 不等首请求);发布失败留到下轮重试
+                for ready_edge in channel.ready_instance_ids():
+                    if ready_edge in self._lwd_hello_sent:
+                        continue
+                    if channel.publish(self._lwd_hello, ready_edge):
+                        self._lwd_hello_sent.add(ready_edge)
+                        logger.info(
+                            "[Lwd][cloud] HELLO(triple) sent to edge%d: "
+                            "budget=%d seqs=%d num_spec=%d",
+                            ready_edge,
+                            self._lwd_hello.max_num_batched_tokens,
+                            self._lwd_hello.max_num_seqs,
+                            self._lwd_hello.num_speculative_tokens,
+                        )
                 for edge_id, notify in channel.consume_new_outputs(
                     timeout_s=_LWD_ROUTER_CONSUME_TIMEOUT_S
                 ):
@@ -448,6 +478,22 @@ class LwdCloudEngineCore(EngineCoreProc):
         edge_id:云侧复用取自信封 identity(来源标注免费携带,不解析
         载荷);1E1C 取消息自带字段(缺省 0,单边兼容)。入口即做
         req_id 命名空间包装(wrap_req_id),云内只认包装 id。"""
+        if (
+            self._lwd_channel is not None
+            and edge_id not in self._lwd_hello_sent
+        ):
+            # 云侧复用:通道层 HELLO/WELCOME 裸帧不带载荷,调度三元组
+            # 改走 LwdHelloNotify 按边定向送达(每条边首次来讯时),
+            # 边侧据生效值互校(预算/名额不一致启动期即炸,不等地错)
+            if self._lwd_channel.publish(self._lwd_hello, edge_id):
+                self._lwd_hello_sent.add(edge_id)
+                logger.info(
+                    "[Lwd][cloud] HELLO(triple) sent to edge%d: "
+                    "budget=%d seqs=%d num_spec=%d",
+                    edge_id, self._lwd_hello.max_num_batched_tokens,
+                    self._lwd_hello.max_num_seqs,
+                    self._lwd_hello.num_speculative_tokens,
+                )
         if isinstance(msg, LwdRangeNotify):
             # 入口命名空间包装:云内统一用 wrapped_req_id,调度器据此
             # 解析 edge_id 做数据面分桶。
