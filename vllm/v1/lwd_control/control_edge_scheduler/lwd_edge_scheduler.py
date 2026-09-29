@@ -647,6 +647,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 收尾备料一并清理(该请求不再上报 finish)
         self._lwd_finish_prompt_ids.pop(request.request_id, None)
         self._lwd_finish_gen_ids.pop(request.request_id, None)
+        self._lwd_finish_media_items.pop(request.request_id, None)
         super().add_request(request)
         self.finish_requests(
             [request.request_id], RequestStatus.FINISHED_ABORTED
