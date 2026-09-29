@@ -348,12 +348,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 尺寸与注入切行信息:req_ids 取批内逐请求,token_ids 为占位
         # 列表——长度必须等于边侧实际发送的逐请求 token 数,recv numel
         # 才能与边侧 isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
+        # prompt_offsets/has_mrope 逐 item 透传:worker 据此求 aux 帧
+        # 尺寸(Σ 有 mrope 条目的 n_i×3),runner 据此对 MM 请求注入
+        # mrope 行(文本请求零 aux 流量、零路径变化)。
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=LwdEmbedBatch(
                 req_ids=[item.request_id for item in items],
                 token_ids=[[0] * item.num_tokens for item in items],
+                prompt_offsets=[item.offset for item in items],
+                has_mrope=[item.has_mrope for item in items],
             ),
         )
         return out

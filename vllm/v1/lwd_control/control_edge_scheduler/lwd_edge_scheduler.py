@@ -30,6 +30,8 @@ import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import (
     LwdBatch,
@@ -147,6 +149,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             LwdConfig.from_env_and_config(self.vllm_config).scheduler_name
             == "mixed"
         )
+        # 多模态请求的整 prompt mrope positions([3,N] CPU 张量,准入时
+        # 一次性算好,按 chunk 切片随 LwdEmbedBatch 下发 worker);嵌入
+        # 完结/abort 时摘除。key 在 = 该请求各 chunk 的 has_mrope 恒真。
+        # 全局表(不入 _LWD_INSTANCE_DOMAIN_ATTRS):key 是全局唯一
+        # request_id,abort/完结清理点各自在所属实例桶绑定下运行,按桶
+        # 切表反而漏清。
+        self._lwd_mrope_positions_dict: dict[str, torch.Tensor] = {}
+        # 惰性解析的模型类静态方法 _get_mrope_input_positions(直接缓存
+        # 方法本身而非模型类,语义直达;首用即验,不支持的族 fail-fast)。
+        self._lwd_mrope_positions_fn = None
         # chunk 单元 C:prompt 按 min(剩余, C) 切块下发
         # (lwd_chunked_prefill_design.md)。C 取本地
         # long_prefill_token_threshold(原生调度本就按它截断 prompt 排程,
@@ -452,6 +464,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。"""
         self._lwd_validate_request(request)
+        self._lwd_compute_mrope_positions(request)
         idx = request.client_index if self._instance_count > 1 else 0
         if not 0 <= idx < self._instance_count:
             raise ValueError(
@@ -472,6 +485,66 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     [request.request_id], RequestStatus.FINISHED_ABORTED
                 )
                 self.lwd_edge_abort([request.request_id])
+
+    @staticmethod
+    def _lwd_request_has_mm(request: Request) -> bool:
+        """请求是否带真实多模态数据(prompt_embeds passthrough 不算——
+        它没有 grid 元数据,mrope 按文本位置处理,与原生口径一致)。"""
+        return any(
+            feature.modality != "prompt_embeds"
+            for feature in request.mm_features
+        )
+
+    def _lwd_compute_mrope_positions(self, request: Request) -> None:
+        """准入时为多模态请求一次性算全 prompt 的 [3,N] mrope positions。
+
+        设计分工(对照 latest_lwd 边云):token_id 不上线路,云侧拿
+        不到 grid 元数据,无法从第一性原理构造 3D 位置——由边侧(唯一
+        持有真实 prompt + mm_features 的一侧)算好,逐 chunk 切片随
+        EMBED 批经数据面发给云;delta 云侧收齐末 chunk 后自推
+        (max+1-N),不上 wire。
+
+        模型类静态方法直接以 hf_config 调用(Qwen3VL 族,含 Qwen3.5),
+        无需模型实例/权重;模型族不提供该静态入口即拒绝(报错信息给出
+        白名单口径),不静默按文本位置错算。"""
+        if not self.vllm_config.model_config.uses_mrope:
+            return
+        if not self._lwd_request_has_mm(request):
+            return
+        if self._lwd_mrope_positions_fn is None:
+            from vllm.model_executor.models import ModelRegistry
+
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                self.vllm_config.model_config.architectures,
+                self.vllm_config.model_config,
+            )
+            fn = getattr(model_cls, "_get_mrope_input_positions", None)
+            if fn is None:
+                raise ValueError(
+                    f"[LWD] multimodal requests in prefill-only mode "
+                    f"require a model class exposing "
+                    f"_get_mrope_input_positions (Qwen3VL family, incl. "
+                    f"Qwen3.5); got {model_cls.__name__} "
+                    f"(request {request.request_id})"
+                )
+            self._lwd_mrope_positions_fn = fn
+        mrope_features = [
+            f for f in request.mm_features if f.modality != "prompt_embeds"
+        ]
+        positions, _delta = self._lwd_mrope_positions_fn(
+            input_tokens=list(request.prompt_token_ids),
+            mm_features=mrope_features,
+            config=self.vllm_config.model_config.hf_config,
+        )
+        assert positions.shape[1] == request.num_prompt_tokens, (
+            f"[LWD] mrope positions width {positions.shape[1]} != prompt "
+            f"len {request.num_prompt_tokens} (request {request.request_id})"
+        )
+        self._lwd_mrope_positions_dict[request.request_id] = positions
+        logger.info(
+            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
+            request.request_id, request.num_prompt_tokens,
+        )
 
     def _lwd_publish(self, message, idx: int) -> bool:
         """控制面发布出口(唯一模式分流派发点):多实例(必为 router 模式)
@@ -505,6 +578,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
         token_slices: list[list[int]] = []
+        prompt_offsets: list[int] = []
+        has_mrope: list[bool] = []
+        mrope_slices: list[list[list[int]]] = []
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
             if request is None:
@@ -517,17 +593,32 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     f"[Lwd][edge-notify] req={request_id} pinned instance "
                     f"{pinned} != bound instance {idx}"
                 )
+            # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
+            # 恒携带 mrope 行(key 在即恒真);[3,N] 切本 chunk 列 ->
+            # [n,3] 行序与 token 轴对齐,随批下发 worker 组 aux 帧
+            positions = self._lwd_mrope_positions_dict.get(request_id)
+            req_has_mrope = positions is not None
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
+                    has_mrope=req_has_mrope,
                 )
             )
             req_ids.append(request_id)
             token_slices.append(
                 list(request.prompt_token_ids[offset : offset + num_tokens])
             )
+            prompt_offsets.append(offset)
+            has_mrope.append(req_has_mrope)
+            if req_has_mrope:
+                assert positions is not None
+                mrope_slices.append(
+                    positions[:, offset : offset + num_tokens].t().tolist()
+                )
+            else:
+                mrope_slices.append([])
         if not items:
             return True
         seqno = self._lwd_seqno
@@ -546,20 +637,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return False
         self._lwd_seqno = seqno + 1
         logger.info(
-            "[Lwd][edge-notify] batch reqs=%d inst=%d tokens=%d seqno=%d",
+            "[Lwd][edge-notify] batch reqs=%d inst=%d tokens=%d seqno=%d "
+            "mrope=%d",
             len(items), idx, sum(item.num_tokens for item in items), seqno,
+            sum(has_mrope),
         )
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
         # 配对键(与云侧 RangeNotify 登记同值,本批一个号一次 UP
         # send,云侧混排步按队首通知同号配对),embed 载荷为本
         # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化,
-        # instance_id stamp 决定 UP 通道对的路由)
+        # instance_id stamp 决定 UP 通道对的路由);mrope 行同序
+        # 携带(仅 MM 请求非空),worker 据此组 aux 帧
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
             batch_meta=LwdEmbedBatch(
                 req_ids=req_ids,
                 token_ids=token_slices,
+                prompt_offsets=prompt_offsets,
+                has_mrope=has_mrope,
+                mrope_positions=mrope_slices,
             ),
             instance_id=idx,
         )
@@ -640,6 +737,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             idx = self._req_id_to_instance.get(request_id, 0)
             with self._instance_binding(idx):
                 self._lwd_awaiting.pop(request_id, None)
+                self._lwd_mrope_positions_dict.pop(request_id, None)
             if publisher is None:
                 continue
             if not self._lwd_publish(LwdAbortNotify(request_id=request_id), idx):
@@ -678,6 +776,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     )
                     now = time.monotonic()
                     self._lwd_awaiting[request_id] = now
+                    self._lwd_mrope_positions_dict.pop(request_id, None)
                     logger.info(
                         "[Lwd][edge-progress] req=%s embed done -> awaiting",
                         request_id,
@@ -712,21 +811,47 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             return True
 
-    @staticmethod
-    def _lwd_validate_request(request: Request) -> None:
+    def _lwd_validate_request(self, request: Request) -> None:
         """模式边界校验;违规抛 ValueError,在入队之前拒绝,错误经
         add_request 调用链回到客户端 error 路径。
 
         边界 = 边侧能力面:边是 embedding 属主(拒绝客户端自带
         prompt_embeds),只处理纯文本补全(拒 pooling/结构化
         输出),prompt 非空;不上 wire 的采样参数(logit_bias/
-        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。"""
+        allowed_token_ids/logprobs)缺省即拒,不静默丢约束。
+
+        多模态白名单:仅 image;video/audio 等其余模态与 EVS
+        (multimodal pruning)拒绝——merge/mrope 链路按 image 语义
+        实现,其余模态未适配,静默放过即错算。"""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
                 f"prompt_embeds (request {request.request_id}); the edge "
                 "is the embedding owner"
             )
+        if request.mm_features:
+            unsupported_mm = sorted(
+                {
+                    feature.modality
+                    for feature in request.mm_features
+                    if feature.modality not in ("image", "prompt_embeds")
+                }
+            )
+            if unsupported_mm:
+                raise ValueError(
+                    f"[LWD] prefill-only mode supports image-only "
+                    f"multimodal requests; got modality "
+                    f"{', '.join(unsupported_mm)} "
+                    f"(request {request.request_id})"
+                )
+            if (
+                self.vllm_config.model_config.multimodal_config
+                .is_multimodal_pruning_enabled()
+            ):
+                raise ValueError(
+                    "[LWD] prefill-only mode does not support multimodal "
+                    f"pruning (EVS) (request {request.request_id})"
+                )
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "

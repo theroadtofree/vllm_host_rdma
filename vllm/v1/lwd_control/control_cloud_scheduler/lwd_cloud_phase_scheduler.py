@@ -174,13 +174,19 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # worker 的 recv 尺寸与注入切行信息:req_ids 取预告请求(单请求
         # 批),token_ids 为占位列表——长度必须等于边侧实际发送的 chunk
         # token 数(= RangeNotify.num_tokens),recv numel 才能与边侧
-        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
+        # isend 严格相等(HCCL P2P 要求两端 numel 匹配)。逃生通道的
+        # 多模态透传:新版边侧恒填 items,首条目的 has_mrope 即该请求
+        # 的标记(相位模式单请求批,批级 ≡ 请求级);旧版无 items 的
+        # 预告无 mrope 概念,恒 False。
+        _item0 = notify.items[0] if notify.items else None
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
             batch_meta=LwdEmbedBatch(
                 req_ids=[notify.request_id],
                 token_ids=[[0] * notify.num_tokens],
+                prompt_offsets=[_item0.offset if _item0 else notify.offset],
+                has_mrope=[_item0.has_mrope if _item0 else False],
             ),
         )
         return out

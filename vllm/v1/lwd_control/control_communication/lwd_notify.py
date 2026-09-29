@@ -16,11 +16,16 @@ class LwdRangeItem(msgspec.Struct, gc=False):
     """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
     起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
     offset == num_computed 对账。chunk 为 min(剩余 prompt, chunk 单元)
-    的自限块;cap 截断块独占一批。"""
+    的自限块;cap 截断块独占一批。
+
+    has_mrope(pdmix 多模态):逐请求标记本 chunk 是否携带 mrope
+    positions 行(UP aux 帧,[n,3] int64 与主帧同 seqno)。混批可含
+    文本+图像混合,批级标记不够;纯文本恒 False,零 aux 流量。"""
 
     request_id: str
     offset: int
     num_tokens: int
+    has_mrope: bool = False
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
