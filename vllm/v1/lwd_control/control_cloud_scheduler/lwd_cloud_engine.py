@@ -424,6 +424,23 @@ class LwdCloudEngineCore(EngineCoreProc):
             counts = vals[-2 * n_req : -n_req]
             seg_lens = vals[-n_req:]
             ranks_flat = vals[: -2 * n_req]
+            # 界定点[云侧/数据面源头]:pinned 布局自洽性——counts 与
+            # seg_lens 逐请求应满足 count>=1 且 count<=seg_len(decode
+            # 步每请求至少 1 个接受 token;被拒行在 seg_len 里、不在
+            # count 里)。violate 即 rank-replay 布局/解析错位:此时
+            # hidden 行数与 c2e meta 不再对齐,边侧 DOWN recv 将错读帧
+            if n_req and (
+                any(c < 1 for c in counts)
+                or any(c > s for c, s in zip(counts, seg_lens))
+            ):
+                logger.error(
+                    "[LWD][diag][cloud/data] down seqno=%d reqs=%s "
+                    "counts=%s seg_lens=%s — rank-replay pinned 布局"
+                    "自洽性破坏(0 接受行或 count>seg_len):边侧将"
+                    "错判 ERROR 或错读 DOWN 帧,疑云 runner carrier "
+                    "组包,与边侧无关",
+                    seqno, list(req_ids), list(counts), list(seg_lens),
+                )
             top_id_ths: list[list[int]] = []
             off = 0
             for seg_len in seg_lens:

@@ -686,6 +686,23 @@ class LwdEdgeEngineCore(EngineCoreProc):
         c2e_wait(到达→派发)是消费滞后读数:持续偏大说明边引擎步
         循环被收割/派发占住,c2e 在积压,云侧 publisher 队满小睡在即。"""
         unembed_batch = lwd_build_unembed_batch(notify)
+        # 界定点[云侧/控制面]:c2e 通告的逐请求接受行数(num_accepted_
+        # tokens)出现 0 行——空行经 _lwd_deliver_unembed 必判 ERROR。
+        # 云侧 rank-replay 的 counts 解析(lwd_cloud_engine 的 pinned
+        # 布局)或 carrier 组包异常才会产生 0 行,边侧透传无责
+        _c2e_zero_rows = sum(
+            1 for c in notify.num_accepted_tokens if c < 1
+        )
+        if _c2e_zero_rows:
+            logger.error(
+                "[LWD][diag][cloud/ctrl] c2e seqno=%s inst=%d reqs=%d "
+                "zero_accept_rows=%d counts=%s — 云侧通告含 0 接受行,"
+                "该批对应请求在边侧将判 ERROR(疑云侧 rank-replay "
+                "counts/pinned 布局异常,非边侧问题)",
+                notify.down_seqno, notify.instance_id,
+                len(notify.req_ids), _c2e_zero_rows,
+                list(notify.num_accepted_tokens),
+            )
         n_emb, n_unemb = self._lwd_queue_mix()
         logger.info(
             "[Lwd][sched] edge dispatch-unembed seqno=%s inst=%d reqs=%d "
@@ -718,6 +735,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         校验保证):与原生 update_from_output 的 outputs[request.
         client_index] 分组同构,前端 attach 据此送达对应客户端。"""
         _t = time.monotonic()
+        result = None  # DISABLE_DOWN 直通(future None)时无 worker 应答
         if future is None:
             # DISABLE_DOWN 直通:无 worker 批,token 直接取自 c2e 通告。
             sampled_token_map: dict[str, list[int]] = {
@@ -726,6 +744,19 @@ class LwdEdgeEngineCore(EngineCoreProc):
             }
         else:
             result = future.result()
+            # 界定点[边侧/数据面]:worker 对 UNEMBED 批返回 None——
+            # 整批请求在下面逐行判为空行 ERROR。execute_model 返回 None
+            # 只能来自边 worker(lwd_edge_worker execute_model 的 None
+            # 分支)或 RPC 收割链路,与云侧无关
+            if result is None:
+                logger.error(
+                    "[LWD][diag][edge/data] unembed seqno=%s inst=%d "
+                    "reqs=%d — 边 worker 返回 None,整批将逐请求判 "
+                    "ERROR(疑边 worker 执行或数据面收割链路,非云侧"
+                    "问题)",
+                    notify.down_seqno, notify.instance_id,
+                    len(notify.req_ids),
+                )
             # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
             # token,即该请求本步的生成内容;后续仅两处流向——
             # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
@@ -756,6 +787,27 @@ class LwdEdgeEngineCore(EngineCoreProc):
             if not sampled_token_ids and not finished:
                 # 行在批里但无 token 且未完结 = unembed 失败,ERROR 优先于
                 # 云侧码(已完结的空行属正常,如 DISABLE_DOWN 下的 ABORT)
+                # 界定点:缺行(worker req_ids 对齐错位 → 边 worker/数据面)
+                # vs 空行(云侧 num_accepted=0 → 云侧控制面,应已由
+                # dispatch 侧 zero_accept_rows 日志先行告警)
+                if result is not None and request_id not in sampled_token_map:
+                    logger.error(
+                        "[LWD][diag][edge/data] req=%s seqno=%s inst=%d "
+                        "— worker 结果缺行(notify 有该请求、worker "
+                        "req_ids 无):批内对齐错位,疑边 worker/"
+                        "数据面;worker reqs=%s",
+                        request_id, notify.down_seqno, notify.instance_id,
+                        list(getattr(result, "req_ids", None) or []),
+                    )
+                else:
+                    logger.error(
+                        "[LWD][diag][cloud/ctrl] req=%s seqno=%s inst=%d "
+                        "— worker 行为空(云侧 num_accepted=0):"
+                        "counts=%s,疑云侧 c2e meta",
+                        request_id, notify.down_seqno,
+                        notify.instance_id,
+                        list(notify.num_accepted_tokens),
+                    )
                 finish_reason = FinishReason.ERROR
                 finished = True
             if not self.scheduler.lwd_edge_deliver_tokens(
