@@ -699,6 +699,11 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        logger.info(
+                            "sched dbg: waiting break (no-chunk budget) "
+                            "req=%s num_new=%s budget=%s",
+                            request_id, num_new_tokens, token_budget,
+                        )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -778,6 +783,13 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    logger.info(
+                        "sched dbg: waiting break (alloc) req=%s num_new=%s "
+                        "free=%s computed=%s",
+                        request_id, num_new_tokens,
+                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                        num_computed_tokens,
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager

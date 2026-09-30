@@ -28,6 +28,10 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 class SingleTypeKVCacheManager(ABC):
     """
@@ -1069,6 +1073,10 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
+            logger.info(
+                "sched dbg: mamba same-step guard deferred req=%s hit_blocks=%d",
+                request_id, len(new_computed_blocks),
+            )
             return self.block_pool.num_gpu_blocks + 1
         if self.mamba_cache_mode != "align":
             # Allocate extra `num_speculative_blocks` blocks for
