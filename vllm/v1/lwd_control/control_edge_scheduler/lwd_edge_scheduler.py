@@ -215,6 +215,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 在重启后首个请求(probe 用旧粒度、finish 须用同一粒度才能与云侧
         # 存储的 manifest 对账),稳态请求 probe/finish 同粒度自然一致。
         self._lwd_probe_bs_by_req: dict[str, int] = {}
+        # resume 命中边界与 probe 链留档(request_id -> 命中 token 数 /
+        # (链粒度, 链)):picker 的 mamba 同批缓存冲突预检用(见
+        # _lwd_mamba_dep_conflict);仅命中请求(>0)入档,finish/abort
+        # 路径随 _lwd_probe_bs_by_req 一并摘除
+        self._lwd_resume_hit_by_req: dict[str, int] = {}
+        self._lwd_probe_chain_by_req: dict[str, tuple[int, list[bytes]]] = {}
         # 探前缀客户端惰性缓存(复用 hasher/tenant_key,避免每请求读文件重建)
         self._lwd_probe_client_cache = None
         # probe 异步化(E1 根治):请求先投 probe 线程,结果回灌主循环后
@@ -418,6 +424,84 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         return self._lwd_schedule_batch()
 
+    def _lwd_chain_hash_eq(
+        self, req_a: Request, req_b: Request, boundary: int, grid: int
+    ) -> bool:
+        """两请求在网格边界 boundary 处的 prompt 前缀是否同内容:
+        取各自 probe 链(云 hash 粒度)同索引比对(HMAC 域,媒体感知)。
+
+        unitary 云(链粒度 == grid,无 mamba 组)无该守卫,直接 False;
+        链缺失(未协调/未命中不入档)同样 False——无 resume 即无守卫
+        触发面。粒度不一致只发生在学习换挡瞬间,按冲突处理(安全方向:
+        多拆一批,不误放)。"""
+        entry_a = self._lwd_probe_chain_by_req.get(req_a.request_id)
+        entry_b = self._lwd_probe_chain_by_req.get(req_b.request_id)
+        if entry_a is None or entry_b is None:
+            return False
+        bs_a, chain_a = entry_a
+        bs_b, chain_b = entry_b
+        if bs_a >= grid:
+            return False
+        if bs_a <= 0 or bs_a != bs_b:
+            return True
+        idx = boundary // bs_a - 1
+        if not 0 <= idx < min(len(chain_a), len(chain_b)):
+            return False
+        return chain_a[idx] == chain_b[idx]
+
+    def _lwd_mamba_dep_conflict(
+        self,
+        cand: Request,
+        cand_chunk: int,
+        picked: list[str],
+        expected: dict[str, int],
+    ) -> bool:
+        """云侧 mamba align 同步缓存守卫的同批预检(冲突即收批)。
+
+        原生 MambaManager.get_num_blocks_to_allocate 对「命中块在本步内
+        刚被缓存」的 resume 强制分配失败(single_type_kv_cache_manager
+        .py:1064:状态块内容本步执行才落盘,resume 不可读;原生是合法
+        deferral,LWD 整批精确准入下必炸,实测 scheduled=0 != notify)。
+        该集合每步首清空(scheduler.py:374),触发只可能来自**同一条
+        notify 批内**先准入的条目(allocate_slots 末尾 cache_blocks);
+        hold 不解(批组成不变,下步原样重现=死锁),只能拆开——批组成
+        权威在边侧,故预检放 picker:候选与任一已选条目满足「一条是
+        新准入 resume(首 chunk 未发、命中 H>0),另一条的 chunk 覆盖
+        其命中边界(o < H ≤ o+n)且边界处链上同哈希」即冲突,收批,
+        候选留下一条 notify(下一条 notify 另行消费时,前序条目的
+        缓存已越步清空,必不冲突,无死锁)。"""
+        cloud_id = self._lwd_binding.cloud_of(
+            cand.request_id, default=self._lwd_default_cloud_id()
+        )
+        grid = self._lwd_align_grid_by_cloud.get(cloud_id, 0)
+        if grid <= 0:
+            return False  # 网格未学到(协调未启用):无混合守卫触发面
+        cand_off = cand.num_computed_tokens
+        cand_end = cand_off + cand_chunk
+        cand_hit = self._lwd_resume_hit_by_req.get(cand.request_id, 0)
+        cand_is_fresh_resume = cand_hit > 0 and cand_off == cand_hit
+        for rid in picked:
+            other = self.requests[rid]
+            o_other = other.num_computed_tokens
+            end_other = o_other + expected[rid]
+            other_hit = self._lwd_resume_hit_by_req.get(rid, 0)
+            other_is_fresh_resume = other_hit > 0 and o_other == other_hit
+            # 候选 resume:已选条目的 chunk 覆盖其命中边界?
+            if (
+                cand_is_fresh_resume
+                and o_other < cand_hit <= end_other
+                and self._lwd_chain_hash_eq(cand, other, cand_hit, grid)
+            ):
+                return True
+            # 已选条目 resume:候选的 chunk 覆盖其命中边界?
+            if (
+                other_is_fresh_resume
+                and cand_off < other_hit <= cand_end
+                and self._lwd_chain_hash_eq(other, cand, other_hit, grid)
+            ):
+                return True
+        return False
+
     def _lwd_pick_prefill_batch(
         self,
     ) -> tuple[list[str], dict[str, int], int]:
@@ -439,6 +523,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
           块,故组批强制:非末位块同尺寸且不小于任何末位块,违例即
           收批留待下一条 notify(空批恒合法,无饿死);唯一例外是
           批尾的预算截断块(预算耗尽复现,见下);
+        - 同批 mamba 缓存冲突预检(_lwd_mamba_dep_conflict):新准入
+          resume 条目的命中边界不得被批内另一条目本步覆盖缓存(云侧
+          align 守卫对本步新缓存块上的 resume 强制欠排),冲突即收批;
         - 续传(先收尾再开新):running 中未发完的 prefill 按 FCFS 序取
           c = min(剩余, C),Σ ≤ cap;
         - 开新:waiting(skipped 优先,原生准入失败回插者)按 FCFS
@@ -535,6 +622,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # T 抬过已有非末位块尺寸
                 break
             batch_max = max(batch_max, chunk)
+            if self._lwd_mamba_dep_conflict(request, chunk, picked, expected):
+                # 同批 mamba 缓存冲突:收批,候选留下一条 notify
+                break
             if used + chunk > cap:
                 # 末位截断:批内最后一个条目允许被剩余额度截尾,
                 # 批收尾(预算耗尽,与集中式 chunked prefill 逐语义
@@ -579,6 +669,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             elif nonlast_size is not None and chunk > nonlast_size:
                 break
             batch_max = max(batch_max, chunk)
+            if self._lwd_mamba_dep_conflict(request, chunk, picked, expected):
+                # 同批 mamba 缓存冲突:同续传循环(违例收批,保 FCFS 前缀)
+                break
             if new_count >= free_seq:
                 break
             if used + chunk > cap:
@@ -686,6 +779,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_finish_prompt_ids.pop(request.request_id, None)
         self._lwd_finish_gen_ids.pop(request.request_id, None)
         self._lwd_finish_media_items.pop(request.request_id, None)
+        self._lwd_resume_hit_by_req.pop(request.request_id, None)
+        self._lwd_probe_chain_by_req.pop(request.request_id, None)
         super().add_request(request)
         self.finish_requests(
             [request.request_id], RequestStatus.FINISHED_ABORTED
@@ -705,6 +800,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request.num_computed_tokens = prefix_hit_tokens
         cloud_id = self._lwd_default_cloud_id()
         self._lwd_binding.bind(request.request_id, cloud_id)
+        if prefix_hit_tokens > 0:
+            # resume 命中边界与链留档:picker 预检 mamba 同批缓存冲突用
+            # (云侧 MambaManager 对本步新缓存块上的 resume 强制欠排)
+            self._lwd_resume_hit_by_req[request.request_id] = prefix_hit_tokens
+            self._lwd_probe_chain_by_req[request.request_id] = (
+                self._lwd_hash_bs_by_cloud.get(cloud_id, 0),
+                list(block_hashes),
+            )
         self._lwd_compute_mrope_positions(request)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
@@ -1356,6 +1459,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_gen_chain_sent.pop(request_id, None)
             self._lwd_gen_chain_state.pop(request_id, None)
             self._lwd_probe_bs_by_req.pop(request_id, None)
+            self._lwd_resume_hit_by_req.pop(request_id, None)
+            self._lwd_probe_chain_by_req.pop(request_id, None)
             # mrope 台账随 abort 清理(多模态准入期预计算的位置缓存)
             self._lwd_mrope_positions_dict.pop(request_id, None)
             # probe 在飞期间的 abort:摘除 inflight(迟到的 probe 结果在
@@ -1409,6 +1514,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         media_items = self._lwd_finish_media_items.pop(request_id, None) or ()
         self._lwd_gen_chain_sent.pop(request_id, None)
         self._lwd_gen_chain_state.pop(request_id, None)
+        self._lwd_resume_hit_by_req.pop(request_id, None)
+        self._lwd_probe_chain_by_req.pop(request_id, None)
         if prompt_ids is None:
             return
         vllm_config = getattr(self, "vllm_config", None)
