@@ -531,6 +531,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 and o_other < cand_hit <= end_other
                 and self._lwd_chain_hash_eq(cand, other, cand_hit)
             ):
+                logger.info(
+                    "[Lwd][edge-sched] mamba dep conflict: req=%s hit=%d "
+                    "covered by %s [%d, %d) — split batch",
+                    cand.request_id, cand_hit, rid, o_other, end_other,
+                )
                 return True
             # 已选条目 resume:候选的 chunk 覆盖其命中边界?
             if (
@@ -538,6 +543,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 and cand_off < other_hit <= cand_end
                 and self._lwd_chain_hash_eq(other, cand, other_hit)
             ):
+                logger.info(
+                    "[Lwd][edge-sched] mamba dep conflict: req=%s hit=%d "
+                    "covered by candidate %s [%d, %d) — split batch",
+                    rid, other_hit, cand.request_id, cand_off, cand_end,
+                )
                 return True
         return False
 
