@@ -107,14 +107,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_recent_finished: OrderedDict[str, None] = OrderedDict()
         # 当次消费的幽灵条目(classify 写入,建批/释放读取)
         self._lwd_cur_ghost_items: list[LwdRangeItem] = []
-        # KV preflight 的分组块粒度:混合模型块池跨组共享,一个 chunk 的
-        # 实际占用 = Σ_g cdiv(tokens, g.block_size)(768-token chunk =
-        # 48 attn(16) + 1 mamba(768) = 49 块)。用 self.block_size
-        # (=scheduler_block_size,混合下为组块 LCM 网格)按单粒度估会
-        # 少算 ~组数倍,preflight 失守放进批 → allocate_slots 失败 →
-        # 步后核验以 scheduled=0 炸(实测 seqno=195)
-        self._lwd_group_block_sizes = [
-            group.kv_cache_spec.block_size
+        # KV preflight 的分组块粒度:混合模型块池跨组共享,占用须逐组
+        # 对齐 allocate_slots 的真实口径——attention 组按 cdiv(chunk +
+        # lookahead, bs)(lookahead 进 num_tokens_need_slot 可顶破块
+        # 边界);mamba align 组首准入恒 1+num_speculative_blocks(最新
+        # 状态块+草稿快照,与 chunk 长度无关),续传至多 +1,lookahead
+        # 豁免。用 self.block_size(=scheduler_block_size,混合下为组块
+        # LCM 网格)按单粒度估会少算 ~组数倍,preflight 失守放进批 →
+        # allocate_slots 失败 → 步后核验以 scheduled=0 炸(实测
+        # seqno=195)
+        self._lwd_group_specs = [
+            group.kv_cache_spec
             for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups
         ]
 
@@ -313,13 +316,22 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
-        need_blocks = sum(
-            cdiv(item.num_tokens, bs)
-            for item in items
-            for bs in self._lwd_group_block_sizes
-        ) + num_decode * sum(
-            cdiv(self._lwd_spec_factor, bs) for bs in self._lwd_group_block_sizes
-        )
+        # 逐组对齐 allocate_slots 真实口径(口径依据见 __init__ 注释);
+        # resume 命中块只 touch 不占空闲池,忽略之是保守方向
+        spec_tokens = self._lwd_spec_factor - 1  # lookahead(MTP 草稿)占块
+        need_blocks = 0
+        for item in items:
+            fresh = item.request_id not in running_ids
+            for spec in self._lwd_group_specs:
+                num_spec_blocks = getattr(spec, "num_speculative_blocks", 0)
+                if getattr(spec, "mamba_cache_mode", None) == "align":
+                    need_blocks += (1 + num_spec_blocks) if fresh else 1
+                else:
+                    need_blocks += (
+                        cdiv(item.num_tokens + spec_tokens, spec.block_size)
+                        + num_spec_blocks
+                    )
+        need_blocks += num_decode * len(self._lwd_group_specs)
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
             logger.info(
