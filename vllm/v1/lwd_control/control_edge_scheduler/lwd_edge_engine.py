@@ -20,7 +20,8 @@
 
 步进编排(embed 优先):步首收割在飞批(unembed 交付 token/请求终结,
 embed 登记进度)-> prefill 编排(单请求组批 -> 范围预告 -> executor
-异步执行,优先占深度配额)-> 云载荷消费(c2e -> UNEMBED 批,剩余配额)。
+异步执行,优先占 EMBED 保留预算)-> 云载荷消费(c2e -> UNEMBED 批,
+剩余配额;批队列总深度随云实例数扩容,公式见 vllm.config.lwd)。
 """
 
 from __future__ import annotations
@@ -32,6 +33,10 @@ import time
 from collections import defaultdict, deque
 from typing import Any
 
+from vllm.config.lwd import (
+    LWD_EDGE_BASE_DEPTH,
+    lwd_edge_batch_queue_depth,
+)
 from vllm.logger import init_logger
 from vllm.v1.engine import (
     EngineCoreOutput,
@@ -80,10 +85,6 @@ LWD_C2E_META_QUEUE_MAX = 1000
 # POST_OUT 泵线程阻塞拍:仅作关停响应上限;消息到达由通知事件即时唤醒
 LWD_POST_OUT_PUMP_TIMEOUT_MS = 5000
 
-# 批队列在飞深度上限:派发(embed+unembed 合计)不收割的批数上限,
-# 突发积压时连续派发喂饱 worker(参照仓经验 >=4 才能维持流水对齐)
-LWD_EDGE_BATCH_QUEUE_DEPTH = 4
-
 
 class LwdEdgeEngineCore(EngineCoreProc):
     """边 PO 引擎:通信面装配 + 调度器注入 + step/add/abort/shutdown 覆写。"""
@@ -103,9 +104,40 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # 承担;桶水位是消费滞后的本地读数(正常远低于通道 FIFO)。
         # 数据面经 UNEMBED 批的 lwd_c2e_notifies 拿元数据,不直接读桶
         # (单消费者语义)
-        self._lwd_c2e_pending: dict[int, deque] = {}
+        # 桶集合构造期一次建全、永不增删、属性永不重绑:泵线程的
+        # setdefault 恒命中既有键(取桶与 append 之间无 detach 窗口),
+        # 引擎侧遍历时也不会因新键插入抛 dict-changed-size——若消费后
+        # 整体重绑 self._lwd_c2e_pending,泵线程可能把 append 落在旧
+        # 字典对象上,该 c2e 通告永久丢失(请求 finish 丢失即永不返回)。
+        # 键数 = 实例数,有界,不存在膨胀问题
+        self._lwd_c2e_pending: dict[int, deque] = {
+            iid: deque() for iid in range(config.instance_count)
+        }
         # 实例数标记:泵线程 c2e 越界防御用(与屏障/通道的 N 同源)
         self._lwd_instance_count = config.instance_count
+        # 批队列总深度(embed+unembed 合计在飞上限)与 EMBED 保留预算:
+        # 总深度随云实例数 N 扩容(公式唯一实现见
+        # vllm.config.lwd.lwd_edge_batch_queue_depth,N=1 退化为单实例
+        # 历史值 4);EMBED 派发以保留预算为门槛而非总深度——多实例下
+        # 若仍以总深度为门槛,持续 prefill 会把 UNEMBED 挤出队列
+        # (decode token 交付停摆)。worker 侧 buffer 池深经
+        # model_runner 以同公式同源贯通,不得单独改此值。
+        self._lwd_batch_queue_depth = lwd_edge_batch_queue_depth(vllm_config)
+        if self._lwd_batch_queue_depth is None:
+            raise RuntimeError(
+                "[Lwd] edge engine selected but batch queue depth unresolved "
+                "(lwd_config missing or not enabled prefill_only edge); "
+                "check additional_config['lwd_config'] parsing"
+            )
+        self._lwd_embed_slots = min(
+            LWD_EDGE_BASE_DEPTH, self._lwd_batch_queue_depth
+        )
+        logger.info(
+            "[Lwd] edge batch queue depth=%d (embed_slots=%d, instances=%d)",
+            self._lwd_batch_queue_depth,
+            self._lwd_embed_slots,
+            self._lwd_instance_count,
+        )
         # HELLO 载荷按实例留存(router 泵线程收首个 HELLO 时写入,
         # 构造线程 _lwd_cross_check_hello 在集合屏障后消费;dict 单键
         # 赋值原子,重复 HELLO 幂等跳过)
@@ -553,7 +585,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 (time.monotonic() - t_dispatch) * 1000,
             )
         d_emb = 0
-        while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
+        # EMBED 派发门槛 = 保留预算(队列内 embed 计数),而非总深度:
+        # 多实例下总深度随 N 扩容,若仍以总深度为门槛,持续 prefill 会
+        # 把 UNEMBED 挤出本步(decode token 交付停摆);保留预算使
+        # embed 优先有界,UNEMBED 消费剩余配额。N=1 时总深度 ==
+        # 保留预算,与历史行为逐位等价。
+        while (self._lwd_queue_mix()[0] < self._lwd_embed_slots
                and self.scheduler.has_requests()):
             scheduler_output = self.scheduler.schedule()
             if not scheduler_output.num_scheduled_tokens:
@@ -615,7 +652,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         返回本步派发条数。
         DISABLE_DOWN 诊断:通告只携带 token_ids(hidden=0)时跳过 worker
         派发,以 future=None 直通收割,不挂任何 recv。"""
-        quota = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
+        quota = self._lwd_batch_queue_depth - len(self._lwd_batch_queue)
         notifies: list[tuple[LwdC2eNotify, float]] = []
         while len(notifies) < quota:
             progressed = False
@@ -629,12 +666,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     break
             if not progressed:
                 break
-        # 清掉取空的桶,防长期运行字典膨胀
-        self._lwd_c2e_pending = {
-            iid: bucket
-            for iid, bucket in self._lwd_c2e_pending.items()
-            if bucket
-        }
+        # 不删空桶、不重绑字典:键数 = 实例数恒定,无膨胀;重绑会让泵
+        # 线程的 append 落在旧字典对象上,c2e 通告静默丢失(见 __init__)
         for notify, t_arrive in notifies:
             if _lwd_disable_down_enabled() and notify.token_ids:
                 logger.info(
@@ -736,16 +769,6 @@ class LwdEdgeEngineCore(EngineCoreProc):
         # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
         logger.info(
             "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
-        )
-        # req_ids x sampled_token_ids 按位对齐:worker lm_head 恢复的采样
-        # token,即该请求本步的生成内容;后续仅两处流向——
-        # lwd_edge_deliver_tokens(调度器只对账 awaiting 生命周期,
-        # 不消费内容)与 EngineCoreOutput 的 new_token_ids(outputs ->
-        # EngineCoreOutputs -> 主循环按 frontend 消费 -> 前端解流交付
-        # 客户端,即最终输出的生成 token)。
-        sampled_token_map: dict[str, list[int]] = (
-            {} if result is None
-            else dict(zip(result.req_ids, result.sampled_token_ids))
         )
         routing = self.scheduler._req_id_to_instance
         for index, request_id in enumerate(notify.req_ids):

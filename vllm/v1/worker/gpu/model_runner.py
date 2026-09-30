@@ -30,6 +30,7 @@ import torch.nn as nn
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.lwd import lwd_edge_batch_queue_depth
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -154,8 +155,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
-        # steps. Must run before any pooled buffer is constructed
-        set_default_max_concurrency(vllm_config.max_concurrent_batches)
+        # steps. Must run before any pooled buffer is constructed. On the LWD
+        # prefill-only edge the real in-flight bound is the engine-side batch
+        # queue depth (embed+unembed mixed FIFO), which exceeds
+        # max_concurrent_batches; the same helper (config + env) keeps the
+        # pools on the exact value the edge engine throttles against.
+        pool_concurrency = vllm_config.max_concurrent_batches
+        lwd_edge_depth = lwd_edge_batch_queue_depth(vllm_config)
+        if lwd_edge_depth is not None:
+            pool_concurrency = max(pool_concurrency, lwd_edge_depth)
+        set_default_max_concurrency(pool_concurrency)
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
