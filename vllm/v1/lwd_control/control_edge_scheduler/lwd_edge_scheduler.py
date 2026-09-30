@@ -459,7 +459,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return None
 
     def _lwd_chain_hash_eq(
-        self, req_a: Request, req_b: Request, boundary: int, grid: int
+        self, req_a: Request, req_b: Request, boundary: int
     ) -> bool:
         """两请求在网格边界 boundary 处的 prompt 前缀是否同内容:
         取各自 probe 链(云 hash 粒度)同索引比对(HMAC 域,媒体感知)。
@@ -467,8 +467,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         req_a 恒为 resume 侧(命中才入档,缺链不会发生;兜底不拦),
         req_b 恒为覆盖者侧——**覆盖者缺链按冲突处理**(安全方向:
         多拆一批,不误放;fail-open 未补建/学习未就位时如此)。
-        unitary 云(链粒度 == grid,无 mamba 组)无该守卫,直接 False;
-        粒度不一致只发生在学习换挡瞬间,同样按冲突处理。"""
+        粒度不一致只发生在学习换挡瞬间,同样按冲突处理。
+        注意:不得以 bs==grid 判定"unitary 无守卫"——混合模型在
+        mamba_block_size != cache block_size 时 hash 粒度回退为
+        scheduler 粒度(kv_cache_utils.py:639),bs==grid 恰是该场景,
+        守卫真实存在(实测:bs=grid=768 下同批冲突漏检复炸);真
+        unitary 上保留检测的代价只是同前缀对多拆一批(安全方向)。"""
         entry_a = self._lwd_probe_chain_by_req.get(req_a.request_id)
         entry_b = self._lwd_probe_chain_by_req.get(req_b.request_id)
         if entry_a is None:
@@ -477,8 +481,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return True
         bs_a, chain_a = entry_a
         bs_b, chain_b = entry_b
-        if bs_a >= grid:
-            return False
         if bs_a <= 0 or bs_a != bs_b:
             return True
         idx = boundary // bs_a - 1
@@ -527,14 +529,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if (
                 cand_is_fresh_resume
                 and o_other < cand_hit <= end_other
-                and self._lwd_chain_hash_eq(cand, other, cand_hit, grid)
+                and self._lwd_chain_hash_eq(cand, other, cand_hit)
             ):
                 return True
             # 已选条目 resume:候选的 chunk 覆盖其命中边界?
             if (
                 other_is_fresh_resume
                 and cand_off < other_hit <= cand_end
-                and self._lwd_chain_hash_eq(other, cand, other_hit, grid)
+                and self._lwd_chain_hash_eq(other, cand, other_hit)
             ):
                 return True
         return False
