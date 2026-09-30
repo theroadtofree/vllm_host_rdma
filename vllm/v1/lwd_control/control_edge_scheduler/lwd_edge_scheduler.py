@@ -424,20 +424,57 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         return self._lwd_schedule_batch()
 
+    def _lwd_try_build_dep_chain(self, request: Request) -> list[bytes] | None:
+        """尽力补建 probe 链(HMAC 域,云 hash 粒度):fail-open 路径的
+        冲突预检备料(该请求不续算,但可能作为"覆盖者"触发同批
+        resume 的云侧 mamba 守卫)。学习未就位/协调未启用/建链失败
+        返回 None——缺链的覆盖者在预检中按冲突处理(安全方向)。"""
+        cfg_pair = self._lwd_probe_coord_cfg()
+        if cfg_pair is None:
+            return None
+        coord_cfg, vllm_config = cfg_pair
+        learned = self._lwd_hash_bs_by_cloud.get(self._lwd_default_cloud_id(), 0)
+        if learned <= 0:
+            return None
+        try:
+            return list(
+                self._lwd_prefix_hasher(coord_cfg, vllm_config, learned)
+                .build_manifest(
+                    request.request_id,
+                    list(request.prompt_token_ids),
+                    # 与 probe 建链同一份媒体快照
+                    media_items=(
+                        self._lwd_finish_media_items.get(request.request_id)
+                        or ()
+                    ),
+                )
+                .full_block_hashes
+            )
+        except Exception:  # noqa: BLE001  fail-open:缺链按冲突处理
+            logger.warning(
+                "[Lwd][edge] dep chain rebuild failed req=%s",
+                request.request_id,
+                exc_info=True,
+            )
+            return None
+
     def _lwd_chain_hash_eq(
         self, req_a: Request, req_b: Request, boundary: int, grid: int
     ) -> bool:
         """两请求在网格边界 boundary 处的 prompt 前缀是否同内容:
         取各自 probe 链(云 hash 粒度)同索引比对(HMAC 域,媒体感知)。
 
+        req_a 恒为 resume 侧(命中才入档,缺链不会发生;兜底不拦),
+        req_b 恒为覆盖者侧——**覆盖者缺链按冲突处理**(安全方向:
+        多拆一批,不误放;fail-open 未补建/学习未就位时如此)。
         unitary 云(链粒度 == grid,无 mamba 组)无该守卫,直接 False;
-        链缺失(未协调/未命中不入档)同样 False——无 resume 即无守卫
-        触发面。粒度不一致只发生在学习换挡瞬间,按冲突处理(安全方向:
-        多拆一批,不误放)。"""
+        粒度不一致只发生在学习换挡瞬间,同样按冲突处理。"""
         entry_a = self._lwd_probe_chain_by_req.get(req_a.request_id)
         entry_b = self._lwd_probe_chain_by_req.get(req_b.request_id)
-        if entry_a is None or entry_b is None:
+        if entry_a is None:
             return False
+        if entry_b is None:
+            return True
         bs_a, chain_a = entry_a
         bs_b, chain_b = entry_b
         if bs_a >= grid:
@@ -630,9 +667,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # 批收尾(预算耗尽,与集中式 chunked prefill 逐语义
                 # 对齐)。复现依据:截断块恒为末位,边侧预算钳制
                 # (§2.5)与云侧预算钳制(§2.3)都靠"预算耗尽"复现它;
-                # 非末位块由 R/C/T 定界,与截断块尺寸无关
+                # 非末位块由 R/C/T 定界,与截断块尺寸无关。
+                # 同质性门控豁免截尾块(批尾设计),但 mamba 冲突门控
+                # 无豁免依据:截尾块照样可能覆盖批内 resume 的命中边界
                 c = _legal_chunk(request, cap - used)
-                if c >= 1:
+                if c >= 1 and not self._lwd_mamba_dep_conflict(
+                    request, c, picked, expected
+                ):
                     picked.append(request.request_id)
                     expected[request.request_id] = c
                     used += c  # 截断块同样占预算,漏记会被新开循环超批
@@ -676,7 +717,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 break
             if used + chunk > cap:
                 c = _legal_chunk(request, cap - used)
-                if c >= 1:
+                # 截尾块同样过 mamba 冲突预检(见续传循环同名注释)
+                if c >= 1 and not self._lwd_mamba_dep_conflict(
+                    request, c, picked, expected
+                ):
                     picked.append(request.request_id)
                     expected[request.request_id] = c
                     used += c
@@ -787,7 +831,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
 
     def _lwd_finalize_add_request(
-        self, request: Request, block_hashes: list[bytes], prefix_hit_tokens: int
+        self,
+        request: Request,
+        block_hashes: list[bytes],
+        prefix_hit_tokens: int,
+        dep_chain: list[bytes] | None = None,
     ) -> None:
         """add 第二阶段(主循环唯一执行点):续算推进 -> 绑定 -> 预告 -> 入队。
 
@@ -801,12 +849,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         cloud_id = self._lwd_default_cloud_id()
         self._lwd_binding.bind(request.request_id, cloud_id)
         if prefix_hit_tokens > 0:
-            # resume 命中边界与链留档:picker 预检 mamba 同批缓存冲突用
+            # resume 命中边界留档:picker 预检 mamba 同批缓存冲突用
             # (云侧 MambaManager 对本步新缓存块上的 resume 强制欠排)
             self._lwd_resume_hit_by_req[request.request_id] = prefix_hit_tokens
+        # probe 链对**所有**协调内请求入档:触发云侧守卫的"覆盖者"
+        # 可以是 hit=0 的 fresh 请求(重算覆盖段并在本步缓存),只存
+        # 命中者会漏检该方向(实测 seqno=291);协调未启用/fail-open
+        # 未补建时 dep_chain=None,缺链覆盖者在预检中按冲突处理
+        if dep_chain is not None:
             self._lwd_probe_chain_by_req[request.request_id] = (
                 self._lwd_hash_bs_by_cloud.get(cloud_id, 0),
-                list(block_hashes),
+                list(dep_chain),
             )
         self._lwd_compute_mrope_positions(request)
         self.lwd_edge_notify_request(
@@ -1013,9 +1066,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             request, _, _ = entry
             self._lwd_probe_inflight.pop(request_id, None)
             if outcome is None:
-                # fail-open:探测失败不阻断请求,不续算
+                # fail-open:探测失败不阻断请求,不续算。但本请求仍可能
+                # 作为"覆盖者"触发同批 resume 的云侧 mamba 守卫——尽力
+                # 补建 HMAC 链供 picker 冲突预检(建不出则缺链按冲突
+                # 处理,安全方向)
+                dep_chain = self._lwd_try_build_dep_chain(request)
                 self._lwd_finalize_add_request(
-                    request, list(request.block_hashes), 0
+                    request, list(request.block_hashes), 0, dep_chain=dep_chain
                 )
                 completed += 1
                 continue
@@ -1076,7 +1133,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # 多模态命中与文本同权:mm 链已掺图像内容身份,不同图在图像
             # 首个覆盖块即分叉必不命中;同图任意边界(含半图)复用的 KV
             # 与锚点请求逐位一致,无需位置截断。
-            self._lwd_finalize_add_request(request, chain, result.hit_tokens)
+            self._lwd_finalize_add_request(
+                request, chain, result.hit_tokens, dep_chain=chain
+            )
             completed += 1
         return completed
 
