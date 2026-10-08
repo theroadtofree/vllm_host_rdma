@@ -193,6 +193,57 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    @staticmethod
+    def _lwd_spec_token_block_size(spec) -> int:
+        """单组命中换算用的每块 token 数(与 find_longest_cache_hit 一致)。
+
+        压缩 MLA(``CompressAttentionManager``)用
+        ``block_size * compress_ratio``;其余用 ``spec.block_size``。
+        UniformType 容器本身无 compress_ratio,按其 ``block_size`` 计
+        (与 ``HybridKVCacheCoordinator._get_effective_block_size`` 同口径)。
+        """
+        block_size = int(getattr(spec, "block_size", 0) or 0)
+        compress = int(getattr(spec, "compress_ratio", 0) or 0) or 1
+        return block_size * compress if compress > 1 else block_size
+
+    @classmethod
+    def _lwd_eagle_peek_tokens(cls, spec) -> int:
+        """eagle/MTP「多查一块」需要的前瞻 token 数上界。
+
+        协调器按 ``spec.block_size`` 放宽查窗,但压缩管理器按
+        ``block_size * compress_ratio`` 切逻辑块——前瞻必须按逻辑块
+        算,否则丢尾后对齐循环会把命中压塌。UniformType 内层
+        compress_ratio 一并计入,取保守上界。
+        """
+        peek = cls._lwd_spec_token_block_size(spec)
+        inner = getattr(spec, "kv_cache_specs", None)
+        if inner:
+            for s in inner.values():
+                peek = max(peek, cls._lwd_spec_token_block_size(s))
+        return peek
+
+    def _lwd_resume_lookahead_margin(self) -> int:
+        """LWD resume 帽的前瞻余量:≥ 一个逻辑块(eagle 丢尾所需)。
+
+        DeepSeek-V4 压缩 MLA 的逻辑块 = block_size * compress_ratio,
+        对齐网格 = lcm_block_size;二者都远大于 hash 块。取
+        max(hash_bs, lcm/scheduler 网格, 各组 eagle 前瞻),保证
+        probe 用来丢弃的那块在 resume 查窗内可见。下方截断保证结果
+        不会越过边侧声明的续算边界。
+        """
+        coord = self.coordinator
+        margin = int(getattr(coord, "hash_block_size", 0) or 0)
+        for attr in ("lcm_block_size", "scheduler_block_size"):
+            margin = max(margin, int(getattr(coord, attr, 0) or 0))
+        groups = getattr(coord, "attention_groups", None) or ()
+        for entry in groups:
+            margin = max(margin, self._lwd_eagle_peek_tokens(entry[0]))
+        for group in self.kv_cache_config.kv_cache_groups:
+            margin = max(
+                margin, self._lwd_eagle_peek_tokens(group.kv_cache_spec)
+            )
+        return max(margin, 1)
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -227,15 +278,19 @@ class KVCacheManager:
         if lwd_declared_hit is not None and lwd_declared_hit > 0:
             # eagle/MTP 混合协调器对 attention 组"多查一块再丢尾块"
             # (前瞻余量):帽恰好等于命中值时余量被钳死,丢尾块后
-            # 网格对齐循环会把命中压塌(实测 probe 768 / resume 0)。
-            # 帽放宽一个 hash 块恢复余量;命中是网格倍数、声明值也是
-            # 网格倍数,放宽 < 一个网格时结果不会越过声明值。
+            # 网格对齐循环会把命中压塌(实测 probe 768 / resume 0,
+            # DeepSeek-V4 上 probe 16384 / resume 0)。
+            # 余量必须 ≥ 一个逻辑块(eagle 前瞻的那一块):
+            #   - 压缩 MLA 逻辑块 = block_size * compress_ratio,
+            #     可远大于 hash 块(DeepSeek-V4 c128 逻辑块可达 4k+);
+            #   - 对齐网格 = lcm_block_size,丢尾后还要落回网格。
+            # 只放宽一个 hash 块时 resume 查窗看不到 probe 用来丢弃的
+            # 那块,丢尾/对齐后整段命中被压成 0。结果仍由下方截断封顶,
+            # 不会越过边侧 trim 边界。
             # 声明为 0(未命中不续算)不放宽:帽恒 0,查窗零宽。
-            hash_bs = getattr(self.coordinator, "hash_block_size", None) or (
-                self.coordinator.scheduler_block_size
-            )
             max_cache_hit_length = min(
-                max_cache_hit_length, lwd_declared_hit + hash_bs
+                max_cache_hit_length,
+                lwd_declared_hit + self._lwd_resume_lookahead_margin(),
             )
         elif lwd_declared_hit is not None:
             max_cache_hit_length = min(max_cache_hit_length, lwd_declared_hit)
@@ -248,12 +303,15 @@ class KVCacheManager:
             lwd_declared_hit is not None
             and num_new_computed_tokens > lwd_declared_hit
         ):
-            # 余量恢复后命中可能越过声明值(unitary 场景 margin==grid):
-            # resume 绝不超过边侧 trim 边界,越界部分截断(网格倍数,
-            # 截断安全)
+            # 余量恢复后命中可能越过声明值:
+            # resume 绝不超过边侧 trim 边界,越界部分按各组命中换算
+            # 块尺寸截断(网格倍数,截断安全)。
             groups = self.kv_cache_config.kv_cache_groups
             computed_blocks = [
-                blocks[: lwd_declared_hit // g.kv_cache_spec.block_size]
+                blocks[
+                    : lwd_declared_hit
+                    // self._lwd_spec_token_block_size(g.kv_cache_spec)
+                ]
                 for blocks, g in zip(computed_blocks, groups)
             ]
             num_new_computed_tokens = lwd_declared_hit
