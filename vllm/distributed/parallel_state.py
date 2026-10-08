@@ -1736,7 +1736,9 @@ def _lwd_topology_axes(parallel_config) -> dict:
     + N cloud instance commands derive their group tables from these)."""
     return {
         "world_size": parallel_config.world_size,
-        "data_parallel_size": parallel_config.data_parallel_size,
+        # 云侧 DP engine 数:边侧本地 data_parallel_size 可能恒为 1,
+        # 拓扑真值以 cloud_dp_size 为准(多实例部署下二者相等)。
+        "cloud_dp_size": parallel_config.lwd_config.cloud_dp_size,
         "instance_parallel_size": (
             parallel_config.lwd_config.instance_parallel_size
         ),
@@ -1756,7 +1758,8 @@ def _raise_on_lwd_topology_mismatch(
         f"Lwd topology mismatch with global rank {remote_rank}: "
         f"local axes {local_axes} vs remote {remote_axes} "
         f"(differing: {diff}). Every launch command (the edge and all "
-        "cloud instances) must pass the same --data-parallel-size, "
+        "cloud instances) must pass the same --cloud-dp-size (or "
+        "--data-parallel-size, which defaults it), "
         "--instance-parallel-size, --edge-npu-count and "
         "--cloud-npu-count; otherwise the process group layout "
         "misaligns and init_process_group hangs."
@@ -1912,16 +1915,19 @@ def initialize_model_parallel(
         # 的 world 断言拦不住,错位的 new_group 序列只在第一个组集体上
         # 静默死锁。全 rank 在同一时点 all-gather 拓扑轴快速失败。
         _validate_lwd_topology_consistency(parallel_config)
-        expected_world = lwd.lwd_world_size(data_parallel_size)
+        # 云 DP engine 数以 cloud_dp_size 为准:边侧本地
+        # data_parallel_size 可能为 1,不能作为云拓扑真值。
+        lwd_dp = lwd.cloud_dp_size
+        expected_world = lwd.lwd_world_size(lwd_dp)
         assert world_size == expected_world, (
             f"Lwd world size mismatch: got {world_size}, expected "
             f"edge {lwd.edge_npu_count} + {lwd.instance_parallel_size} "
-            f"instances * {data_parallel_size} dp * "
-            f"{lwd.cloud_npu_count_per_instance_dp(data_parallel_size)} "
+            f"instances * {lwd_dp} dp * "
+            f"{lwd.cloud_npu_count_per_instance_dp(lwd_dp)} "
             "cloud ranks per (instance, dp)")
-        is_edge = rank < lwd.edge_rank_count(data_parallel_size)
+        is_edge = rank < lwd.edge_rank_count(lwd_dp)
 
-        groups = lwd.lwd_group_ranks(data_parallel_size)
+        groups = lwd.lwd_group_ranks(lwd_dp)
         tp_groups = groups["tp"]
         pp_groups = groups["pp"]
         dp_groups = groups["dp"]

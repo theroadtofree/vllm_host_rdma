@@ -5,8 +5,9 @@ from __future__ import annotations
 
 
 def lwd_resolve_engine_cls(vllm_config):
-    """core.py 类选择点的分流点:云角色返回 LwdCloudEngineCore,边角色返回
-    LwdEdgeEngineCore,其余返回 None(调用方用原生 EngineCoreProc)。"""
+    """core.py 类选择点的分流点:云角色返回 LwdCloudEngineCore(或其 DP
+    变体),边角色返回 LwdEdgeEngineCore,其余返回 None(调用方用原生
+    EngineCoreProc/DPEngineCoreProc)。"""
     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
         LwdConfig,
         is_lwd_prefill_only,
@@ -17,7 +18,14 @@ def lwd_resolve_engine_cls(vllm_config):
     config = LwdConfig.from_env_and_config(vllm_config)
     from vllm.logger import init_logger
 
+    dp_size = vllm_config.parallel_config.data_parallel_size
     if config.is_edge_node:
+        if dp_size > 1:
+            raise ValueError(
+                "[Lwd] prefill_only edge must be single-card "
+                f"(data_parallel_size={dp_size}); multi-card/multi-DP edge "
+                "is not supported"
+            )
         from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
             LwdEdgeEngineCore,
         )
@@ -26,6 +34,17 @@ def lwd_resolve_engine_cls(vllm_config):
             "[Lwd] prefill_only edge: engine class selected (LwdEdgeEngineCore)"
         )
         return LwdEdgeEngineCore
+    if dp_size > 1:
+        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+            LwdCloudDPEngineCore,
+        )
+
+        init_logger(__name__).info(
+            "[Lwd] prefill_only cloud: engine class selected "
+            "(LwdCloudDPEngineCore, dp=%d)",
+            dp_size,
+        )
+        return LwdCloudDPEngineCore
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
         LwdCloudEngineCore,
     )

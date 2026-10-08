@@ -126,9 +126,11 @@ class LwdParallelConfig:
     """Total number of edge NPUs across all DP instances (LWD mode)."""
     cloud_npu_count: int = Field(default=0, ge=0)
     """Total number of cloud NPUs across all DP instances AND all cloud
-    instances (LWD mode): with ``instance_parallel_size = N`` each cloud
-    instance runs ``cloud_npu_count / (N * data_parallel_size)`` NPUs, so
-    the count must be divisible by ``N * data_parallel_size``."""
+    instances (LWD mode): with ``instance_parallel_size = N`` and
+    ``cloud_dp_size = D`` each cloud engine runs
+    ``cloud_npu_count / (N * D)`` NPUs. When ``--cloud-dp-size`` is given
+    explicitly (one-command-per-engine deployment), ``EngineArgs``
+    normalizes the per-engine count to this grand total first."""
     instance_parallel_size: int = Field(default=1, ge=1, le=16)
     """Number of cloud instances (N) in the LWD multi-instance deployment.
     Must be identical on the edge command and on every cloud instance
@@ -144,9 +146,34 @@ class LwdParallelConfig:
     ``[0, instance_parallel_size)``. Only the cloud side sets it; cloud
     instances sharing one physical machine are distinguished by this
     value alone. ``None`` means instance 0 (also the edge value)."""
+    cloud_dp_size: int = Field(default=1, ge=1)
+    """Number of cloud data-parallel engines (D). Normalized to
+    ``ParallelConfig.data_parallel_size`` when not explicitly provided;
+    the LWD world is ``edge + N * D * C`` with
+    ``C = cloud_npu_count / (N * D)``."""
+
+    def cloud_engine_rank_base(
+        self, dp_rank: int, instance_id: int | None = None
+    ) -> int:
+        """Global (LWD world) rank of cloud engine (instance, dp_rank)'s
+        first worker. Layout: edge [0, E), then instance-major cloud
+        blocks: ``E + i*D*C + j*C``."""
+        i = (
+            self.instance_parallel_start_rank
+            if instance_id is None
+            else instance_id
+        )
+        i = i or 0
+        d = self.cloud_dp_size
+        c_per = self.cloud_npu_count_per_instance_dp(d)
+        return self.edge_npu_count + i * d * c_per + dp_rank * c_per
 
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance edge NPU count."""
+        """Edge NPUs attributed to each cloud DP engine. A shared edge
+        (``edge_npu_count == 1``) is one rank time-shared by all engines;
+        otherwise the edge ranks are split evenly across the DP axis."""
+        if data_parallel_size > 1 and self.edge_npu_count == 1:
+            return 1
         return self.edge_npu_count // data_parallel_size
 
     def cloud_npu_count_per_dp(self, data_parallel_size: int) -> int:
@@ -212,35 +239,49 @@ class LwdParallelConfig:
         c_per = self.cloud_npu_count_per_instance_dp(d)
         e_total = self.edge_rank_count(d)
         world = self.lwd_world_size(d)
+        # 共享边(E==1 且 D>1):唯一的一张边卡被所有云 engine 复用,
+        # 不再按 dp 切分;否则沿用多实例的 per-dp 边卡布局。
+        shared_edge = d > 1 and self.edge_npu_count == 1
 
         def cloud_first(i: int, j: int) -> int:
             return self.lwd_cloud_first_rank(i, j, d)
 
         tp_groups: list[list[int]] = []
-        for j in range(d):
-            tp_groups.append(
-                list(range(j * e_per, (j + 1) * e_per)))
+        if shared_edge:
+            tp_groups.append(list(range(e_total)))
             for i in range(n):
-                base = cloud_first(i, j)
-                tp_groups.append(list(range(base, base + c_per)))
+                for j in range(d):
+                    base = cloud_first(i, j)
+                    tp_groups.append(list(range(base, base + c_per)))
+        else:
+            for j in range(d):
+                tp_groups.append(
+                    list(range(j * e_per, (j + 1) * e_per)))
+                for i in range(n):
+                    base = cloud_first(i, j)
+                    tp_groups.append(list(range(base, base + c_per)))
 
         pp_groups: list[list[int]] = []
         pp_paired: set[int] = set()
         for i in range(n):
             for j in range(d):
-                # dp j's first edge card pairs with instance i's dp j
-                # first cloud rank; other edge cards are singletons.
-                pp_groups.append([j * e_per, cloud_first(i, j)])
-                pp_paired.add(j * e_per)
+                # 共享边:唯一的边卡与每个 (instance, dp) 云首卡成对;
+                # 否则 dp j 的首张边卡与 instance i 的 dp j 云首卡成对。
+                edge_rank = 0 if shared_edge else j * e_per
+                pp_groups.append([edge_rank, cloud_first(i, j)])
+                pp_paired.add(edge_rank)
                 pp_paired.add(cloud_first(i, j))
         for r in range(world):
             if r not in pp_paired:
                 pp_groups.append([r])
 
         dp_groups: list[list[int]] = []
-        for t in range(e_per):
-            dp_groups.append(
-                [j * e_per + t for j in range(d)])
+        if shared_edge:
+            dp_groups.append(list(range(e_total)))
+        else:
+            for t in range(e_per):
+                dp_groups.append(
+                    [j * e_per + t for j in range(d)])
         for i in range(n):
             for t in range(c_per):
                 dp_groups.append(
@@ -881,38 +922,36 @@ class ParallelConfig:
     @property
     def local_world_size(self) -> int:
         if self.lwd_config.enable_lwd:
-            # LWD edge-cloud multi-instance: each launch command spawns
-            # its own contiguous rank block of the §4.1 layout. The edge
-            # command spawns ALL edge ranks [0, E); each cloud instance
-            # command (identified by instance_parallel_start_rank) spawns
-            # its own instance block (all dp segments of that instance,
-            # contiguous because the layout is instance-major).
+            # LWD edge-cloud: each executor owns exactly one engine's
+            # contiguous rank block. The edge command owns [0, E); a cloud
+            # executor owns the C ranks of its (instance, dp) block —
+            # multi-instance places blocks instance-major, and multi-DP
+            # launches one executor per dp engine, so both axes divide the
+            # grand-total cloud count here.
             if self.lwd_config.is_edge_node:
                 return self.lwd_config.edge_npu_count
             return self.lwd_config.cloud_npu_count // (
                 self.lwd_config.instance_parallel_size
+                * self.lwd_config.cloud_dp_size
             )
         return self.world_size // self.nnodes_within_dp
 
     @property
     def lwd_global_start_rank(self) -> int:
-        """First global rank owned by this command's executor in LWD
-        multi-instance mode (§4.1 rank layout).
+        """First global rank owned by this executor in LWD mode (§4.1).
 
         Edge command: 0 (it spawns every edge rank, dp j's block being
-        ``[j*E_per, (j+1)*E_per)``). Cloud instance i command:
-        ``E + i*D*C`` — the first rank of instance i's contiguous block
-        (the command spans all dp segments of that instance). The
-        executor passes ``lwd_global_start_rank + local_rank`` to each
-        worker, so the standard dp-rank rearrangement in
-        ``init_distributed_environment`` is skipped for LWD.
+        ``[j*E_per, (j+1)*E_per)``). Cloud executor: the first rank of its
+        (instance, dp) block, ``E + i*D*C + j*C`` — multi-instance adds
+        the instance offset and multi-DP adds the dp offset, so both
+        deployment shapes map to the same formula.
         """
         assert self.lwd_config.enable_lwd
         if self.lwd_config.is_edge_node:
             return 0
         i = self.lwd_config.instance_parallel_start_rank or 0
         return self.lwd_config.lwd_cloud_first_rank(
-            i, 0, self.data_parallel_size
+            i, self.data_parallel_rank, self.lwd_config.cloud_dp_size
         )
 
     @staticmethod
@@ -1040,17 +1079,25 @@ class ParallelConfig:
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
         ):
+            # 云 DP engine 数以 cloud_dp_size 为准;未显式提供(默认 1)时
+            # 采用本地 data_parallel_size,兼容多实例部署。
+            if (
+                self.lwd_config.cloud_dp_size <= 1
+                and self.data_parallel_size > 1
+            ):
+                self.lwd_config.cloud_dp_size = self.data_parallel_size
+            lwd_dp = self.lwd_config.cloud_dp_size
             n = self.lwd_config.instance_parallel_size
             if (
                 self.lwd_config.cloud_npu_count
-                % (n * self.data_parallel_size)
+                % (n * lwd_dp)
                 != 0
             ):
                 raise ValueError(
                     f"cloud_npu_count ({self.lwd_config.cloud_npu_count}) "
                     f"must be divisible by instance_parallel_size * "
-                    f"data_parallel_size "
-                    f"({n} * {self.data_parallel_size})"
+                    f"cloud_dp_size "
+                    f"({n} * {lwd_dp})"
                 )
             if self.lwd_config.instance_parallel_start_rank is not None and (
                 self.lwd_config.instance_parallel_start_rank >= n
@@ -1067,9 +1114,7 @@ class ParallelConfig:
                     f"(instance_parallel_size={n}, "
                     f"is_edge_node={self.lwd_config.is_edge_node})"
                 )
-            self.world_size = (
-                self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
-            )
+            self.world_size = self.lwd_config.lwd_world_size(lwd_dp)
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

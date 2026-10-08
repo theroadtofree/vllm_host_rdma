@@ -107,8 +107,12 @@ class LwdCloudEngineCore(EngineCoreProc):
         """构造期装配通信面:PRE_OUT bind 收边(内部搬运线程)+ POST_OUT
         connect 边,承载首拍 HELLO 通告与步内元数据。"""
         config = LwdConfig.from_env_and_config(self.vllm_config)
+        # 多 DP:每 engine 的 PRE_OUT 端口按 dp_rank 派生,避免同机 bind
+        # 冲突;HELLO 通告派生后的真值,边侧据此建 per-engine 端点表。
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        pre_out_port = config.pre_out_port + dp_rank
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True,
+            f"tcp://{config.pre_out_host}:{pre_out_port}", bind=True,
             decoder=lwd_decode_notify,
         )
         master_addr = self.vllm_config.parallel_config.master_addr
@@ -121,7 +125,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
+            pre_out_port=pre_out_port,
             # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
             max_num_batched_tokens=sched_config.max_num_batched_tokens,
             max_num_seqs=sched_config.max_num_seqs,
@@ -172,9 +176,9 @@ class LwdCloudEngineCore(EngineCoreProc):
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
+            f"tcp://{config.pre_out_host}:{pre_out_port}",
             config.pre_out_host,
-            config.pre_out_port,
+            pre_out_port,
             master_addr,
         )
 
@@ -198,10 +202,14 @@ class LwdCloudEngineCore(EngineCoreProc):
         config = LwdConfig.from_env_and_config(self.vllm_config)
         master_addr = self.vllm_config.parallel_config.master_addr
         self._lwd_instance_id = config.instance_id
+        # 多 DP:每 engine 的 PRE_OUT 端口按 dp_rank 派生,避免同机 bind
+        # 冲突;DEALER identity / HELLO 通告都用派生后的真值。
+        dp_rank = self.vllm_config.parallel_config.data_parallel_rank
+        pre_out_port = config.pre_out_port + dp_rank
         channel = create_cloud_zmq_channel(
             master_addr=master_addr,
-            dp_rank=0,
-            pre_out_port=config.pre_out_port,
+            dp_rank=dp_rank,
+            pre_out_port=pre_out_port,
             name=f"lwd-cloud-inst{config.instance_id}",
             instance_id=config.instance_id,
         )
@@ -212,7 +220,7 @@ class LwdCloudEngineCore(EngineCoreProc):
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
+            pre_out_port=pre_out_port,
             instance_id=config.instance_id,
             # 调度三元组供边侧互校(cap/preflight 公式的同源输入)
             max_num_batched_tokens=sched_config.max_num_batched_tokens,

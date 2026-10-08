@@ -489,6 +489,7 @@ class EngineArgs:
     cloud_npu_count: int = 0
     instance_parallel_size: int = 1
     instance_parallel_start_rank: int | None = None
+    cloud_dp_size: int | None = None
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -1089,9 +1090,11 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
-            help="Total number of cloud NPUs across all DP instances AND "
-                 "all cloud instances (LWD mode); must be divisible by "
-                 "instance-parallel-size * data-parallel-size.",
+            help="Cloud NPU count (LWD mode). Default: grand total across "
+                 "all DP instances AND all cloud instances; must be "
+                 "divisible by instance-parallel-size * data-parallel-size. "
+                 "When --cloud-dp-size is given explicitly, this is the "
+                 "per-engine (TP) count instead.",
         )
         parallel_group.add_argument(
             "--instance-parallel-size", type=int, default=1,
@@ -1108,6 +1111,14 @@ class EngineArgs:
             "cloud instances (and edge frontend attach commands) pass "
             "their instance number here; instances on the same machine "
             "differ only by this value.",
+        )
+        parallel_group.add_argument(
+            "--cloud-dp-size", type=int, default=None,
+            help="Number of cloud data-parallel engines (D) for the "
+            "one-command-per-engine deployment (LWD mode). Must match "
+            "--data-parallel-size on the cloud side. When omitted, "
+            "--cloud-npu-count is interpreted as the grand total across "
+            "all engines and instances (multi-instance deployment).",
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1998,6 +2009,28 @@ class EngineArgs:
             model_config.skip_tokenizer_init = True
             logger.info("Skipping tokenizer initialization for tokens-only mode.")
 
+        # LWD: 两种部署形态共用同一套拓扑配置——
+        #   B 侧多实例:--cloud-npu-count 为跨实例/跨 engine 的总量;
+        #   A 侧 per-engine:显式给 --cloud-dp-size 时,--cloud-npu-count
+        #   是每 engine(TP)卡数,这里归一化成总量,后续布局统一消费。
+        lwd_cloud_dp_size = self.cloud_dp_size
+        lwd_cloud_npu_count = self.cloud_npu_count
+        if lwd_cloud_dp_size is not None:
+            lwd_cloud_npu_count = (
+                lwd_cloud_npu_count
+                * lwd_cloud_dp_size
+                * self.instance_parallel_size
+            )
+        else:
+            lwd_cloud_dp_size = self.data_parallel_size
+        lwd_parallel_config = LwdParallelConfig(
+            edge_npu_count=self.edge_npu_count,
+            cloud_npu_count=lwd_cloud_npu_count,
+            instance_parallel_size=self.instance_parallel_size,
+            instance_parallel_start_rank=self.instance_parallel_start_rank,
+            cloud_dp_size=lwd_cloud_dp_size,
+        )
+
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
@@ -2021,14 +2054,7 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
-            lwd_config=LwdParallelConfig(
-                edge_npu_count=self.edge_npu_count,
-                cloud_npu_count=self.cloud_npu_count,
-                instance_parallel_size=self.instance_parallel_size,
-                instance_parallel_start_rank=(
-                    self.instance_parallel_start_rank
-                ),
-            ),
+            lwd_config=lwd_parallel_config,
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

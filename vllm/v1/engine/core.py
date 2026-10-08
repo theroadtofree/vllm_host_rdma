@@ -1193,7 +1193,22 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                engine_core = DPEngineCoreProc(*args, **kwargs)
+                # Lwd prefill-only cloud engines must stay DP-aware (wave
+                # coordination); the resolver returns a DPEngineCoreProc
+                # subclass for the cloud role, None for non-LWD configs.
+                from vllm.v1.lwd_control import lwd_resolve_engine_cls
+
+                engine_cls = lwd_resolve_engine_cls(vllm_config)
+                if engine_cls is not None and not issubclass(
+                    engine_cls, DPEngineCoreProc
+                ):
+                    logger.warning(
+                        "Lwd engine class %s is not DP-capable; falling back "
+                        "to DPEngineCoreProc for MoE data_parallel.",
+                        engine_cls.__name__,
+                    )
+                    engine_cls = None
+                engine_core = (engine_cls or DPEngineCoreProc)(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect

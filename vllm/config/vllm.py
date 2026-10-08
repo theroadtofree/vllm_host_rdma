@@ -871,10 +871,29 @@ class VllmConfig:
             parallel_lwd.is_edge_node = self.lwd_config.is_edge
             if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                 raise ValueError("--edge-npu-count must be positive on the LWD edge process")
-            # 多实例(instance-parallel)模式下 cloud_npu_count 是所有实例的总量
-            # 这里仅在推导 TP 时取每实例卡数 C,world 仍为边+云总量的全局 rank 空间。
+            dp_size = self.parallel_config.data_parallel_size
+            if self.lwd_config.is_edge:
+                if parallel_lwd.edge_npu_count != 1:
+                    raise ValueError(
+                        "LWD edge must be a single shared NPU "
+                        f"(--edge-npu-count={parallel_lwd.edge_npu_count}); "
+                        "multi-card edge is not supported")
+            else:
+                # Cloud: --data-parallel-size is authoritative (one LWD
+                # cloud engine per DP rank); --cloud-dp-size left at its
+                # default simply adopts it, an explicit mismatch is rejected.
+                if parallel_lwd.cloud_dp_size <= 1:
+                    parallel_lwd.cloud_dp_size = dp_size
+                elif parallel_lwd.cloud_dp_size != dp_size:
+                    raise ValueError(
+                        "LWD cloud --cloud-dp-size "
+                        f"({parallel_lwd.cloud_dp_size}) must equal "
+                        f"--data-parallel-size ({dp_size})")
+            lwd_dp = parallel_lwd.cloud_dp_size
+            # 多实例(instance-parallel)模式下 cloud_npu_count 是所有实例的
+            # 总量;推导 TP 时取每实例、每 engine 卡数 C。
             cloud_npu_count_per_instance = parallel_lwd.cloud_npu_count_per_instance_dp(
-                self.parallel_config.data_parallel_size
+                lwd_dp
             )
             # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
             # 云一组 TP=每实例 cloud 卡数 C);配置 tp 回填为真值,使头数/
@@ -896,9 +915,7 @@ class VllmConfig:
                     self.parallel_config.tensor_parallel_size,
                     self.parallel_config.pipeline_parallel_size,
                 )
-            self.parallel_config.world_size = (
-                parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
-            )
+            self.parallel_config.world_size = parallel_lwd.lwd_world_size(lwd_dp)
             self.parallel_config.pipeline_parallel_size = 2
             self.parallel_config.tensor_parallel_size = (
                 parallel_lwd.edge_npu_count
