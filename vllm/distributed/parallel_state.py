@@ -1600,27 +1600,38 @@ def init_distributed_environment(
         and not enable_elastic_ep
     ):
         parallel_config = config.parallel_config
-        # adjust to take into account data parallelism
-        # offset the rank by the data parallel rank
-        rank = parallel_config.data_parallel_rank * world_size + rank
-        # adjust the world size to take into account data parallelism
-        world_size = parallel_config.world_size_across_dp
-
-        # Use appropriate IP and port based on configuration
-        if parallel_config.nnodes > 1:
-            ip = parallel_config.master_addr
-            port = parallel_config.master_port
-            distributed_init_method = get_distributed_init_method(ip, port)
-        else:
-            ip = parallel_config.data_parallel_master_ip
-            port = parallel_config.get_next_dp_init_port()
-            distributed_init_method = get_distributed_init_method(ip, port)
-            logger.debug(
-                "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
-                world_size,
-                rank,
-                distributed_init_method,
+        if parallel_config.lwd_config.enable_lwd:
+            # LWD 边云共享世界:executor 分配的 rank 已是全局 rank、
+            # world_size 已含全部云 engine(cloud_dp),原生的 rank 偏移与
+            # world 放大必须跳过(否则世界内没有 rank 0——LWD 的 rank 0 是
+            # 边——无人 bind store,全员挂死在连接重试)。但 rendezvous 地址
+            # 沿用部署配置的 master_addr:master_port(边 rank0 host store,
+            # 边与全部云 engine 共用同一地址汇合)。
+            distributed_init_method = get_distributed_init_method(
+                parallel_config.master_addr, parallel_config.master_port
             )
+        else:
+            # adjust to take into account data parallelism
+            # offset the rank by the data parallel rank
+            rank = parallel_config.data_parallel_rank * world_size + rank
+            # adjust the world size to take into account data parallelism
+            world_size = parallel_config.world_size_across_dp
+
+            # Use appropriate IP and port based on configuration
+            if parallel_config.nnodes > 1:
+                ip = parallel_config.master_addr
+                port = parallel_config.master_port
+                distributed_init_method = get_distributed_init_method(ip, port)
+            else:
+                ip = parallel_config.data_parallel_master_ip
+                port = parallel_config.get_next_dp_init_port()
+                distributed_init_method = get_distributed_init_method(ip, port)
+                logger.debug(
+                    "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
+                    world_size,
+                    rank,
+                    distributed_init_method,
+                )
     if not torch.distributed.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
