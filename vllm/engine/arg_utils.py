@@ -1991,8 +1991,19 @@ class EngineArgs:
                     "data_parallel_backend can only be ray or mp, got %s",
                     self.data_parallel_backend,
                 )
+                # LWD 边云:master_addr 是边侧地址(POST_OUT/共享世界
+                # rendezvous 用),不能回退为云侧 DP master——否则 engine 级
+                # DP 组把 store 建到边侧 IP,云 engine 间 gloo store 永连不通。
+                _lwd_enabled = bool(
+                    ((self.additional_config or {}).get("lwd_config") or {})
+                    .get("enabled"))
                 data_parallel_address = (
-                    self.master_addr or ParallelConfig.data_parallel_master_ip
+                    ParallelConfig.data_parallel_master_ip
+                    if _lwd_enabled
+                    else (
+                        self.master_addr
+                        or ParallelConfig.data_parallel_master_ip
+                    )
                 )
         else:
             data_parallel_address = self.data_parallel_address
