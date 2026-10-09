@@ -293,6 +293,14 @@ def set_device_control_env_var(
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
+    # LWD edge-cloud: world_size spans the shared edge plus ALL cloud
+    # engines (E + C*cloud_dp), so the native per-DP device slicing
+    # (dp_rank * world_size) overshoots the physical card count. Each
+    # cloud engine owns exactly local_world_size cards; slice by
+    # dp_rank * local_world_size instead.
+    if vllm_config.parallel_config.lwd_config.enable_lwd:
+        world_size = local_world_size
+
     value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
     with patch.dict(os.environ, values=((evar, value),)):
         yield
