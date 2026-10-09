@@ -457,6 +457,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
     def schedule(self) -> SchedulerOutput:
         # [Lwd][perf] 云侧每步 LWD 税分段之一:调度(容器交换)时长
         _t = time.monotonic()
+        self._lwd_settle_deferred_aborts()
         out = self._schedule_impl()
         self._lwd_sched_step += 1
         self._lwd_log_sched_batch(out)

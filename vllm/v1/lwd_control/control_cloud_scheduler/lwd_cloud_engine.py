@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import threading
 import time
-from collections import deque
 from typing import TYPE_CHECKING
 
 import torch
@@ -315,10 +314,9 @@ class LwdCloudEngineCore(EngineCoreProc):
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_seqno_registry.pop(msg.request_id, None)
-            # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
-            # "ADD 未落地"的预告是留队首等落地, aborted 请求永不落地,
-            # 不清扫会把队首永久堵住(条目掏空则整条移除)
-            self._lwd_purge_prefill_notify(msg.request_id)
+            # 预告队列**不改**:该请求已预告的 chunk 数据已在线上,必须由
+            # 调度器先算完再终结(见 LwdBaseScheduler.finish_requests);
+            # "请求已不存在"时的条目清理也在那里做。
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
             self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [msg.request_id]))
@@ -338,36 +336,6 @@ class LwdCloudEngineCore(EngineCoreProc):
             request = self._lwd_build_request(wire)
             self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
             logger.info("[Lwd] cloud request %s admitted via gate", request_id)
-
-    def _lwd_purge_prefill_notify(self, request_id: str) -> None:
-        """abort 清扫:摘除 prefill_notify_queue 里该请求的条目(条目
-        掏空则整条移除),并整体替换 deque(赋值原子,调度主线程的
-        peek/popleft 不受清扫影响)。"""
-        queue = getattr(self.scheduler, "prefill_notify_queue", None)
-        if not queue:
-            return
-        kept: deque = deque()
-        removed = 0
-        for notify in queue:
-            if notify.items:
-                items = [
-                    item for item in notify.items
-                    if item.request_id != request_id
-                ]
-                removed += len(notify.items) - len(items)
-                if items:
-                    notify.items = items
-                    kept.append(notify)
-            elif notify.request_id != request_id:
-                kept.append(notify)
-            else:
-                removed += 1
-        if removed:
-            self.scheduler.prefill_notify_queue = kept
-            logger.info(
-                "[Lwd][cloud-ctrl] purged %d pending notify item(s) for "
-                "aborted req=%s", removed, request_id,
-            )
 
     def _lwd_build_request(self, wire: LwdRequestNotify) -> Request:
         """请求构建(唯一建请求点,Request/SamplingParams 留 L3)。
