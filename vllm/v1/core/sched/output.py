@@ -54,6 +54,9 @@ class LwdEmbedBatch:
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
+    # 目标云 engine(= dp_rank):多 DP 下数据面按它选 UP 通道;
+    # 单云恒 0。
+    engine_index: int = 0
 
 
 @dataclass
@@ -66,6 +69,9 @@ class LwdUnembedBatch:
     out_token_idxs: list[list[int]] = field(default_factory=list)  # per request: generation ordinal of each token (order-preserving emit)
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
     token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
+    # 来源云 engine(= dp_rank):多 DP 下数据面按它选 DOWN 通道挂 recv;
+    # 单云恒 0。
+    engine_index: int = 0
 
 
 @dataclass

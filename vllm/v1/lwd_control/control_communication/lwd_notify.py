@@ -15,9 +15,11 @@ if TYPE_CHECKING:
 # 控制面协议版本:1 = mrope positions 经数据面 UP aux 帧([n,3] int64
 # 第二 P2P 载荷);2 = mrope positions 经控制面 LwdRangeItem.mrope_
 # positions 原始字节直传(数据面 aux 帧自 mrope 退役;aux 机制本身
-# 保留,供 deepstack 等大数据量载荷扩展)。两侧必须同版本部署:
+# 保留,供 deepstack 等大数据量载荷扩展);3 = 云侧多 DP:HELLO 携带
+# engine_index/coord_stats_addr,C2eNotify 携带 engine_index。
+# 两侧必须同版本部署:
 # msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
-LWD_WIRE_VERSION = 2
+LWD_WIRE_VERSION = 3
 
 
 class LwdRangeItem(msgspec.Struct, gc=False):
@@ -115,10 +117,18 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     num_speculative_tokens: int = 0
     wire_version: int = 0
     """控制面协议版本(见 LWD_WIRE_VERSION):1=mrope 经数据面 aux 帧;
-    2=mrope 经控制面 RangeItem.mrope_positions 直传。缺省 0=旧版未
-    携带。mrope 模型下边侧构造期校验 >=LWD_WIRE_VERSION 并 fail-fast
+    2=mrope 经控制面 RangeItem.mrope_positions 直传;3=云侧多 DP
+    (HELLO 带 engine_index/coord_stats_addr)。缺省 0=旧版未携带。
+    mrope 模型下边侧构造期校验 >=LWD_WIRE_VERSION 并 fail-fast
     ——msgspec 容忍未知字段,旧云对新字段静默丢弃,mrope 缺失不会
     有任何报错,必须显式互校。"""
+    engine_index: int = 0
+    """云 engine 身份(= dp_rank),wire_version>=3 起携带;多云 DP 下
+    边侧按它建 per-engine 端点表与路由账。缺省 0 = 单云旧版。"""
+    coord_stats_addr: str = ""
+    """云侧 DPCoordinator 的 front 发布地址(tcp://<云可路由IP>:port),
+    边侧据此订阅 stats 对账并上行 FIRST_REQ 唤醒。空 = 无 coordinator
+    (dp=1 单云),边侧不建唤醒通道。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -150,6 +160,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     """诊断旁路载荷:云侧逐请求 accepted token ids(仅
     VLLM_ASCEND_LWD_EDGE_SKIP_SAMPLE=1 时填充),与 req_ids 按位对齐。
     空列表 = 未携带,边侧走原生 rank-replay(lm_head + top_id_ths)。"""
+    engine_index: int = 0
+    """来源云 engine(= dp_rank),wire_version>=3 起携带:POST_OUT 是
+    多 engine fan-in,边侧按它把本通告归到对应 engine 的 seqno 流与
+    路由账。缺省 0 = 单云旧版。"""
 
 
 # typing.Union 而非 PEP 604 `|`:msgspec 解码器的全版本支持路径

@@ -51,6 +51,9 @@ from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
 from vllm.v1.lwd_control.control_communication.lwd_control_subscriber import (
     LwdControlSubscriber,
 )
+from vllm.v1.lwd_control.control_communication.lwd_coord_client import (
+    LwdCoordClient,
+)
 from vllm.v1.lwd_control.control_communication.lwd_zmq_factory import (
     create_edge_zmq_channel,
 )
@@ -116,6 +119,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
         }
         # 实例数标记:泵线程 c2e 越界防御用(与屏障/通道的 N 同源)
         self._lwd_instance_count = config.instance_count
+        # 云 DP engine 数(D):控制面按 (instance, engine) 双维度定向
+        self._lwd_cloud_dp = (
+            vllm_config.parallel_config.lwd_config.cloud_dp_size
+        )
+        # per-engine 定向发布面:{engine_index: router channel / publisher}
+        self._edge_senders: dict[int, Any] = {}
+        # coordinator 客户端按 (instance, engine) 一一对应(FIRST_REQ/stats)
+        self._lwd_coord_clients: dict[tuple[int, int], LwdCoordClient] = {}
         # 批队列总深度(embed+unembed 合计在飞上限)与 EMBED 保留预算:
         # 总深度随云实例数 N 扩容(公式唯一实现见
         # vllm.config.lwd.lwd_edge_batch_queue_depth,N=1 退化为单实例
@@ -139,10 +150,10 @@ class LwdEdgeEngineCore(EngineCoreProc):
             self._lwd_embed_slots,
             self._lwd_instance_count,
         )
-        # HELLO 载荷按实例留存(router 泵线程收首个 HELLO 时写入,
+        # HELLO 载荷按 (instance, engine) 留存(泵线程收首个 HELLO 时写入,
         # 构造线程 _lwd_cross_check_hello 在集合屏障后消费;dict 单键
         # 赋值原子,重复 HELLO 幂等跳过)
-        self._lwd_peer_hellos: dict[int, LwdHelloNotify] = {}
+        self._lwd_peer_hellos: dict[tuple[int, int], LwdHelloNotify] = {}
         # 已派发待收割的批队列 (kind, payload, t_dispatch, future):
         # kind="unembed" payload=notify;kind="embed" payload=scheduler_output。
         # 派发不收割,队首 FIFO 收割——必须全局单队列:executor 的 FutureWrapper
@@ -154,10 +165,18 @@ class LwdEdgeEngineCore(EngineCoreProc):
         self._lwd_zmq_mode = "full_duplex"
         self._lwd_setup_zmq_router_dealer(config)
         # self._lwd_setup_zmq_publisher_subscriber(config)
-        self.scheduler.lwd_edge_publisher = self._edge_sender
+        self.scheduler.lwd_edge_publishers = self._edge_senders
+        # FIRST_REQ 唤醒钩子:仅有多云 engine coordinator 时接上
+        self.scheduler.lwd_first_req_hook = (
+            self._lwd_send_first_req if self._lwd_coord_clients else None
+        )
         logger.info(
-            "[Lwd] edge engine assembled: POST_OUT bind %s, PRE_OUT discovered",
+            "[Lwd] edge engine assembled: POST_OUT bind %s, "
+            "engines=%d, instances=%d, coord_clients=%d",
             config.lwd_post_out_bind_endpoint(),
+            self._lwd_cloud_dp,
+            self._lwd_instance_count,
+            len(self._lwd_coord_clients),
         )
 
     # ------------------------------------------------------------------ #
@@ -252,107 +271,137 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     self._lwd_drop_unexpected_frame(msg)
 
     def _lwd_setup_zmq_router_dealer(self, config: LwdConfig) -> None:
-        """full_duplex 模式装配:边 bind 单 ROUTER 端口服务 N 个云 DEALER,
-        收发同通道,无 PRE_OUT 延迟连接/retarget。业务层 HELLO 通告保留
-        (通道握手只证明 TCP 连通,业务层 HELLO 证明云全量初始化完成):
-        集合屏障收齐 N 个不同实例的 HELLO 才放行,超时文案列出已到/
-        缺失实例;通过后与通道层就绪 identity 交叉对账(HELLO 戳与
-        identity 不一致 = 云侧三处同源被破坏,立即 error)。"""
-        self._edge_receiver = create_edge_zmq_channel(
-            dp_rank=0,
-            pre_out_port=config.pre_out_port,
-            name="lwd-edge",
-            instance_count=config.instance_count,
-        )
-        self._edge_sender = self._edge_receiver
+        """full_duplex:每云 engine 一条 ROUTER 端口(pre_out_port+engine),
+        每条服务 N 个实例 DEALER。集合屏障收齐 N*D 个 (instance, engine)
+        HELLO 才放行;通过后与各通道 identity 集合交叉对账,再做逐 engine
+        调度三元组互校。"""
+        receivers: dict[int, Any] = {}
+        for eng in range(self._lwd_cloud_dp):
+            ch = create_edge_zmq_channel(
+                dp_rank=eng,
+                pre_out_port=config.pre_out_port,
+                name=f"lwd-edge-eng{eng}",
+                instance_count=config.instance_count,
+            )
+            receivers[eng] = ch
+            self._edge_senders[eng] = ch
+        self._edge_receivers = receivers
+        # 兼容旧的单通道引用(单 engine 时等价)
+        self._edge_receiver = receivers[0]
         hello_event = threading.Event()
-        ready_instances: set[int] = set()
-        self._lwd_hello_ready = ready_instances
+        ready: set[tuple[int, int]] = set()
+        self._lwd_hello_ready = ready
         pump = threading.Thread(
             target=self._lwd_pump_cloud_messages_router_dealer,
-            args=(hello_event, ready_instances, config.instance_count),
+            args=(hello_event, ready, config.instance_count),
             name="lwd-post-in",
             daemon=True,
         )
         pump.start()
+        expected = config.instance_count * self._lwd_cloud_dp
         if not hello_event.wait(config.hello_timeout_s):
             missing = sorted(
-                set(range(config.instance_count)) - ready_instances
+                {
+                    (i, e)
+                    for i in range(config.instance_count)
+                    for e in range(self._lwd_cloud_dp)
+                }
+                - ready
             )
             self._lwd_shutdown_planes()
             raise RuntimeError(
                 f"[Lwd] edge engine init failed (full_duplex): only "
-                f"{len(ready_instances)}/{config.instance_count} cloud "
-                f"instances ready via HELLO within "
-                f"{config.hello_timeout_s}s (ready="
-                f"{sorted(ready_instances)}, missing={missing}; check "
-                f"every cloud instance is up with a distinct "
-                f"--instance-parallel-start-rank in "
-                f"[0, {config.instance_count}))"
+                f"{len(ready)}/{expected} (instance, engine) HELLOs within "
+                f"{config.hello_timeout_s}s (missing={missing}); check every "
+                f"cloud instance is up with a distinct "
+                f"--instance-parallel-start-rank and all "
+                f"--cloud-dp-size engines are running"
             )
-        # 交叉对账:业务 HELLO 集合 vs 通道层就绪 identity 集合
-        wire_ready = self._edge_receiver.ready_instance_ids()
-        if wire_ready != ready_instances:
+        # 交叉对账:HELLO 实例集合 vs 各 engine 通道 identity 集合
+        wire_ready: set[int] = set()
+        for ch in receivers.values():
+            wire_ready |= ch.ready_instance_ids()
+        hello_instances = {iid for iid, _ in ready}
+        if wire_ready != hello_instances:
             logger.error(
                 "[Lwd] HELLO instance set %s != channel identity set %s: "
                 "a cloud instance stamps HELLO/c2e with an instance_id "
                 "different from its DEALER identity (routing will "
                 "misdeliver); check --instance-parallel-start-rank "
                 "consistency on that instance",
-                sorted(ready_instances),
+                sorted(hello_instances),
                 sorted(wire_ready),
             )
-        # 集合屏障收齐后做调度三元组互校(逐实例 vs 本地 + 实例间互检)
+        # 集合屏障收齐后做调度三元组互校(逐 (instance, engine) vs 本地)
         self._lwd_cross_check_hello()
 
     def _lwd_pump_cloud_messages_router_dealer(
         self,
         hello_event: threading.Event,
-        ready_instances: set[int],
+        ready: set[tuple[int, int]],
         instance_count: int,
     ) -> None:
-        """full_duplex/router_dealer 模式(_lwd_setup_zmq_router_dealer)
-        的 POST_OUT 泵线程:泵取通道层攒下的消息,按消息类型分发。
+        """轮询 D 条 ROUTER 通道,按 (instance, engine) 双维度收集 HELLO。
 
-        HELLO -> 按 instance_id 收集集合屏障,收齐 N 个不同实例才
-        放行(重复 HELLO 幂等,越界实例号 error 丢弃——说明该云实例
-        的 start-rank 配置在 [0,N) 之外)。
+        engine 由端口分离(HELLO.engine_index 必须与接收端口一致),
+        instance 由 DEALER identity/业务戳决定;重复 HELLO 幂等,越界即
+        error 丢弃。收齐 N*D 才放行。
         """
-        receiver = self._edge_receiver
-        while not receiver.closed:
-            for msg in receiver.recv_batch(
-                timeout_ms=LWD_POST_OUT_PUMP_TIMEOUT_MS
-            ):
-                if isinstance(msg, LwdHelloNotify):
-                    # 集合屏障(实例号取业务戳)
-                    iid = msg.instance_id
-                    if not 0 <= iid < instance_count:
-                        logger.error(
-                            "[Lwd] drop HELLO with out-of-range "
-                            "instance_id=%d (expect [0, %d)); this cloud "
-                            "has a misconfigured "
-                            "--instance-parallel-start-rank",
-                            iid,
-                            instance_count,
-                        )
-                        continue
-                    if iid not in ready_instances:
-                        ready_instances.add(iid)
-                        # 载荷按实例留存供构造线程互校(调度三元组,
-                        # 见 _lwd_cross_check_hello);重复 HELLO 幂等跳过
-                        self._lwd_peer_hellos[iid] = msg
+        receivers = self._edge_receivers
+        expected = instance_count * self._lwd_cloud_dp
+        while not any(ch.closed for ch in receivers.values()):
+            drained = False
+            for eng, receiver in receivers.items():
+                if receiver.closed:
+                    continue
+                for msg in receiver.recv_batch(timeout_ms=0):
+                    drained = True
+                    if isinstance(msg, LwdHelloNotify):
+                        iid = msg.instance_id
+                        if not 0 <= iid < instance_count:
+                            logger.error(
+                                "[Lwd] drop HELLO with out-of-range "
+                                "instance_id=%d (expect [0, %d)); this cloud "
+                                "has a misconfigured "
+                                "--instance-parallel-start-rank",
+                                iid,
+                                instance_count,
+                            )
+                            continue
+                        if msg.engine_index != eng:
+                            logger.error(
+                                "[Lwd] drop HELLO: engine_index=%d arrived "
+                                "on the ROUTER port of engine %d (cloud "
+                                "PRE_OUT port/engine config mismatch)",
+                                msg.engine_index,
+                                eng,
+                            )
+                            continue
+                        key = (iid, eng)
+                        if key in ready:
+                            continue
+                        ready.add(key)
+                        self._lwd_peer_hellos[key] = msg
+                        if msg.coord_stats_addr:
+                            self._lwd_coord_clients[key] = LwdCoordClient(
+                                msg.coord_stats_addr
+                            )
                         logger.info(
-                            "[Lwd] cloud instance %d ready via HELLO (%d/%d)",
+                            "[Lwd] cloud (inst=%d, engine=%d) ready via "
+                            "HELLO (%d/%d)",
                             iid,
-                            len(ready_instances),
-                            instance_count,
+                            eng,
+                            len(ready),
+                            expected,
                         )
-                        if len(ready_instances) >= instance_count:
+                        if len(ready) >= expected:
                             hello_event.set()
-                elif isinstance(msg, LwdC2eNotify):
-                    self._lwd_dispatch_c2e_notify(msg)
-                else:
-                    self._lwd_drop_unexpected_frame(msg)
+                    elif isinstance(msg, LwdC2eNotify):
+                        self._lwd_dispatch_c2e_notify(msg)
+                    else:
+                        self._lwd_drop_unexpected_frame(msg)
+            if not drained:
+                threading.Event().wait(0.01)
 
     def _lwd_dispatch_c2e_notify(self, msg: LwdC2eNotify) -> None:
         """两种 ZMQ 模式共用的 C2eNotify 分发(见泵线程 docstring)。"""
@@ -395,16 +444,30 @@ class LwdEdgeEngineCore(EngineCoreProc):
         logger.warning("[Lwd] drop unexpected POST_OUT frame %r", type(msg))
 
     def _lwd_shutdown_planes(self) -> None:
-        """两面关停(幂等):receiver 先关断输入,publisher 收尾。"""
-        receiver = getattr(self, "_edge_receiver", None)
-        if receiver is not None:
-            receiver.shutdown()
-        publisher = getattr(self, "_edge_sender", None)
-        if publisher is not None:
-            publisher.shutdown()
+        """关停全部通信面(幂等):各 engine ROUTER 通道 + coord 客户端。"""
+        receivers = getattr(self, "_edge_receivers", None)
+        if receivers:
+            for ch in receivers.values():
+                ch.shutdown()
+        else:
+            receiver = getattr(self, "_edge_receiver", None)
+            if receiver is not None:
+                receiver.shutdown()
+            publisher = getattr(self, "_edge_sender", None)
+            if publisher is not None and publisher is not receiver:
+                publisher.shutdown()
+        for client in getattr(self, "_lwd_coord_clients", {}).values():
+            client.shutdown()
+
+    def _lwd_send_first_req(self, instance_id: int, engine_index: int) -> None:
+        """FIRST_REQ 唤醒:按 (instance, engine) 找对应 coordinator 客户端。"""
+        client = self._lwd_coord_clients.get((instance_id, engine_index))
+        if client is None:
+            return
+        client.send_first_req(engine_index)
 
     def _lwd_cross_check_hello(self) -> None:
-        """HELLO 调度三元组互校(构造线程;push_pull 单云/集合屏障之后)。
+        """HELLO 调度三元组互校(构造线程;集合屏障之后)。
 
         max_num_batched_tokens/max_num_seqs 是边 cap 公式与云 preflight
         的同源输入(设计 §2.2/§5.2 的部署对齐前提),不一致即构造期
@@ -412,28 +475,40 @@ class LwdEdgeEngineCore(EngineCoreProc):
         prefill 被 decode 静默串行(真机实录:边 factor=1/云 factor=4
         时 chunk 8191 + decode 4 > 预算 8192,prefill 积压 280 步)。
 
-        多实例扩展:各云实例三元组先做实例间互检——边 cap 公式读的
-        是一份本地预算,异构实例下部分实例的 preflight 与边 cap 永久
-        错位,等于把单实例的静默串行 bug 换成多实例版本;云集群部署
-        本就要求同构,互检不一致即 fail-fast(spec 亦然:_lwd_
-        spec_factor 是全局单值,无按实例采纳的空间)。
+        多实例/多 engine 扩展:各 (instance, engine) 三元组先做全簇互检
+        ——边 cap 公式读的是一份本地预算,_lwd_spec_factor 也是全局单值,
+        异构会导致部分 engine 的 preflight 与边 cap 永久错位;云集群
+        部署本就要求同构,互检不一致即 fail-fast。
         num_speculative_tokens 与本地不一致时以对端为准采纳(边本地
         取不到合法来源)并复核活性下界。对端为旧版(三值全 0)时
         仅告警不拦截。"""
-        hellos: dict[int, LwdHelloNotify] = {}
+        hellos: dict[tuple[int, int], LwdHelloNotify] = dict(
+            getattr(self, "_lwd_peer_hellos", None) or {}
+        )
+        # push_pull 兼容路径仍用单条 _lwd_peer_hello
         peer = getattr(self, "_lwd_peer_hello", None)
-        if peer is not None:
-            hellos[0] = peer
-        hellos.update(getattr(self, "_lwd_peer_hellos", None) or {})
+        if peer is not None and not hellos:
+            hellos[(peer.instance_id, peer.engine_index)] = peer
         if not hellos:
             return
-        # mrope + 旧协议 fail-fast(wire_version=2 起 mrope positions 走控制面):
-        # wire_version<2 的云侧仍按数据面 aux 帧传 positions,而 msgspec 容忍
-        # 未知字段——协议不一致不会报错,只会让 positions 静默缺失。逐实例
-        # 校验,任一不满足即整体拒绝(部署要求两侧同版本)。
+        # 多 engine 要求 wire_version>=3(HELLO 携带 engine_index/
+        # coord_stats_addr),否则无法按身份建立端点表
+        if self._lwd_cloud_dp > 1:
+            stale = sorted(
+                key for key, h in hellos.items()
+                if h.wire_version < LWD_WIRE_VERSION
+            )
+            if stale:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] cloud (instance, engine) {stale} wire_version < "
+                    f"{LWD_WIRE_VERSION}: 多 DP 部署要求 HELLO 携带 "
+                    f"engine_index/coord_stats_addr,两侧必须同版本部署"
+                )
+        # mrope + 旧协议 fail-fast
         if self.vllm_config.model_config.uses_mrope:
             stale = sorted(
-                iid for iid, h in hellos.items()
+                key for key, h in hellos.items()
                 if h.wire_version < LWD_WIRE_VERSION
             )
             if stale:
@@ -441,49 +516,49 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 raise RuntimeError(
                     f"[LWD] edge/cloud wire protocol mismatch: model uses "
                     f"mrope but cloud HELLO wire_version<{LWD_WIRE_VERSION} "
-                    f"on instance(s) {stale}——云侧仍按数据面 aux 帧协议运行,"
-                    f"mrope positions 将静默缺失(msgspec 容忍未知字段,旧云"
-                    f"不会报错),两侧必须同版本部署"
+                    f"on (instance, engine) {stale}——云侧仍按数据面 aux 帧"
+                    f"协议运行,mrope positions 将静默缺失(msgspec 容忍未知"
+                    f"字段,旧云不会报错),两侧必须同版本部署"
                 )
         legacy = sorted(
-            iid for iid, h in hellos.items()
+            key for key, h in hellos.items()
             if h.max_num_batched_tokens == 0
         )
         if legacy:
             logger.warning(
-                "[Lwd] HELLO from instance(s) %s carries no scheduling "
-                "triple (legacy peer); edge/cloud config alignment "
-                "UNCHECKED for them",
+                "[Lwd] HELLO from (instance, engine) %s carries no "
+                "scheduling triple (legacy peer); edge/cloud config "
+                "alignment UNCHECKED for them",
                 legacy,
             )
         live = {
-            iid: h for iid, h in hellos.items()
+            key: h for key, h in hellos.items()
             if h.max_num_batched_tokens != 0
         }
         if not live:
             return
         triples = {
-            iid: (
+            key: (
                 h.max_num_batched_tokens,
                 h.max_num_seqs,
                 h.num_speculative_tokens,
             )
-            for iid, h in live.items()
+            for key, h in live.items()
         }
-        # 实例间互检(先于逐实例 vs 本地:异构即整簇拒绝)
-        ref_iid = min(triples)
+        # 全簇互检(先于逐项 vs 本地:异构即整簇拒绝)
+        ref_key = min(triples)
         divergent = sorted(
-            iid for iid, t in triples.items() if t != triples[ref_iid]
+            key for key, t in triples.items() if t != triples[ref_key]
         )
         if divergent:
             self._lwd_shutdown_planes()
             raise RuntimeError(
-                f"[LWD] cloud instances disagree on the scheduling "
+                f"[LWD] cloud (instance, engine) disagree on the scheduling "
                 f"triple (max_num_batched_tokens, max_num_seqs, "
-                f"num_speculative_tokens): inst {ref_iid}="
-                f"{triples[ref_iid]} vs "
-                f"{[(iid, triples[iid]) for iid in divergent]}; "
-                f"边 cap 公式读一份本地预算,异构实例的 preflight 将"
+                f"num_speculative_tokens): {ref_key}="
+                f"{triples[ref_key]} vs "
+                f"{[(key, triples[key]) for key in divergent]}; "
+                f"边 cap 公式读一份本地预算,异构 engine 的 preflight 将"
                 f"永久错位——云集群须同构拉起"
             )
         sched = self.vllm_config.scheduler_config

@@ -93,6 +93,11 @@ class DPCoordinator:
             local_only_eng = False
 
         front_publish_address = get_engine_client_zmq_addr(local_only, host=host)
+        if parallel_config.lwd_config.enable_lwd:
+            # LWD 边云:stats 订阅方在边侧(跨机),front 发布口强制 TCP
+            # 并绑全网卡;对边通告的可路由地址由云 engine 在 HELLO 里
+            # 以 pre_out_host 改写后携带。
+            front_publish_address = get_engine_client_zmq_addr(False, "0.0.0.0")
         back_publish_address = get_engine_client_zmq_addr(local_only_eng, host=host)
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host=host)
 

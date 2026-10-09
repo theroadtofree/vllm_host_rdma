@@ -111,10 +111,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         publisher: LwdControlPublisher | None = None,
         **kwargs,
     ) -> None:
-        """publisher 经构造注入(与调度器同生命周期)。"""
+        """publisher 由引擎在 HELLO 收齐后回填(per-engine 定向通道)。"""
         super().__init__(*args, **kwargs)
-        self.lwd_edge_publisher = publisher
-        self._lwd_seqno = 0
+        # per-engine 定向发布面:{engine_index: publisher};空 = HELLO 未
+        # 收齐(legacy 单云构造窗口),各发布点的空守卫维持原语义
+        self.lwd_edge_publishers: dict[int, LwdControlPublisher] = (
+            {0: publisher} if publisher is not None else {}
+        )
+        # FIRST_REQ 唤醒钩子(多云 DP 由引擎接线;单云恒 None,跳过)
+        self.lwd_first_req_hook = None
+        # 云 engine 数与请求路由表(req_id -> engine_index,announce 时
+        # 钉死,终生不变);单云时一切路由到 0,行为与改造前逐值一致
+        self._lwd_cloud_dp = (
+            self.vllm_config.parallel_config.lwd_config.cloud_dp_size
+        )
+        self._lwd_route: dict[str, int] = {}
+        # 轮转锚点:目标 engine 选择与路由并列打散共用
+        self._lwd_last_engine = -1
+        # seqno 流按 engine 独立(每实例桶各持一份):UP 通道的无空洞
+        # 配对契约是 per-(instance, engine) 的
+        self._lwd_seqno: list[int] = [0] * self._lwd_cloud_dp
         # 前缀缓存:manager 级关命中,配置级保留使能。两级拆分的原因:
         # - 必须关命中:命中会跳过 token 排程,首条 RangeNotify 的
         #   offset != 0,云侧按 offset==0 识别首块的约定失效;且被
@@ -242,6 +258,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for name, value in bucket0.items():
                 if name in _LWD_INSTANCE_QUEUE_ATTRS:
                     bucket[name] = create_request_queue(self.policy)
+                elif name == "_lwd_seqno":
+                    # seqno 空间按 (instance, engine) 独立
+                    bucket[name] = [0] * self._lwd_cloud_dp
                 else:
                     bucket[name] = _fresh_instance_value(value)
             buckets.append(bucket)
@@ -366,10 +385,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     "pending_chunks=%d",
                     idx, pending_chunks,
                 )
-        return self._lwd_schedule_batch()
+        engine = self._lwd_pick_target_engine()
+        if engine is None:
+            # 无 prefill 活可组:仍要让基类把本实例的 finished_req_ids 排空
+            if self.finished_req_ids:
+                return self._lwd_schedule_batch(0)
+            return SchedulerOutput.make_empty()
+        return self._lwd_schedule_batch(engine)
 
     def _lwd_pick_prefill_batch(
         self,
+        engine: int = 0,
     ) -> tuple[list[str], dict[str, int], int]:
         """选下一步 embed 批:续传优先 + FCFS 前缀组批,按 chunk 单元切块。
 
@@ -400,7 +426,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 不做核验——两侧同配 prefill_first/decode_first 时逐字节
         # 复现旧行为
         if not self._lwd_mixed:
-            candidates = list(self.skipped_waiting) + list(self.waiting)
+            candidates = [
+                c
+                for c in list(self.skipped_waiting) + list(self.waiting)
+                if self._lwd_route.get(c.request_id, 0) == engine
+            ]
             picked = [candidates[0].request_id] if candidates else []
             return picked, {}, self.max_num_scheduled_tokens
         # cap 语义:批 Σchunk ≤ 预算 − 在途数 × spec 系数(云混排步里
@@ -422,8 +452,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
         )
         single_prefill = False
-        # 1) 续传优先(先收尾再开新)
+        # 1) 续传优先(先收尾再开新);只续本 engine 的传
         for request in self.running:
+            if self._lwd_route.get(request.request_id, 0) != engine:
+                continue
             if single_prefill and picked:
                 break
             remaining = (
@@ -458,7 +490,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 压到 C 以下会让大 prompt 永不可开新、流水线全程串行(真机
         # 已现:decode 阶段云侧只剩 1-2 个请求在跑)
         new_count = 0
-        candidates = list(self.skipped_waiting) + list(self.waiting)
+        candidates = [
+            c
+            for c in list(self.skipped_waiting) + list(self.waiting)
+            if self._lwd_route.get(c.request_id, 0) == engine
+        ]
         for request in candidates:
             if single_prefill and picked:
                 break
@@ -488,7 +524,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         return picked, expected, cap
 
-    def _lwd_schedule_batch(self) -> SchedulerOutput:
+    def _lwd_schedule_batch(self, engine: int = 0) -> SchedulerOutput:
         """chunk 组批:picker 选批,预算钳制后经基类可见集机制调度 +
         逐 chunk 核验。
 
@@ -502,11 +538,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         picker 的 chunk 划分。语义注记:与旧手写容器交换不同,本步被
         抢占的请求回 waiting 尾部、被跳过的回 skipped 队首,均取基类
         统一语义,不再做队首回插。"""
-        req_ids, expected, cap = self._lwd_pick_prefill_batch()
+        req_ids, expected, cap = self._lwd_pick_prefill_batch(engine)
         if req_ids:
             logger.info(
-                "[Lwd][edge-sched] pick batch reqs=%s tokens=%d cap=%d",
-                req_ids, sum(expected.values()), cap,
+                "[Lwd][edge-sched] pick batch engine=%d reqs=%s tokens=%d cap=%d",
+                engine, req_ids, sum(expected.values()), cap,
             )
         if req_ids and cap < self.max_num_scheduled_tokens:
             saved_budget = self.max_num_scheduled_tokens
@@ -578,8 +614,71 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for req in self.running
         )
 
+    def _lwd_route_request(self, request_id: str) -> int:
+        """选目标云 engine 并钉死(请求亲和:KV 与调度状态只在目标
+        engine 内,终生不变,所有 chunk/abort/结果回程都查路由表)。
+
+        数据源 = 当前绑定实例的本地台账(边是唯一流量源,台账即精确
+        负载):prefill 中(waiting/skipped/running)权重 4 + decode 中
+        (awaiting)权重 1,取最低分;并列时自上次服务位置轮转。权重与
+        原生 DPLBAsyncMPClient 的 score = waiting*4 + running 同源。"""
+        M = self._lwd_cloud_dp
+        if M == 1:
+            self._lwd_route[request_id] = 0
+            return 0
+        prefill = [0] * M
+        decode = [0] * M
+        for req in (
+            list(self.waiting) + list(self.skipped_waiting) + list(self.running)
+        ):
+            eng = self._lwd_route.get(req.request_id)
+            if eng is not None:
+                prefill[eng] += 1
+        for rid in self._lwd_awaiting:
+            eng = self._lwd_route.get(rid)
+            if eng is not None:
+                decode[eng] += 1
+        best, best_score = 0, None
+        for k in range(M):
+            eng = (self._lwd_last_engine + 1 + k) % M
+            score = prefill[eng] * 4 + decode[eng]
+            if best_score is None or score < best_score:
+                best, best_score = eng, score
+        self._lwd_last_engine = best
+        self._lwd_route[request_id] = best
+        logger.info(
+            "[Lwd][edge-route] req=%s -> engine %d (prefill=%s decode=%s)",
+            request_id, best, prefill, decode,
+        )
+        return best
+
+    def _lwd_pick_target_engine(self) -> int | None:
+        """选本次 schedule() 的目标 engine:只在当前实例里有活的 engine
+        中挑(续传与开新都算活),多个有活则自上次服务位置轮转。批的
+        engine 单一性由 picker 过滤保证。"""
+        M = self._lwd_cloud_dp
+        if M == 1:
+            return 0
+        route = self._lwd_route
+        busy = {
+            route.get(r.request_id, 0)
+            for r in (
+                list(self.running)
+                + list(self.skipped_waiting)
+                + list(self.waiting)
+            )
+        }
+        if not busy:
+            return None
+        for k in range(M):
+            eng = (self._lwd_last_engine + 1 + k) % M
+            if eng in busy:
+                self._lwd_last_engine = eng
+                return eng
+        return None
+
     def lwd_edge_add_request(self, request: Request) -> None:
-        """请求入口:边界校验 -> 云预告 -> 本地入队。
+        """请求入口:边界校验 -> 实例绑定 -> 云预告 -> 本地入队。
 
         预告先于本地登记:云侧视图领先本地工作,云只能准备不能提前
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
@@ -593,12 +692,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"[0, {self._instance_count})"
             )
         self._req_id_to_instance[request.request_id] = idx
+        with self._instance_binding(idx):
+            engine = self._lwd_route_request(request.request_id)
         self.lwd_edge_notify_request(
             request_id=request.request_id,
             num_prompt_tokens=len(request.prompt_token_ids),
             sampling_params=request.sampling_params,
             block_hashes=list(request.block_hashes),
+            engine=engine,
         )
+        # wave 唤醒:每请求一条 FIRST_REQ(上行目标 (instance, engine) 的
+        # coordinator);单云无 coordinator,钩子为 None
+        if self.lwd_first_req_hook is not None:
+            self.lwd_first_req_hook(idx, engine)
         with self._instance_binding(idx):
             super().add_request(request)
             if request.abort_immediately:
@@ -671,13 +777,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             (time.monotonic() - _t_mrope) * 1000,
         )
 
-    def _lwd_publish(self, message, idx: int) -> bool:
-        """控制面发布出口(唯一模式分流派发点):多实例(必为 router 模式)
-        按实例定向路由;单实例 push_pull/单实例 router 均用原单参调用
-        (instance 0 缺省)。push_pull 不支持多实例(装配期 fail-fast)。"""
+    def _lwd_publish(self, message, idx: int, engine: int = 0) -> bool:
+        """控制面发布出口:按 (instance, engine) 定向路由。
+
+        多实例经 instance_id 选云 DEALER;多 engine 选对应的 ROUTER
+        通道(PRE_OUT 端口按 engine 分离)。目标 engine 缺失返回 False
+        (调用方按发布失败处理)。"""
+        publisher = self.lwd_edge_publishers.get(engine)
+        if publisher is None:
+            return False
         if self._instance_count > 1:
-            return self.lwd_edge_publisher.publish(message, instance_id=idx)
-        return self.lwd_edge_publisher.publish(message)
+            return publisher.publish(message, instance_id=idx)
+        return publisher.publish(message)
 
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 批发一条批量 LwdRangeNotify(seqno 先行)。
@@ -700,6 +811,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 实例戳 = 本步绑定实例:_lwd_seqno/requests 都是当前桶的,
         # 批内条目 pin 别的实例即路由/seqno 空间发散,fail-fast
         idx = self._cur_instance
+        # 批必须 engine 单一(picker 已按路由过滤,此处核验)
+        engines_in_batch = {
+            self._lwd_route.get(rid, 0) for rid in scheduled
+        }
+        if len(engines_in_batch) > 1:
+            raise RuntimeError(
+                f"[Lwd][edge-notify] batch spans multiple cloud engines "
+                f"{engines_in_batch} (picker engine filter broken): "
+                f"reqs={list(scheduled)}"
+            )
+        engine = next(iter(engines_in_batch), 0)
         items: list[LwdRangeItem] = []
         req_ids: list[str] = []
         token_slices: list[list[int]] = []
@@ -749,7 +871,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             has_mrope.append(req_has_mrope)
         if not items:
             return True
-        seqno = self._lwd_seqno
+        seqno = self._lwd_seqno[engine]
         first = items[0]
         # 顶层单请求字段 = 首条目:旧版云侧(不读 items)仍可消费单请求批
         if not self._lwd_publish(
@@ -761,17 +883,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 items=items,
             ),
             idx,
+            engine,
         ):
             return False
-        self._lwd_seqno = seqno + 1
+        self._lwd_seqno[engine] = seqno + 1
         # chunk 粒度 pending 跟踪(本实例桶):批内全部请求收到首
         # token 即该 seqno 已消费,pending 闸门据此计数
-        self._lwd_batch_requests[seqno] = list(req_ids)
+        self._lwd_batch_requests[(engine, seqno)] = list(req_ids)
         logger.info(
-            "[Lwd][edge-notify] batch reqs=%d inst=%d tokens=%d seqno=%d "
-            "mrope=%d",
-            len(items), idx, sum(item.num_tokens for item in items), seqno,
-            sum(has_mrope),
+            "[Lwd][edge-notify] batch engine=%d reqs=%d inst=%d tokens=%d "
+            "seqno=%d mrope=%d",
+            engine, len(items), idx, sum(item.num_tokens for item in items),
+            seqno, sum(has_mrope),
         )
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
         # 配对键(与云侧 RangeNotify 登记同值),本批一个号一次 UP
@@ -789,6 +912,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 token_ids=token_slices,
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
+                engine_index=engine,
             ),
             instance_id=idx,
         )
@@ -800,6 +924,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         num_prompt_tokens: int,
         sampling_params: SamplingParams | None = None,
         block_hashes: list[bytes] | None = None,
+        engine: int = 0,
     ) -> None:
         """发 LwdRequestNotify(请求元数据预告)。
 
@@ -816,8 +941,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         调用链回前端 error 通道,用户立即得到失败;不做无限阻塞
         重试(发布点在引擎主线程,云宕机会把整个引擎卡死在 add)。
         此时请求未入队、云侧零残留,无需补发 abort。"""
-        publisher = self.lwd_edge_publisher
-        if publisher is None:
+        if engine not in self.lwd_edge_publishers:
+            if self.lwd_edge_publishers:
+                raise RuntimeError(
+                    f"[LWD] no PRE_OUT publisher for routed cloud engine "
+                    f"{engine} (request {request_id}); known engines: "
+                    f"{sorted(self.lwd_edge_publishers)}"
+                )
+            # HELLO 未收齐的构造窗口(legacy 单云路径同款静默)
             return
         sp = sampling_params
         # 实例戳:调用点(lwd_edge_add_request)已先登记路由表
@@ -845,11 +976,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             eos_token_id=sp.eos_token_id if sp is not None else None,
         )
         for attempt in range(_LWD_ADD_RETRY_STEPS):
-            if self._lwd_publish(message, idx):
+            if self._lwd_publish(message, idx, engine):
                 logger.info(
                     "[Lwd][edge-notify] request meta announced: req=%s "
-                    "inst=%d prompt=%d",
-                    request_id, idx, num_prompt_tokens,
+                    "inst=%d engine=%d prompt=%d",
+                    request_id, idx, engine, num_prompt_tokens,
                 )
                 return
             time.sleep(_LWD_ADD_RETRY_INTERVAL_S * (attempt + 1))
@@ -864,32 +995,34 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         awaiting 请求已不在调度器视野(嵌入完结时清出),原生
         finish_requests 触不到它,须在此显式摘除,防迟到云结果被误认领。"""
-        publisher = self.lwd_edge_publisher
         for request_id in request_ids:
             idx = self._req_id_to_instance.get(request_id, 0)
             with self._instance_binding(idx):
                 self._lwd_awaiting.pop(request_id, None)
                 self._lwd_first_token_seen.discard(request_id)
                 self._lwd_mrope_positions_dict.pop(request_id, None)
+                engine = self._lwd_route.pop(request_id, None)
                 # pending 跟踪摘除该请求;摘空或批内全部已见首 token
                 # 即整条移除(本实例桶)
                 seen = self._lwd_first_token_seen
-                for seqno, rids in list(self._lwd_batch_requests.items()):
+                for key, rids in list(self._lwd_batch_requests.items()):
                     rids = [rid for rid in rids if rid != request_id]
                     if not rids or all(rid in seen for rid in rids):
-                        del self._lwd_batch_requests[seqno]
+                        del self._lwd_batch_requests[key]
                     else:
-                        self._lwd_batch_requests[seqno] = rids
-            if publisher is None:
+                        self._lwd_batch_requests[key] = rids
+            if engine is None:
                 continue
-            if not self._lwd_publish(LwdAbortNotify(request_id=request_id), idx):
+            if not self._lwd_publish(
+                LwdAbortNotify(request_id=request_id), idx, engine
+            ):
                 logger.warning(
                     "[Lwd] drop abort signal for %s: publish queue full", request_id
                 )
             else:
                 logger.info(
-                    "[Lwd][edge-notify] AbortNotify req=%s inst=%d",
-                    request_id, idx,
+                    "[Lwd][edge-notify] AbortNotify req=%s inst=%d engine=%d",
+                    request_id, idx, engine,
                 )
 
     def lwd_edge_update_progress(self, executed: dict[str, int]) -> None:
@@ -955,6 +1088,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if finished:
                 del self._lwd_awaiting[request_id]
                 self._lwd_first_token_seen.discard(request_id)
+                self._lwd_route.pop(request_id, None)
                 # 死锁根因修复:完结请求必须像 abort 一样从批台账摘除。批清除
                 # 判据 all(rid in seen) 要求 seen 只增不减,而上一行的 discard
                 # 让完结请求永久缺席——同批"短请求先完结、长请求首 token 后到"
@@ -1082,6 +1216,8 @@ def lwd_build_unembed_batch(notify: LwdC2eNotify) -> SchedulerOutput:
             out_token_idxs=[],
             top_id_ths=list(notify.top_id_ths),
             token_ids=[list(t) for t in notify.token_ids],
+            # 来源云 engine:多 DP 下 worker 据此选 DOWN 通道
+            engine_index=notify.engine_index,
         ),
         # 来源实例戳:worker 据此选数据面 DOWN wire(down_seqno 配对域
         # = 单实例 wire,实例号是选 wire 的唯一依据)
