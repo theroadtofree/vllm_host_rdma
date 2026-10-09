@@ -145,6 +145,24 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             self._lwd_note_finished(rid)
         return super().finish_requests(request_ids, finished_status)
 
+    def _free_request(self, request, delay_free_blocks: bool = False):
+        """完结台账登记补挂**释放链唯一收口点**。
+
+        finish_requests 覆写只覆盖 abort/error 路径;正常终结
+        (update_from_output 里 check_stop 命中)直接调本方法、不经
+        finish_requests——漏登会让该请求事后到达的重复预告被 classify
+        误判 unknown(ADD 未落地)而整批 defer,请求永不落地即队首
+        永久堵塞。与 phase 臂同型(那边只挂本方法);abort 路径两处
+        登记幂等(set 语义,重复写无害)。登记失败不阻断释放。"""
+        try:
+            self._lwd_note_finished(request.request_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Lwd][cloud-sched] note-finished failed (non-fatal)",
+                exc_info=True,
+            )
+        return super()._free_request(request, delay_free_blocks)
+
     _LWD_SPEC_LOG_INTERVAL_S = 10.0
 
     def _lwd_observe_spec_acceptance(

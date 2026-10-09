@@ -93,6 +93,10 @@ _LWD_C2E_PENDING_FAIL_AFTER_S = 30.0
 # 云侧复用 consume 阻塞拍:空批时短暂等待,避免忙转
 _LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
 
+# seqno 登记台账容量:条目在 abort 时保留(重连补投抑制依据),自然
+# 完结由 LwdFinishNotify 清理;超容量逐出最旧兜底长尾残留
+_LWD_SEQNO_REGISTRY_CAP = 4096
+
 
 class LwdCloudEngineCore(EngineCoreProc):
     """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
@@ -545,9 +549,13 @@ class LwdCloudEngineCore(EngineCoreProc):
             msg = msgspec.structs.replace(
                 msg, request_id=wrap_req_id(edge_id, msg.request_id)
             )
-            # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。幂等去重
-            # 按"单调性"(seqno 不大于该请求已登记尾号即重复,边侧队满
-            # 重试天然产生重复预告,重试复用同一号不产生新登记)。
+            # 范围预告:登记 UP 链 seqno(数据面配对键,§9.12)。重复判定
+            # 按"单调性"(seqno 不大于该请求已登记尾号即重复:边侧预告
+            # 经滞留保序队列只实际发布一次——发布成功才进位 seqno,
+            # 重复只可能来自 router 断连重连的滞留补投;补投是纯控制面
+            # 行为,不随行新张量)。登记台账在请求 abort 时**不**清理
+            # (留作补投抑制依据,见 AbortNotify 分支),自然完结由
+            # LwdFinishNotify 清理,另以有界 LRU 兜底防长尾残留。
             # mixed 组批:items 逐请求登记同一批号;空 items = 旧版单请求
             if msg.items:
                 # D2 多边:items 内是边侧原始 id,逐条命名空间包装
@@ -564,20 +572,42 @@ class LwdCloudEngineCore(EngineCoreProc):
             items = msg.items or [
                 LwdRangeItem(msg.request_id, msg.offset, msg.num_tokens)
             ]
+            registry = self._lwd_seqno_registry
+            all_seen = True
             for item in items:
-                seqnos = self._lwd_seqno_registry.setdefault(
-                    item.request_id, []
-                )
+                if (
+                    item.request_id not in registry
+                    and len(registry) >= _LWD_SEQNO_REGISTRY_CAP
+                ):
+                    # 有界逐出最旧(py dict 保插入序)。逐出后极端迟到的
+                    # 补投会重新登记入队,由调度臂 stale/幽灵分支兜底,
+                    # 不致错(但二义窗口重新打开,容量取大放低该概率)
+                    registry.pop(next(iter(registry)), None)
+                seqnos = registry.setdefault(item.request_id, [])
                 if not seqnos or msg.seqno > seqnos[-1]:
                     seqnos.append(msg.seqno)
+                    all_seen = False
+            if all_seen:
+                # 重连补投的重复预告:**不入队**。同一 seqno 的预告已被
+                # 登记过 = 原条目已入队或已消费,其配对张量只随首次发布
+                # 流转;补投不带新张量。若放行入队且请求恰在幽灵窗口
+                # (abort 已标记幽灵、原条目尚未消费),副本会被按幽灵再
+                # 收一次——多收的 recv 永远等不到对端 isend,HCCL 通道
+                # 楔死。消费端无法区分原条目与副本(同 seqno 同载荷),
+                # 入口抑制是唯一无二义的拦截点。
+                logger.debug(
+                    "[Lwd][cloud-ctrl] duplicate RangeNotify suppressed "
+                    "req=%s seqno=%s (reconnect replay, no tensor follows)",
+                    msg.request_id, msg.seqno,
+                )
+                return
             logger.info(
                 "[Lwd][cloud-ctrl] RangeNotify reqs=%d edge=%d num=%s seqno=%s",
                 len(items), edge_id, sum(item.num_tokens for item in items),
                 msg.seqno,
             )
-            # 每条预告都整条入队(重复预告即重复点名,剔除-调度-拼回幂等,
-            # 无副作用;PRE_OUT 只 append,调度主线程单独 popleft,deque
-            # 单操作原子;预告自带 seqno,出批时作 UP 链配对号)
+            # PRE_OUT 只 append,调度主线程单独 popleft,deque 单操作原子;
+            # 预告自带 seqno,出批时作 UP 链配对号
             self.scheduler.prefill_notify_queue.append(msg)
             return
         if isinstance(msg, LwdAbortNotify):
@@ -585,12 +615,40 @@ class LwdCloudEngineCore(EngineCoreProc):
                 msg, request_id=wrap_req_id(edge_id, msg.request_id)
             )
             logger.info("[Lwd][cloud-ctrl] AbortNotify req=%s", msg.request_id)
+            # 台账清理(幂等 no-op,重复/迟到 abort 也照做)。注意
+            # **_lwd_seqno_registry 故意不在此清理**:它是重连补投重复
+            # 预告的抑制依据(见 RangeNotify 分支)——abort 后幽灵条目
+            # 尚未消费完之前,补投副本必须能被识别为重复;残留由有界
+            # LRU 兜底。
             self._lwd_gate_pending.pop(msg.request_id, None)
             self._lwd_edge_chains.pop(msg.request_id, None)
-            self._lwd_seqno_registry.pop(msg.request_id, None)
-            # abort 清扫:摘除通知队列里该请求的条目——mixed 调度对
-            # "ADD 未落地"的预告是留队首等落地, aborted 请求永不落地,
-            # 不清扫会把队首永久堵住(条目掏空则整条移除)
+            # 重复 abort 早退:首次 abort 的 purge + 双队列 ABORT 已覆盖
+            # 当时全部在队预告(预告与 abort 同通道 FIFO,先于 abort 发布
+            # 的预告必先入队);此后到达的该请求预告只可能是边侧 notify-only
+            # 重试(复用 seqno、不随行新张量),由调度臂的 stale 分支兜住。
+            # 跳过此处重复的全队列 purge 扫描与二次 ABORT 投递(原生
+            # finish_requests 对未知 id 幂等,重复投递无害但纯属浪费)。
+            # race 良性:_lwd_recent_finished 由调度线程在 _free_request
+            # 里写入——首个 ABORT 尚未被调度线程处理时本检查不命中,走完整
+            # 路径由原生幂等兜底,两个方向都收敛。请求若从未过门(只在
+            # 门池)则 _free_request 不曾执行、本检查永不命中,重复 abort
+            # 走完整路径,pop 均为 no-op,同样正确。
+            recent_finished = getattr(
+                self.scheduler, "_lwd_recent_finished", None
+            )
+            if recent_finished is not None and msg.request_id in recent_finished:
+                logger.debug(
+                    "[Lwd][cloud-ctrl] duplicate AbortNotify req=%s ignored "
+                    "(already finished)",
+                    msg.request_id,
+                )
+                return
+            # abort 清扫:把 prefill_notify_queue 里该请求的条目**标记为
+            # 幽灵**(不摘除)——预告发布即配对一次 UP isend,张量已在路上,
+            # 摘除会让云侧 recv numel 与边侧 isend 不等(HCCL 通道楔死)。
+            # 消费时照收不注入,详见 _lwd_purge_prefill_notify。
+            # mixed 调度对"ADD 未落地"的预告是留队首等落地, aborted 请求
+            # 永不落地,不清扫会把队首永久堵住。
             self._lwd_purge_prefill_notify(msg.request_id)
             # 双队列与原生 ABORT 同款:eager 处理 + 保持 input_queue 次序
             self.aborts_queue.put_nowait([msg.request_id])
@@ -614,6 +672,10 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             # 收尾后生成段链台账即可释放(后续块不再需要登记)
             self._lwd_edge_chains.pop(msg.request_id, None)
+            # seqno 登记台账同步清理:自然完结后不会再有该请求的新预告;
+            # 完结后的重连补投若到达,重新登记入队后由调度臂 stale 分支
+            # 丢弃(_lwd_recent_finished 命中),不误收不堵队
+            self._lwd_seqno_registry.pop(msg.request_id, None)
             return
         if isinstance(msg, LwdGenChainNotify):
             # 生成段哈希链增量上报(全量替换)。存台账供两处同源消费:

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
@@ -52,11 +52,45 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # prefill 通知队列:边侧范围预告(RangeNotify)逐条入队,每步取
         # 队首点名其 request_id;预告自带 seqno 即本步 UP 链配对号
         self.prefill_notify_queue: deque[LwdRangeNotify] = deque()
+        # 已完结请求 LRU 台账(队首清扫用):区分「ADD 尚未落地」(unknown,
+        # 留队首等下一拍)与「已完结释放」(stale,迟到/重复预告,整条丢弃
+        # 防堵队首)。登记点挂在 _free_request(释放链唯一收口——正常终结
+        # check_stop 不经 finish_requests,挂后者会漏登记),与基类
+        # lwd_finished_records 快照同一挂点论证。有界 LRU,超容量逐出最旧
+        # (逐出后极端迟到的预告退化为 unknown,只会留队首等一拍——与
+        # mixed 臂既有残余风险口径一致,4096 容量下工程不可达)。
+        # 与 LwdCloudMixedScheduler._lwd_recent_finished 同型;不上提
+        # LwdBaseScheduler——该基类同时为边侧 LwdEdgeScheduler 所继承,
+        # 「迟到预告」是纯云侧概念,不污染公共基类。
+        self._lwd_recent_finished: OrderedDict[str, None] = OrderedDict()
         logger.info(
             "[Lwd] cloud phase scheduler: single-request prefill batches "
             "enforced (edge/cloud chunk stream stays per-request contiguous)"
         )
 
+    _LWD_RECENT_FINISHED_CAP = 4096
+
+    def _lwd_note_finished(self, request_id: str) -> None:
+        """登记请求完结(LRU 有界):供队首清扫区分迟到预告与未落地。"""
+        self._lwd_recent_finished[request_id] = None
+        if len(self._lwd_recent_finished) > self._LWD_RECENT_FINISHED_CAP:
+            self._lwd_recent_finished.popitem(last=False)
+
+    def _free_request(self, request, delay_free_blocks: bool = False):
+        """完结台账登记挂**释放链唯一收口点**(与基类 lwd_finished_records
+        快照同一论证):abort/error 走 finish_requests → 本方法,正常终结
+        (update_from_output 里 check_stop 命中)直接调本方法——两条终结
+        路径都经此登记,迟到/重试预告的 stale 判定对两类完结都生效。
+        登记失败不阻断释放(台账只是队首清扫的判据,丢一条退化为留队首
+        等一拍,不致错)。"""
+        try:
+            self._lwd_note_finished(request.request_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[Lwd][cloud-sched] note-finished failed (non-fatal)",
+                exc_info=True,
+            )
+        return super()._free_request(request, delay_free_blocks)
 
     def _lwd_capped_cache_tokens(self, request) -> int:
         """生成段块登记窗口:封顶到「边侧 HMAC 链已覆盖」的 token 数。
@@ -185,50 +219,69 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         waiting/skipped 来源走原生准入);没有则空集进窗口,等价空步,
         三队列原样保留。"""
         q = self.prefill_notify_queue
+        # 队首清扫循环:stale 条目(请求已完结释放后到达的迟到/重复预告)
+        # 整条丢弃后继续看新队首;幽灵/正常/未落地三分支各有确定出口。
+        while q:
+            # peek 而非 popleft:队首请求可能尚未准入(RequestNotify 走
+            # input_queue ADD,RangeNotify 直接进本队列,两者有时序 race)。
+            # 直接 pop+丢弃会丢掉该 chunk,造成 UP seqno 空洞 → 数据面 recv
+            # 端按序 hold → 云侧 prefill 卡死、decode 停摆(边侧空闲、云侧
+            # 空转的根因)。请求未准入时本步空排,等下一轮 ADD 处理后再消费。
+            notify = q[0]
+            if notify.request_id in self.lwd_ghost_req_ids:
+                # 幽灵条目(请求已 abort 但 UP 张量已在路上):照收不注入,
+                # 保 HCCL numel 配对;本条预告消费掉,请求不调度。
+                q.popleft()
+                logger.info(
+                    "[Lwd][cloud-sched] drain ghost prefill notify req=%s "
+                    "seqno=%s num=%s (aborted in-flight chunk)",
+                    notify.request_id, notify.seqno, notify.num_tokens,
+                )
+                out = self._lwd_schedule_for_visible_reqs([])
+                edge_id, _ = parse_edge_id(notify.request_id)
+                _item0 = notify.items[0] if notify.items else None
+                out.lwd_batch = LwdBatch(
+                    batch_type=LwdBatchType.LWD_EMBED,
+                    seqno=notify.seqno,
+                    batch_meta=LwdEmbedBatch(
+                        req_ids=[notify.request_id],
+                        token_ids=[[0] * notify.num_tokens],
+                        edge_id=edge_id,
+                        prompt_offsets=[_item0.offset if _item0 else notify.offset],
+                        has_mrope=[
+                            _item0.has_mrope if _item0 else notify.has_mrope
+                        ],
+                        ghost_req_ids=[notify.request_id],
+                    ),
+                )
+                # 台账摘除:仅当队列中再无该请求的其他待消费预告(同一
+                # 请求的后续 chunk 预告仍需按幽灵照收)
+                if not any(
+                    n.request_id == notify.request_id for n in self.prefill_notify_queue
+                ):
+                    self.lwd_ghost_req_ids.discard(notify.request_id)
+                return out
+            if notify.request_id not in self.requests:
+                if notify.request_id not in self._lwd_recent_finished:
+                    # ADD 未落地(race):留队首等下一拍,原语义不变
+                    return self._lwd_schedule_for_visible_reqs([])
+                # stale:请求已完结释放后到达的迟到/重复预告(边侧队满
+                # 重试为 notify-only:复用同 seqno、不随行新张量,其配对
+                # 张量已在首次消费时收走),整条丢弃是 numel 中性的;
+                # 不丢弃则该请求永不落地,队首被永久堵住(后续所有边的
+                # 预告饿死)。与 mixed 臂 classify 的 stale 分支同语义。
+                q.popleft()
+                logger.warning(
+                    "[Lwd][cloud-sched] drop stale prefill notify req=%s "
+                    "seqno=%s num=%s (request already finished and released)",
+                    notify.request_id, notify.seqno, notify.num_tokens,
+                )
+                continue
+            break
         if not q:
+            # 队首清扫把队列掏空(本步无有效预告):空步,三队列原样保留
             return self._lwd_schedule_for_visible_reqs([])
-        # peek 而非 popleft:队首请求可能尚未准入(RequestNotify 走
-        # input_queue ADD,RangeNotify 直接进本队列,两者有时序 race)。
-        # 直接 pop+丢弃会丢掉该 chunk,造成 UP seqno 空洞 → 数据面 recv
-        # 端按序 hold → 云侧 prefill 卡死、decode 停摆(边侧空闲、云侧
-        # 空转的根因)。请求未准入时本步空排,等下一轮 ADD 处理后再消费。
-        notify = q[0]
-        if notify.request_id in self.lwd_ghost_req_ids:
-            # 幽灵条目(请求已 abort 但 UP 张量已在路上):照收不注入,
-            # 保 HCCL numel 配对;本条预告消费掉,请求不调度。
-            q.popleft()
-            logger.info(
-                "[Lwd][cloud-sched] drain ghost prefill notify req=%s "
-                "seqno=%s num=%s (aborted in-flight chunk)",
-                notify.request_id, notify.seqno, notify.num_tokens,
-            )
-            out = self._lwd_schedule_for_visible_reqs([])
-            edge_id, _ = parse_edge_id(notify.request_id)
-            _item0 = notify.items[0] if notify.items else None
-            out.lwd_batch = LwdBatch(
-                batch_type=LwdBatchType.LWD_EMBED,
-                seqno=notify.seqno,
-                batch_meta=LwdEmbedBatch(
-                    req_ids=[notify.request_id],
-                    token_ids=[[0] * notify.num_tokens],
-                    edge_id=edge_id,
-                    prompt_offsets=[_item0.offset if _item0 else notify.offset],
-                    has_mrope=[
-                        _item0.has_mrope if _item0 else notify.has_mrope
-                    ],
-                    ghost_req_ids=[notify.request_id],
-                ),
-            )
-            # 台账摘除:仅当队列中再无该请求的其他待消费预告(同一
-            # 请求的后续 chunk 预告仍需按幽灵照收)
-            if not any(
-                n.request_id == notify.request_id for n in self.prefill_notify_queue
-            ):
-                self.lwd_ghost_req_ids.discard(notify.request_id)
-            return out
-        if notify.request_id not in self.requests:
-            return self._lwd_schedule_for_visible_reqs([])
-        q.popleft()
+        notify = q.popleft()
         logger.info(
             "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
             notify.request_id, notify.seqno, notify.num_tokens,
