@@ -1721,7 +1721,14 @@ def init_distributed_environment(
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
-        if parallel_config.data_parallel_size > 1:
+        if (
+            parallel_config.data_parallel_size > 1
+            # LWD 边云:世界已是共享边布局(E + C*cloud_dp),
+            # 「dp 实例内世界」的网格切分不适用;且 _INNER_DP_WORLD 的唯一
+            # 消费方(executor 跨节点 MQ)在 LWD 下不走(LWD 用本地 shm MQ),
+            # 直接挂 _WORLD 占位。
+            and not parallel_config.lwd_config.enable_lwd
+        ):
             world_size_inner_dp = parallel_config.world_size
             group_ranks = [
                 [dp_rank * world_size_inner_dp + i for i in range(world_size_inner_dp)]
