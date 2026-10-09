@@ -14,7 +14,7 @@ class TestPrefillBatchLimit(unittest.TestCase):
             Path(__file__).resolve().parents[3]
             / "vllm/v1/lwd_control/control_edge_scheduler/lwd_edge_scheduler.py"
         )
-        tree = ast.parse(path.read_text())
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         scheduler = next(
             node
             for node in tree.body
@@ -44,6 +44,10 @@ class TestPrefillBatchLimit(unittest.TestCase):
             vllm_config=NS(model_config=NS(hf_text_config=NS(model_type=model_type))),
             _lwd_mixed=True,
             _lwd_awaiting={},
+            # 多 DP 路由账(空表 = 全部归 engine 0,与单云语义一致)与
+            # per-engine 负载访问器(无 awaiting 时 = 旧全局口径)
+            _lwd_route={},
+            _lwd_engine_load=lambda engine: (len(running), 0),
             _lwd_spec_factor=2,
             _lwd_chunk_unit=8196,
             max_num_scheduled_tokens=20000,
