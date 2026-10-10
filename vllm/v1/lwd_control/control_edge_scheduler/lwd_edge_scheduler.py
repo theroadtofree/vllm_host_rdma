@@ -97,9 +97,9 @@ _LWD_ADD_RETRY_INTERVAL_S = 0.2
 # 即该 chunk 已消费;未消费 chunk 数达到上限即停止新开 prefill——请求
 # 在边侧 waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
 # 排空后闸门自开。多实例:seqno 空间与云侧 prefill_notify_queue 均
-# 按实例独立,跟踪表随之按实例分桶(见 _LWD_INSTANCE_DOMAIN_ATTRS),
-# 闸门只约束当前绑定实例。
-_LWD_MAX_PENDING_CHUNKS = 3
+# # 按实例独立,跟踪表随之按实例分桶(见 _LWD_INSTANCE_DOMAIN_ATTRS),
+# # 闸门只约束当前绑定实例。
+_LWD_MAX_PENDING_CHUNKS = 2
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
