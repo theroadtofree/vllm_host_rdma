@@ -16,6 +16,29 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
+def aligned_chunk_length(
+    start, prompt_tokens, limit, alignment, required, use_eagle=False
+):
+    """在 prompt 状态检查点坐标上收 chunk:mamba/GDN 状态只有完整的
+    检查点区间才可复用,`use_eagle` 时再留一个区间给 EAGLE 尾块重算。
+    边侧 picker 预测、边侧实切、云侧守卫三方共用本公式。"""
+    count = max(0, min(prompt_tokens - start, limit))
+    if alignment <= 0 or count == 0:
+        return count
+    last_checkpoint = prompt_tokens // alignment * alignment
+    if required and use_eagle:
+        # 对齐原生 Mamba 语义:留一个完整检查点区间给 EAGLE 尾块重算,
+        # 不缓存部分尾块状态。
+        last_checkpoint = max(0, last_checkpoint - alignment)
+    if start >= last_checkpoint:
+        return count
+    end = start + count
+    checkpoint = min(end // alignment * alignment, last_checkpoint)
+    if checkpoint <= start:
+        return 0 if required else count
+    return checkpoint - start
+
+
 class LwdBaseScheduler(AsyncScheduler):
     """边/云调度器公共基类(AsyncScheduler 子类)。"""
 
@@ -95,12 +118,9 @@ class LwdBaseScheduler(AsyncScheduler):
         记账一样不少),running 来源的走续跑。拼回:仍被调度的接在隐藏
         running 之后,被抢占的排 waiting 尾部,被跳过的排 skipped 队首。
 
-        参数 ``token_budget_cap``:本步调度预算上限,把"本步执行多少
-        token"的决定权从本侧原生预算移交给边侧公告量(云侧跟随边侧
-        chunk)。仅用于收紧,不放宽原生上限;跟随模式下同时豁免
-        long_prefill_token_threshold 复切、mamba align 块对齐复切与
-        full_sequence_must_fit 整序列就位(云侧不复切边侧 chunk,保证
-        调度窗口 == 预告行数)。"""
+        参数 ``token_budget_cap``:本步调度预算上限,决定权移交边侧公告量
+        (云侧跟随边侧 chunk)。仅收紧不放宽;跟随模式下同时豁免原生
+        复切/就位约束,保证调度窗口 == 预告行数。"""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -115,17 +135,9 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
         saved_token_budget = self.max_num_scheduled_tokens
-        # 边侧是 prefill 切块权威:跟随模式(token_budget_cap 给定 = 云侧
-        # 照单执行边侧 chunk)下豁免原生调度的"再切/整序列就位"约束,
-        # 否则调度窗口 != 预告 chunk 行数,UP 注入窗口失配直接挂死:
-        # 1) long_prefill_token_threshold 复切(max_num_partial_prefills>1
-        #    且未显式配置时自动取 max_model_len*0.04);
-        # 2) mamba/混合注意力状态块对齐复切(_mamba_block_aligned_split,
-        #    mamba_cache_mode=align 时把 chunk 收到 block_size 整数倍;
-        #    边侧多模态整块发出,天然非对齐,云侧复切即失配);
-        # 3) full_sequence_must_fit(长序列 KV 紧张时整序列 KV 被拒 →
-        #    prefill 空步 → notify 塞回队首死循环,边闲云空转)。
-        # 云侧不复切边侧已定的 chunk;预算钳制(min)仍生效,内存上界不变。
+        # 边侧是 prefill 切块权威:跟随模式下豁免原生调度三项约束
+        # (long_prefill 阈值复切/mamba 对齐复切/整序列就位),否则调度
+        # 窗口 != 预告行数,UP 注入窗口失配;预算钳制(min)仍生效。
         saved_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold
         )

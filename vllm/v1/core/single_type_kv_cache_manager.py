@@ -257,6 +257,7 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+                MambaSpec,
             ):
                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
 
@@ -289,6 +290,7 @@ class SingleTypeKVCacheManager(ABC):
                 FullAttentionSpec,
                 TQFullAttentionSpec,
                 MLAAttentionSpec,
+                MambaSpec,
             ):
                 self.new_block_ids.extend(b.block_id for b in new_blocks)
             return new_blocks
@@ -1199,6 +1201,13 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= self.num_speculative_blocks + 1
                 new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
                 req_blocks.extend(new_blocks)
+                # Register the freshly allocated state blocks for zero-init.
+                # A block returned by `get_new_blocks` may be recycled from the
+                # pool and still hold the recurrent state of a previous request,
+                # which would poison the SSM computation once the pool has
+                # wrapped around (garbage output only after the free blocks are
+                # exhausted). The runner zeroes these before use.
+                self.new_block_ids.extend(b.block_id for b in new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]
 

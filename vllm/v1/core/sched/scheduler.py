@@ -405,6 +405,16 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
+            if request.num_computed_tokens < request.num_prompt_tokens:
+                # Prefill (chunked) request: never schedule more than the
+                # remaining prompt. Async spec-decode may leave draft/placeholder
+                # tokens on a resumed prefill chunk, which would inflate
+                # num_new beyond the chunk and break chunked-prefill exact
+                # admission. Cap to the remaining prompt.
+                num_new_tokens = min(
+                    num_new_tokens,
+                    request.num_prompt_tokens - request.num_computed_tokens,
+                )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)

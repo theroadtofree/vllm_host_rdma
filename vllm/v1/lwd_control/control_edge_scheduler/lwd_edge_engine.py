@@ -242,6 +242,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         "[Lwd] PRE_OUT retarget deferred (queue full), retrying"
                     )
                     threading.Event().wait(0.05)
+                # 采纳云侧调度语义须在 hello_event.set() 之前,先于调度步
+                self._lwd_adopt_cloud_semantics(msg)
                 hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
                 logger.info(
@@ -273,6 +275,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     # 为准(覆盖载荷字段,防错配),逐云校验
                     self._lwd_peer_hellos[cloud_id] = notify
                     try:
+                        # 复用模式没有 1E1C 的 hello_event 同步点,
+                        # 语义只能从这里采纳
+                        self._lwd_adopt_cloud_semantics(notify)
                         self._lwd_cross_check_hello(cloud_id)
                     except Exception:
                         # 接收线程内异常不能静默死线程(配置错位必须
@@ -371,6 +376,88 @@ class LwdEdgeEngineCore(EngineCoreProc):
             "[Lwd] HELLO scheduling triple verified (cloud%d): %s",
             cloud_id, local,
         )
+
+    def _lwd_adopt_cloud_semantics(self, hello: LwdHelloNotify) -> None:
+        """采纳云侧调度语义(HELLO 首拍,先于任何调度步):
+        ① spec_factor/EAGLE 尾块回退口径——MTP 只在云侧配置,边侧本地
+        取不到合法来源,一律以云侧公告为准;② 调度三元组互校,不一致
+        fail-fast(否则 preflight 恒 hold、prefill 被 decode 静默串行);
+        ③ 前缀对齐网格写入边侧并按网格重切 chunk。"""
+        scheduler = self.scheduler
+        count = int(getattr(hello, "num_speculative_tokens", 0) or 0)
+        adopted_factor = count + 1
+        old_factor = int(getattr(scheduler, "_lwd_spec_factor", 1))
+        use_eagle = bool(getattr(hello, "prefix_use_eagle", False))
+        logger.info(
+            "[Lwd][edge] adopt cloud MTP semantics: spec_factor %d -> %d "
+            "(num_speculative_tokens=%d), prefix_use_eagle=%s",
+            old_factor, adopted_factor, count, use_eagle,
+        )
+        scheduler._lwd_spec_factor = adopted_factor
+        scheduler._lwd_prefix_use_eagle = use_eagle
+        # ② 调度三元组互校
+        if hello.max_num_batched_tokens != 0:
+            sched = self.vllm_config.scheduler_config
+            local = (sched.max_num_batched_tokens, sched.max_num_seqs)
+            remote = (hello.max_num_batched_tokens, hello.max_num_seqs)
+            if local != remote:
+                self._lwd_shutdown_planes()
+                raise RuntimeError(
+                    f"[LWD] 边云调度配置不一致: "
+                    f"(max_num_batched_tokens, max_num_seqs) "
+                    f"edge={local} != cloud={remote}; cap/preflight 公式"
+                    f"两侧同源输入不一致会让云 preflight 恒 hold、prefill "
+                    f"被 decode 静默串行——两侧拉起配置须同值"
+                )
+            logger.info("[Lwd] HELLO scheduling triple verified: %s", local)
+        else:
+            logger.warning(
+                "[Lwd] peer HELLO carries no scheduling triple "
+                "(legacy peer; UNCHECKED)"
+            )
+        # ③ 前缀对齐网格采纳(与 probe 响应头学习同源,幂等兜底)
+        alignment = int(getattr(hello, "prefix_alignment_tokens", 0) or 0)
+        required = bool(getattr(hello, "prefix_alignment_required", False))
+        if alignment > 0:
+            cloud_id = scheduler._lwd_default_cloud_id()
+            scheduler._lwd_align_grid_by_cloud[cloud_id] = alignment
+            if not scheduler.need_mamba_block_aligned_split:
+                scheduler.need_mamba_block_aligned_split = True
+            logger.info(
+                "[Lwd][edge] adopt cloud prefix alignment: cloud=%d "
+                "alignment=%d required=%s (chunk auto-alignment enabled)",
+                cloud_id, alignment, required,
+            )
+            # required 时须留出一个对齐块 + 满员 decode 预算,否则续传
+            # chunk 永无可调度预算。
+            if required:
+                usable = (
+                    scheduler.max_num_scheduled_tokens
+                    - scheduler.max_num_running_reqs * adopted_factor
+                )
+                if usable < alignment:
+                    self._lwd_shutdown_planes()
+                    raise RuntimeError(
+                        f"[LWD] Mamba align 需 max_num_batched_tokens >= "
+                        f"{alignment + scheduler.max_num_running_reqs * adopted_factor} "
+                        f"(当前 {scheduler.max_num_scheduled_tokens},满员 "
+                        f"{scheduler.max_num_running_reqs} × spec_factor "
+                        f"{adopted_factor} 后只剩 {usable} < 对齐块 "
+                        f"{alignment});请增大 max_num_batched_tokens"
+                    )
+        # 采纳后复核活性下界(边侧 __init__ 的死锁检查用的是本地 factor)
+        if scheduler._lwd_mixed and (
+            scheduler.max_num_scheduled_tokens
+            - scheduler.max_num_running_reqs * adopted_factor
+            < 1
+        ):
+            self._lwd_shutdown_planes()
+            raise RuntimeError(
+                f"[LWD] 采纳云侧 spec_factor={adopted_factor} 后 cap 恒 < 1"
+                f"(预算 {scheduler.max_num_scheduled_tokens} − 满员 "
+                f"{scheduler.max_num_running_reqs} × {adopted_factor});"
+                "请增大 max_num_batched_tokens 或减小 max_num_seqs"
+            )
 
     def _lwd_shutdown_planes(self) -> None:
         """通信面关停(幂等):云侧复用单通道;1E1C 两面。"""

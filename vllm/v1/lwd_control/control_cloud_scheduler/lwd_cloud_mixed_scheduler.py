@@ -48,6 +48,7 @@ from vllm.v1.lwd_control.control_communication.lwd_id_adapter import (
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
+    aligned_chunk_length,
 )
 
 logger = init_logger(__name__)
@@ -534,19 +535,29 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 )
             )
             if grid > 0:
+                use_eagle = getattr(self, "_lwd_prefix_use_eagle", False)
                 for item in items:
                     req = self.requests[item.request_id]
                     end = item.offset + item.num_tokens
-                    last_chunk = end >= req.num_prompt_tokens
-                    if item.offset % grid != 0 or (not last_chunk and end % grid != 0):
+                    # 三方同源公式:与边侧 picker 预测、原生实切一致;
+                    # use_eagle 取云侧 EAGLE 尾块回退口径。
+                    aligned = aligned_chunk_length(
+                        item.offset,
+                        req.num_prompt_tokens,
+                        item.num_tokens,
+                        grid,
+                        True,
+                        use_eagle,
+                    )
+                    if aligned != item.num_tokens:
                         raise RuntimeError(
-                            f"[Lwd][cloud-sched] chunk not grid-aligned "
+                            "[Lwd][cloud-sched] chunk 违背云侧前缀检查点对齐 "
                             f"req={item.request_id} seqno={notify.seqno}: "
-                            f"[{item.offset}, {end}) grid={grid} — edge "
-                            "never learned the cloud mamba grid "
-                            "(coordination disabled or probe failed); "
-                            "unaligned GDN state slices would corrupt "
-                            "silently"
+                            f"[{item.offset}, {end}) grid={grid} "
+                            f"tokens={item.num_tokens} aligned={aligned} — "
+                            "边侧未学到云 mamba 网格(协调未启用/probe 失败)"
+                            "或 EAGLE 尾块回退口径与云侧不一致;未对齐的 GDN "
+                            "状态切片会静默乱码"
                         )
         # 末位截断块的"预算耗尽复现"要求它最后消费:running 内
         # 续传请求与 decode 按队列序交错,若它不在末尾,轮到自己时

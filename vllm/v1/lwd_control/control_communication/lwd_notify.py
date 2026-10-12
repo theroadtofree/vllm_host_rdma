@@ -128,12 +128,21 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     pre_out_port: int
     cloud_id: int = 0
     """多云发现:边据此建 cloud_id -> 端点本地路由表;缺省 0 单云兼容。"""
-    max_num_batched_tokens: int = 0
-    """云侧调度生效预算(max_num_scheduled_tokens);0 = 旧版未携带。"""
-    max_num_seqs: int = 0
-    """云侧生效并发名额(max_num_running_reqs);0 = 旧版未携带。"""
     num_speculative_tokens: int = 0
-    """云侧 spec k(边侧 spec_factor = k+1 以其为准);0 = 旧版未携带。"""
+    """云侧 spec k(边侧 spec_factor=k+1 以其为准;0=旧版云)。"""
+    prefix_use_eagle: bool = False
+    """云侧前缀命中是否按 EAGLE/MTP 尾块回退;边侧切 chunk 须同口径,
+    否则两侧网格差一个对齐单元(0/False=旧版云)。"""
+    max_num_batched_tokens: int = 0
+    """云侧生效 token 预算,边侧互校部署一致性;0=旧版云。"""
+    max_num_seqs: int = 0
+    """云侧生效并发名额,语义见 max_num_batched_tokens;0=旧版云。"""
+    prefix_alignment_tokens: int = 0
+    """云侧前缀对齐网格(各 KV 组块大小 LCM);边侧按此重切 chunk;
+    0=旧版云(仅靠 probe 响应头学习)。"""
+    prefix_alignment_required: bool = False
+    """云侧是否必须对齐(MambaSpec 且 align 模式);真时边侧须预留
+    一个对齐块 + 满员 decode 预算。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值

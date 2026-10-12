@@ -59,6 +59,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_binding import (
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
+    aligned_chunk_length,
 )
 from vllm.v1.lwd_debug import LwdControlLog
 from vllm.v1.request import RequestStatus
@@ -92,13 +93,8 @@ _LWD_PROBE_MAX_CONNS = 0
 
 @dataclass(frozen=True)
 class _LwdMediaIdentity:
-    """协议层 ``_MediaItem`` 的边侧实现:多模态内容身份进 HMAC 链。
-
-    digest 取 ``MultiModalFeatureSpec.identifier``(encoder 缓存键,含
-    LoRA 前缀)的 sha256——同图同配置同 digest,换图/换 LoRA 即分叉;
-    ``mm_position`` 的 offset/length 即该 item 在 prompt 中的占位区间。
-    图像占位展开 token 与内容无关,不掺身份则不同图共享块哈希,
-    云侧会跨图误命中并复用旧图 KV。"""
+    """多模态内容身份进 HMAC 链:digest=identifier 的 sha256,
+    offset/length=prompt 占位区间;不掺则不同图共享块哈希,云侧跨图误命中。"""
 
     modality: str
     digest: bytes
@@ -190,15 +186,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 累积生成 ids,终结即用租户密钥建全量块哈希链上报云侧并清理。
         self._lwd_finish_prompt_ids: dict[str, list[int]] = {}
         self._lwd_finish_gen_ids: dict[str, list[int]] = {}
-        # 多模态内容身份留档(request_id -> media items):Request 终结后
-        # mm_features 不可达,add_request 入口一次提取供 probe/finish/
-        # 生成段建链续用;与 prompt_ids 同生命周期(finish/abort 摘除)。
-        # 三处建链共用同一份快照,保证查链与存链口径一致。
+        # 多模态内容身份留档(request_id -> media items):终结后
+        # mm_features 不可达,probe/finish/生成段三处建链共用同一快照。
         self._lwd_finish_media_items: dict[str, list[Any]] = {}
-        # processor 指纹惰性缓存(sha256(模型 + mm_processor_kwargs)):
-        # 只掺入媒体覆盖块的 HMAC——纯文本链逐位不变,新旧边混布兼容。
-        # 协议要求带 media_items 的建链必须持指纹,probe client 与
-        # _lwd_prefix_hasher 两个构造点都要传,缺一侧即建链必抛。
+        # processor 指纹(sha256(模型 + mm_processor_kwargs)),只掺入
+        # 媒体覆盖块的 HMAC;带 media_items 的建链必持指纹。
         self._lwd_processor_fp: bytes | None = None
         # 生成段链增量上报水位(request_id -> 已上报满块数):只在满块数
         # 增加时发一条(全量替换语义),避免逐步刷控制面。
@@ -834,9 +826,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_finish_prompt_ids[request.request_id] = list(
             request.prompt_token_ids
         )
-        # 多模态内容身份同一入口留档(主循环线程提取,probe 协程只读
-        # 快照不触碰 Request):probe/finish/生成段三处建链共用这一份
-        # 快照,保证查链与存链口径一致。纯文本请求留档为空,不入字典。
+        # 多模态内容身份同一入口留档(主循环线程提取,协程只读快照);
+        # 纯文本请求不入字典。
         media_items = self._lwd_media_items(request)
         if media_items:
             self._lwd_finish_media_items[request.request_id] = media_items
@@ -914,13 +905,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _lwd_media_items(request: Request) -> list[_LwdMediaIdentity]:
-        """提取多模态内容身份(mm_features -> 协议层 media item)。
-
-        主循环线程调用(probe 协程只拿快照列表,不触碰 Request)。仅取
-        协议 ABI 已支持的 modality(当前 ``image``;audio/video 协议
-        预留未开,掺入会被 _validate_media_items 拒绝使 probe fail-open
-        丢命中——不支持模态暂保持盲链,待协议扩展)。无匹配项返回空表,
-        纯文本路径建链与旧版逐位一致。"""
+        """提取多模态内容身份。仅取协议已支持的 modality(当前 image,
+        其他模态掺入会被协议拒绝使 probe fail-open);无匹配返回空表,
+        纯文本建链与旧版逐位一致。"""
         return [
             _LwdMediaIdentity(
                 modality=feature.modality,
@@ -936,10 +923,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_processor_fingerprint(self) -> bytes:
         """处理器指纹(32B):模型 + mm_processor_kwargs 的 sha256。
-
-        掺入媒体覆盖块 HMAC,保证换模型/换 processor 配置即链分叉。
-        云侧不复算指纹(链值即块池键,边侧单边稳定即可),无需与云
-        对齐。"""
+        掺入媒体覆盖块 HMAC,换模型/换 processor 配置即链分叉。"""
         if self._lwd_processor_fp is None:
             model_cfg = self.vllm_config.model_config
             material = "|".join((
@@ -982,9 +966,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 consumer_id=coord_cfg.consumer_id,
                 # 总超时钳到 3s:死锁残余时快速 fail-open
                 connect_timeout=min(coord_cfg.connect_timeout, 3.0),
-                # 指纹与 _lwd_prefix_hasher 同源:probe 查链侧也要建
-                # media 覆盖块,协议要求带 media_items 的建链必持指纹,
-                # 缺此参数 mm 请求 probe 建链必抛(fail-open 丢命中)
+                # 指纹与 _lwd_prefix_hasher 同源(缺此参数 mm 建链必抛)
                 processor_fingerprint=self._lwd_processor_fingerprint(),
             )
             self._lwd_probe_client_cache = client
@@ -1011,8 +993,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         client = self._lwd_probe_client(coord_cfg, build_bs)
         request_id = request.request_id
         prompt_ids = list(request.prompt_token_ids)
-        # 媒体身份取入口留档快照(主循环线程):协程只读列表,不触碰
-        # Request;纯文本/无图请求留档为空。
         media_items = self._lwd_finish_media_items.get(request_id) or ()
         # model 名供网关路由(NewAPI 按 model 选渠道);取 served_model_name
         # 回退 model。
@@ -1236,18 +1216,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         背景:边侧无 mamba 层(has_mamba_layers=False),原生开关恒关;
         云侧 follow 模式又不能自行复切边侧 chunk——对齐责任只能落在
         边侧。网格(scheduler_block_size = 云各 KV 组块大小 LCM)经
-        probe 响应头逐云学习;学到后 need_mamba_block_aligned_split
-        置真,原生调度的两个重切点自动走这里。
+        probe 响应头逐云学习(HELLO 公告为同源幂等兜底);学到后
+        need_mamba_block_aligned_split 置真,原生调度的两个重切点自动
+        走这里。
 
-        语义与原生 ``Scheduler._mamba_block_aligned_split`` 逐行一致
-        (中间块收到网格整数倍、末个对齐块强制收在 last_cache_position、
-        尾巴直通),仅块大小来源换成云侧公告网格。网格未学到时本方法
-        不被调用(开关恒关),行为与学习前完全一致。
+        切块算术委托给 ``aligned_chunk_length``(LwdBaseScheduler 模块):
+        边侧 picker 预测、原生实切、云侧守卫三方同源共用同一公式;
+        网格未学到(block_size<=0)时原样返回,行为与学习前一致。
 
-        多模态请求照常参与对齐重切:mm 链已掺图像内容身份(不同图链
-        分叉,不会跨图误命中),同图任意边界(含半图)复用放行——与
-        文本命中同权;对齐保证的 mamba 快照正是命中前缀可复用的前提,
-        全量新算的图像段不受 chunk 边界影响。"""
+        多模态请求照常参与对齐重切:mm 链已掺图像内容身份,同图任意
+        边界复用放行;对齐保证的 mamba 快照正是命中前缀可复用的前提。"""
         cloud_id = self._lwd_binding.cloud_of(
             request.request_id, default=self._lwd_default_cloud_id()
         )
@@ -1262,25 +1240,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if num_computed_tokens < max(
             request.num_prompt_tokens, request.num_tokens - 1
         ):
-            last_cache_position = (
-                request.num_tokens - request.num_tokens % block_size
+            # use_eagle 取云侧 EAGLE 尾块回退口径(边侧本地恒 False,
+            # 口径不一致会让两侧网格差一个对齐单元)。
+            num_new_tokens = aligned_chunk_length(
+                num_computed_tokens,
+                request.num_prompt_tokens,
+                num_new_tokens,
+                block_size,
+                required=block_size > 1,
+                use_eagle=getattr(
+                    self, "_lwd_prefix_use_eagle", self.use_eagle
+                ),
             )
-            if self.use_eagle:
-                last_cache_position = max(last_cache_position - block_size, 0)
-            num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
-            if num_computed_tokens_after_sched < last_cache_position:
-                # align to grid
-                num_new_tokens = num_new_tokens // block_size * block_size
-            elif (
-                num_computed_tokens
-                < last_cache_position
-                < num_computed_tokens_after_sched
-            ):
-                # force to cache the last aligned chunk
-                num_new_tokens = last_cache_position - num_computed_tokens
-            else:
-                # prefill the last few tokens
-                pass
         return num_new_tokens
 
     @staticmethod
@@ -1338,10 +1309,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"len {request.num_prompt_tokens} (request {request.request_id})"
         )
         self._lwd_mrope_positions_dict[request.request_id] = positions
-        logger.info(
-            "[Lwd][edge-sched] mrope positions computed: req=%s prompt=%d",
-            request.request_id, request.num_prompt_tokens,
-        )
+
     def lwd_edge_notify(self, scheduler_output: SchedulerOutput) -> bool:
         """对新调度的 prefill 批发一条批量 LwdRangeNotify(seqno 先行)。
 

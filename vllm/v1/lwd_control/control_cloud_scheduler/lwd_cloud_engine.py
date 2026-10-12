@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 from collections import deque
+from math import lcm
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -18,6 +19,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -324,10 +326,47 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_cloud_id = getattr(
             self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
         )
-        # HELLO(含调度三元组)两种模式都要建:1E1C 经 POST_OUT 首拍;
-        # 云侧复用经 ROUTER 按边定向送达(pre_out_* 在复用模式为占位,
-        # 边侧只读三元组)。三元组取调度器**生效值**而非配置原值:
-        # 派生/缺省差异(max_num_scheduled_tokens 覆盖链)只有生效值可信。
+        # HELLO 两种模式都要建(1E1C 经 POST_OUT 首拍;云侧复用经 ROUTER
+        # 定向送达),调度语义(MTP/对齐网格)以云侧公告为准——边侧本地
+        # 取不到合法来源。三元组取调度器生效值,派生/缺省差异只有生效值可信。
+        _lwd_spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+        # 前缀对齐网格 = 各 KV 组块大小 LCM(与 mamba/GDN 检查点网格同源);
+        # 取不到时回退 0(边侧不重切,仅靠 probe 兜底)。
+        coordinator = getattr(
+            self.scheduler.kv_cache_manager, "coordinator", None
+        )
+        scheduler_block_size = int(
+            getattr(coordinator, "scheduler_block_size", 0) or 0
+        )
+        prefix_alignment_tokens = (
+            lcm(
+                scheduler_block_size,
+                int(
+                    getattr(
+                        coordinator, "lcm_block_size", scheduler_block_size
+                    )
+                    or scheduler_block_size
+                ),
+            )
+            if scheduler_block_size > 0
+            else 0
+        )
+        # 是否必须对齐:任一 KV 组为 MambaSpec 且 align 模式。
+        prefix_alignment_required = any(
+            isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
+            for group in self.scheduler.kv_cache_config.kv_cache_groups
+            for spec in (
+                group.kv_cache_spec.kv_cache_specs.values()
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else [group.kv_cache_spec]
+            )
+        )
+        # 云侧自身也落地同款口径,供混合调度器 chunk 对齐校验使用。
+        self.scheduler._lwd_prefix_use_eagle = bool(
+            getattr(self.scheduler, "use_eagle", False)
+        )
+        self.scheduler._lwd_prefix_alignment = prefix_alignment_tokens
+        self.scheduler._lwd_prefix_alignment_required = prefix_alignment_required
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
             pre_out_port=config.pre_out_port,
@@ -335,11 +374,11 @@ class LwdCloudEngineCore(EngineCoreProc):
             max_num_batched_tokens=self.scheduler.max_num_scheduled_tokens,
             max_num_seqs=self.scheduler.max_num_running_reqs,
             num_speculative_tokens=(
-                getattr(
-                    getattr(self.vllm_config, "speculative_config", None),
-                    "num_speculative_tokens", None,
-                ) or 0
+                getattr(_lwd_spec_cfg, "num_speculative_tokens", None) or 0
             ),
+            prefix_use_eagle=bool(getattr(self.scheduler, "use_eagle", False)),
+            prefix_alignment_tokens=prefix_alignment_tokens,
+            prefix_alignment_required=prefix_alignment_required,
         )
         if config.is_cloud_reuse:
             registry = get_role_registry()
