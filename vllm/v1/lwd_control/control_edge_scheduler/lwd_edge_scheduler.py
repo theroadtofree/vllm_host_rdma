@@ -412,7 +412,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     # seqno 进位绑定实际发布成功(与 lwd_edge_notify 直发
                     # 分支同一进位点),滞留补投后号链无空洞
                     self._lwd_seqno[cloud_id] = message.seqno + 1
-                logger.info(
+                logger.debug(
                     "[Lwd][edge-notify] deferred publish flushed: cloud=%d "
                     "type=%s lag=%.1fms",
                     cloud_id, type(message).__name__,
@@ -547,7 +547,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 and o_other < cand_hit <= end_other
                 and self._lwd_chain_hash_eq(cand, other, cand_hit)
             ):
-                logger.info(
+                logger.debug(
                     "[Lwd][edge-sched] mamba dep conflict: req=%s hit=%d "
                     "covered by %s [%d, %d) — split batch",
                     cand.request_id, cand_hit, rid, o_other, end_other,
@@ -559,7 +559,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 and cand_off < other_hit <= cand_end
                 and self._lwd_chain_hash_eq(other, cand, other_hit)
             ):
-                logger.info(
+                logger.debug(
                     "[Lwd][edge-sched] mamba dep conflict: req=%s hit=%d "
                     "covered by candidate %s [%d, %d) — split batch",
                     rid, other_hit, cand.request_id, cand_off, cand_end,
@@ -782,7 +782,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         统一语义,不再做队首回插。"""
         req_ids, expected, cap = self._lwd_pick_prefill_batch()
         if req_ids:
-            logger.info(
+            logger.debug(
                 "[Lwd][edge-sched] pick batch reqs=%s tokens=%d cap=%d",
                 req_ids, sum(expected.values()), cap,
             )
@@ -1428,7 +1428,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"tokens={sum(i.num_tokens for i in items)}"
             )
         self._lwd_seqno[cloud_id] = seqno + 1
-        logger.info(
+        logger.debug(
             "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d cloud=%d "
             "mrope=%d",
             len(items), sum(item.num_tokens for item in items), seqno,
@@ -1698,13 +1698,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # deferred 也推进水位:消息已按全量链入队保序,重复入队
                 # 只浪费不纠错;后续新增块的新链照常覆盖
                 self._lwd_gen_chain_sent[request_id] = len(blocks)
-                logger.info(
+                logger.debug(
                     "[Lwd][edge] gen-chain deferred req=%s blocks=%d",
                     request_id, len(blocks),
                 )
                 return
             self._lwd_gen_chain_sent[request_id] = len(blocks)
-            logger.info(
+            logger.debug(
                 "[Lwd][edge] gen-chain announced req=%s blocks=%d cloud=%d",
                 request_id, len(blocks), cloud_id,
             )
@@ -1808,7 +1808,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # finish 即解绑:请求与云实例的生命周期绑定结束
             # (迟到结果不再认领,绑定表出表)
             self._lwd_binding.unbind(request_id)
-        logger.info(
+        logger.debug(
             "[Lwd][edge-deliver] req=%s tokens=%d finished=%s",
             request_id, len(token_ids), finished,
         )

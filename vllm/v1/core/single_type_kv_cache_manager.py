@@ -1075,7 +1075,7 @@ class MambaManager(SingleTypeKVCacheManager):
             # To put it in the next step, we return num_gpu_blocks + 1 so
             # that kv_cache_manager will think there is no enough blocks to allocate now
             # and don't schedule it in the current step.
-            logger.info(
+            logger.debug(
                 "sched dbg: mamba same-step guard deferred req=%s hit_blocks=%d",
                 request_id, len(new_computed_blocks),
             )

@@ -428,7 +428,7 @@ class MultiprocExecutor(Executor):
         if self.parallel_config.lwd_config.enable_lwd:
             import time as _time
 
-            logger.info(
+            logger.debug(
                 "[Lwd][perf] rpc-enqueue method=%s ts=%.3f",
                 method, _time.monotonic(),
             )
@@ -439,7 +439,7 @@ class MultiprocExecutor(Executor):
             # 探针②对照点:enqueue 返回时刻。与上行 rpc-enqueue 做差 =
             # 引擎侧入队成本(序列化/MQ 写入阻塞);与 worker 侧
             # rpc-dequeue 做差 = MQ 在途+排队等待。
-            logger.info(
+            logger.debug(
                 "[Lwd][perf] rpc-enqueue-done method=%s ts=%.3f",
                 method, _time.monotonic(),
             )
@@ -1050,7 +1050,7 @@ class WorkerProc:
             ready_event.synchronize()
             # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
             # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
-            logger.info(
+            logger.debug(
                 "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
                 (time.monotonic() - _t_sync) * 1000, time.monotonic(),
             )
@@ -1059,7 +1059,7 @@ class WorkerProc:
             output = output.get_output()
 
         if getattr(output, "lwd_c2e_meta", None) is not None:
-            logger.info(
+            logger.debug(
                 "[Lwd][trace] worker response enqueued: c2e_meta reqs=%s",
                 getattr(output.lwd_c2e_meta, "req_ids", None),
             )
@@ -1072,7 +1072,7 @@ class WorkerProc:
             # 探针⑤:响应已写入 response_mq。与上一个 rpc-exec-done
             # 做差 = 输出序列化+响应入队耗时;与引擎侧
             # "engine got model_output" 做差 = 响应在途。
-            logger.info(
+            logger.debug(
                 "[Lwd][perf] response-enqueued ts=%.3f", time.monotonic()
             )
 
@@ -1128,7 +1128,7 @@ class WorkerProc:
             if _lwd_probe:
                 # 探针②:dequeue 返回时刻。减引擎 rpc-enqueue-done =
                 # MQ 在途+排队;减上一个 rpc-exec-done = 忙循环空转等待。
-                logger.info(
+                logger.debug(
                     "[Lwd][perf] rpc-dequeue method=%s ts=%.3f",
                     method if isinstance(method, str) else "<callable>",
                     time.monotonic(),

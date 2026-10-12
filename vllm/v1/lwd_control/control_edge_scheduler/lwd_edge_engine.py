@@ -246,7 +246,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 self._lwd_adopt_cloud_semantics(msg)
                 hello_event.set()
             elif isinstance(msg, LwdC2eNotify):
-                logger.info(
+                logger.debug(
                     "[Lwd][edge-ctrl] C2eNotify reqs=%d down_seqno=%s",
                     len(getattr(msg, "req_ids", []) or []),
                     getattr(msg, "down_seqno", None),
@@ -298,7 +298,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     continue
                 # 信封携带的来源云为准(覆盖载荷字段,防错配)
                 notify.cloud_id = cloud_id
-                logger.info(
+                logger.debug(
                     "[Lwd][edge-ctrl] C2eNotify cloud=%d reqs=%d down_seqno=%s",
                     cloud_id, len(notify.req_ids), notify.down_seqno,
                 )

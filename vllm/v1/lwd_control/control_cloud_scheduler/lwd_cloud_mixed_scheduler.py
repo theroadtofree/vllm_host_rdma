@@ -327,7 +327,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 f"max_num_batched_tokens"
             )
         if need_tokens > self.max_num_scheduled_tokens:
-            logger.info(
+            logger.debug(
                 "[Lwd][cloud-sched] preflight hold: tokens %d > budget %d",
                 need_tokens, self.max_num_scheduled_tokens,
             )
@@ -340,7 +340,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             1 for item in items if item.request_id not in running_ids
         )
         if len(self.running) + new_items > self.max_num_running_reqs:
-            logger.info(
+            logger.debug(
                 "[Lwd][cloud-sched] preflight hold: seqs %d+%d > max %d",
                 len(self.running), new_items, self.max_num_running_reqs,
             )
@@ -363,7 +363,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         need_blocks += num_decode * len(self._lwd_group_specs)
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         if need_blocks > free_blocks:
-            logger.info(
+            logger.debug(
                 "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d",
                 need_blocks, free_blocks,
             )
@@ -419,7 +419,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             elif unknown:
                 # 请求 ADD 未落地(input_queue 次序滞后):预告留队首,
                 # 本步先 decode;abort 清扫兜底防永久堵队首
-                logger.info(
+                logger.debug(
                     "[Lwd][cloud-sched] notify seqno=%d deferred: "
                     "request(s) not added yet",
                     notify.seqno,
@@ -454,7 +454,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         的截断语义逐字对齐)。两个 finally 均恢复。
         注意 decode 请求 num_new = 1+k 远小于正常量级的 T,不受覆写
         影响(病态小 chunk 配置见设计 §8-C9)。"""
-        logger.info(
+        logger.debug(
             "[Lwd][cloud-sched] mixed notify seqno=%d reqs=%s tokens=%d",
             notify.seqno, [item.request_id for item in items],
             sum(item.num_tokens for item in items),
@@ -669,7 +669,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         out = self._schedule_impl()
         self._lwd_sched_step += 1
         self._lwd_log_sched_batch(out)
-        logger.info(
+        logger.debug(
             "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
         )
         return out
@@ -695,7 +695,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         reqs_str = ",".join(reqs[:12]) + (
             f",+{len(reqs) - 12}more" if len(reqs) > 12 else ""
         )
-        logger.info(
+        logger.debug(
             "[Lwd][sched] cloud step=%d phase=%s seqno=%s reqs=[%s] tokens=%d "
             "pending_notify=%d decode_ready=%d",
             self._lwd_sched_step, phase, seqno, reqs_str,

@@ -601,7 +601,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                     msg.request_id, msg.seqno,
                 )
                 return
-            logger.info(
+            logger.debug(
                 "[Lwd][cloud-ctrl] RangeNotify reqs=%d edge=%d num=%s seqno=%s",
                 len(items), edge_id, sum(item.num_tokens for item in items),
                 msg.seqno,
@@ -933,7 +933,7 @@ class LwdCloudEngineCore(EngineCoreProc):
                 # prompt 算完的请求发布其 manifest 摘要 → 后续 probe 可命中
                 self._lwd_publish_completed_prefixes(meta.req_ids)
                 # [Lwd][perf] 云侧 LWD 税:finish 码推导 + ZMQ publish
-                logger.info(
+                logger.debug(
                     "[Lwd][perf] publish edge=%d reqs=%d dur=%.2fms",
                     edge_id, len(meta.req_ids),
                     (time.monotonic() - _t) * 1000,

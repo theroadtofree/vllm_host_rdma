@@ -282,7 +282,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
             # 队首清扫把队列掏空(本步无有效预告):空步,三队列原样保留
             return self._lwd_schedule_for_visible_reqs([])
         notify = q.popleft()
-        logger.info(
+        logger.debug(
             "[Lwd][cloud-sched] prefill notify req=%s seqno=%s num=%s",
             notify.request_id, notify.seqno, notify.num_tokens,
         )
@@ -343,7 +343,7 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         """纯 decode 步:收集全部 decode 态请求,剔除单独调度后按落点拼回。"""
         req_ids = self._lwd_collect_decode_requests()
         if req_ids:
-            logger.info("[Lwd][cloud-sched] decode reqs=%s", req_ids)
+            logger.debug("[Lwd][cloud-sched] decode reqs=%s", req_ids)
         return self._lwd_schedule_for_visible_reqs(req_ids)
 
     @staticmethod

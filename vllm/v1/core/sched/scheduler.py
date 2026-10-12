@@ -692,7 +692,7 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    logger.info(
+                    logger.debug(
                         "sched dbg: num_new=%s computed=%s num_tokens=%s prompt=%s status=%s",
                         num_new_tokens, num_computed_tokens, request.num_tokens,
                         request.num_prompt_tokens, request.status,
@@ -709,7 +709,7 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
-                        logger.info(
+                        logger.debug(
                             "sched dbg: waiting break (no-chunk budget) "
                             "req=%s num_new=%s budget=%s",
                             request_id, num_new_tokens, token_budget,
@@ -793,7 +793,7 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
-                    logger.info(
+                    logger.debug(
                         "sched dbg: waiting break (alloc) req=%s num_new=%s "
                         "free=%s computed=%s",
                         request_id, num_new_tokens,
