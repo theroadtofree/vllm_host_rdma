@@ -34,6 +34,8 @@ HEADER_HIT_BLOCKS = "X-Edge-Cloud-Prefix-Hit-Blocks"
 HEADER_HIT_TOKENS = "X-Edge-Cloud-Prefix-Hit-Tokens"
 HEADER_ALIGNMENT_TOKENS = "X-Edge-Cloud-Alignment-Tokens"
 HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
+HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
+HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
 
 _FULL_BLOCK_DOMAIN = b"\x01"
 _TAIL_BLOCK_DOMAIN = b"\x02"
@@ -177,9 +179,15 @@ class LwdPrefixManifest:
             else:
                 raise ValueError("message content is not an edge-cloud hash")
 
-        prompt_tokens_value = body.get("edge_cloud_prompt_tokens")
-        if not isinstance(prompt_tokens_value, int) or isinstance(prompt_tokens_value, bool):
-            raise ValueError("edge_cloud_prompt_tokens must be an integer")
+        # prompt_tokens 只从 header 取(与参考分支一致):NewAPI 等网关
+        # DTO 转换会剥掉 body 非标准字段。
+        prompt_tokens_raw = normalized_headers.get(HEADER_PROMPT_TOKENS.lower())
+        if prompt_tokens_raw is None:
+            raise ValueError(f"missing required header {HEADER_PROMPT_TOKENS}")
+        try:
+            prompt_tokens_value = int(prompt_tokens_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{HEADER_PROMPT_TOKENS} must be a non-negative integer") from exc
         return cls(
             request_id=request_id,
             prompt_tokens=prompt_tokens_value,
@@ -360,6 +368,8 @@ class LwdProbeResult:
     # 云侧对齐网格(scheduler_block_size,各 KV 组块大小 LCM):边侧按它
     # 对 chunk 做 mamba 对齐重切。0 = 未公告(旧版云/降级),边侧不重切
     alignment_tokens: int = 0
+    # 路由回执的云 id:多云选路时由中央调度器/网关填;None=单云或未启用选路
+    cloud_id: int | None = None
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.instance_id:
@@ -372,7 +382,7 @@ class LwdProbeResult:
             raise ValueError("alignment_tokens must not be negative")
 
     def to_headers(self) -> dict[str, str]:
-        return {
+        headers = {
             HEADER_PROTOCOL: PROTOCOL_VERSION,
             HEADER_REQUEST_ID: self.request_id,
             HEADER_INSTANCE_ID: self.instance_id,
@@ -381,6 +391,56 @@ class LwdProbeResult:
             HEADER_HIT_TOKENS: str(self.hit_tokens),
             HEADER_ALIGNMENT_TOKENS: str(self.alignment_tokens),
         }
+        if self.cloud_id is not None:
+            headers[HEADER_CLOUD_ID] = str(self.cloud_id)
+        return headers
+
+    def to_control_message(
+        self, protocol: str = PROTOCOL_VERSION, mm_abi: str | None = None
+    ) -> dict[str, Any]:
+        """Build the JSON object carried inside an OpenAI delta.content.
+
+        SSE 形态下 Probe 结果走 delta.content 而非响应头——网关 DTO
+        转换不会丢失消息体,响应头可能被吃掉。"""
+        message: dict[str, Any] = {
+            "type": "edge_cloud_probe",
+            "protocol": protocol,
+            "request_id": self.request_id,
+            "instance_id": self.instance_id,
+            "block_size": self.block_size,
+            "hit_blocks": self.hit_blocks,
+            "hit_tokens": self.hit_tokens,
+            "alignment_tokens": self.alignment_tokens,
+        }
+        if self.cloud_id is not None:
+            message["cloud_id"] = self.cloud_id
+        if mm_abi is not None:
+            message["mm_abi"] = mm_abi
+        return message
+
+    @classmethod
+    def from_control_message(cls, message: Mapping[str, Any]) -> LwdProbeResult:
+        """Validate the probe payload from an SSE delta.content JSON object."""
+        if message.get("type") != "edge_cloud_probe":
+            raise ValueError("expected an edge_cloud_probe control message")
+        for name in ("request_id", "instance_id"):
+            if not isinstance(message.get(name), str):
+                raise ValueError(f"probe {name} must be a string")
+        for name in ("block_size", "hit_blocks", "hit_tokens"):
+            if type(message.get(name)) is not int:
+                raise ValueError(f"probe {name} must be an integer")
+        cloud_id = message.get("cloud_id")
+        if cloud_id is not None and type(cloud_id) is not int:
+            raise ValueError("probe cloud_id must be an integer or null")
+        return cls(
+            request_id=message["request_id"],
+            instance_id=message["instance_id"],
+            block_size=message["block_size"],
+            hit_blocks=message["hit_blocks"],
+            hit_tokens=message["hit_tokens"],
+            alignment_tokens=int(message.get("alignment_tokens", 0)),
+            cloud_id=cloud_id,
+        )
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> LwdProbeResult:
@@ -395,6 +455,7 @@ class LwdProbeResult:
         if required(HEADER_PROTOCOL) != PROTOCOL_VERSION:
             raise ValueError("unsupported edge-cloud protocol")
         try:
+            cloud_id_raw = values.get(HEADER_CLOUD_ID.lower())
             return cls(
                 request_id=required(HEADER_REQUEST_ID),
                 instance_id=required(HEADER_INSTANCE_ID),
@@ -405,6 +466,7 @@ class LwdProbeResult:
                 alignment_tokens=int(values.get(
                     HEADER_ALIGNMENT_TOKENS.lower(), "0"
                 )),
+                cloud_id=int(cloud_id_raw) if cloud_id_raw else None,
             )
         except ValueError as exc:
             raise ValueError("cloud prefix result contains invalid integers") from exc

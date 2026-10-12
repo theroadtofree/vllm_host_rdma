@@ -84,6 +84,11 @@ _LWD_PENDING_FAIL_AFTER_S = 30.0
 # 只兜「probe 线程静默死亡」的底,正常 RTT 不会触发
 _LWD_PROBE_WATCHDOG_S = 15.0
 
+# 探针会话连接上限:usage 排空会常驻占住一条连接直到请求完结(≈推理时长),
+# 与探测同池共享会话若用 aiohttp 默认 100,高并发下新 probe 会排队等连接、
+# 被看门狗判超时。0 = 不限,真实上限即边侧在飞请求数。
+_LWD_PROBE_MAX_CONNS = 0
+
 
 @dataclass(frozen=True)
 class _LwdMediaIdentity:
@@ -140,7 +145,9 @@ class _LwdProbeRuntime:
         if self._session is None:
             import aiohttp
 
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=_LWD_PROBE_MAX_CONNS)
+            )
         return self._session
 
     def submit(self, coro) -> "asyncio.Future":
@@ -221,6 +228,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 路径随 _lwd_probe_bs_by_req 一并摘除
         self._lwd_resume_hit_by_req: dict[str, int] = {}
         self._lwd_probe_chain_by_req: dict[str, tuple[int, list[bytes]]] = {}
+        # probe 路由回执(request_id -> cloud_id):多云选路时由 probe
+        # 响应的 cloud_id 驱动绑定/发布/数据面选组,替换默认 cloud[0]。
+        # None/未入档 = 未启用选路,回退 _lwd_default_cloud_id()。
+        self._lwd_probe_cloud_by_req: dict[str, int] = {}
         # 探前缀客户端惰性缓存(复用 hasher/tenant_key,避免每请求读文件重建)
         self._lwd_probe_client_cache = None
         # probe 异步化(E1 根治):请求先投 probe 线程,结果回灌主循环后
@@ -336,6 +347,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if registry is not None and registry.cloud_ids:
             return registry.cloud_ids[0]
         return self._lwd_cloud_id
+
+    def _lwd_routed_cloud_id(self, request_id: str) -> int:
+        """路由回执驱动选云:probe 回执 cloud_id > 绑定表 > 兜底 default。
+
+        多云选路接入后,probe 响应携带 cloud_id(中央调度器/网关决定),
+        本函数优先采纳;单云或未启用选路时回退 default,行为与现状一致。"""
+        probe_cloud = self._lwd_probe_cloud_by_req.get(request_id)
+        if probe_cloud is not None:
+            return probe_cloud
+        bound = self._lwd_binding.cloud_of(request_id)
+        if bound is not None:
+            return bound
+        return self._lwd_default_cloud_id()
 
     def _lwd_publish(self, message, cloud_id: int) -> bool:
         """控制面出口统一:云侧复用按 dest 定向 publish;1E1C 走单
@@ -837,6 +861,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_finish_media_items.pop(request.request_id, None)
         self._lwd_resume_hit_by_req.pop(request.request_id, None)
         self._lwd_probe_chain_by_req.pop(request.request_id, None)
+        self._lwd_probe_cloud_by_req.pop(request.request_id, None)
         super().add_request(request)
         self.finish_requests(
             [request.request_id], RequestStatus.FINISHED_ABORTED
@@ -858,7 +883,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         边界。"""
         if prefix_hit_tokens > 0:
             request.num_computed_tokens = prefix_hit_tokens
-        cloud_id = self._lwd_default_cloud_id()
+        cloud_id = self._lwd_routed_cloud_id(request.request_id)
         self._lwd_binding.bind(request.request_id, cloud_id)
         if prefix_hit_tokens > 0:
             # resume 命中边界留档:picker 预检 mamba 同批缓存冲突用
@@ -989,6 +1014,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 媒体身份取入口留档快照(主循环线程):协程只读列表,不触碰
         # Request;纯文本/无图请求留档为空。
         media_items = self._lwd_finish_media_items.get(request_id) or ()
+        # model 名供网关路由(NewAPI 按 model 选渠道);取 served_model_name
+        # 回退 model。
+        model_cfg = getattr(self.vllm_config, "model_config", None)
+        model_name = None
+        if model_cfg is not None:
+            model_name = getattr(model_cfg, "served_model_name", None) or getattr(
+                model_cfg, "model", None
+            )
 
         async def _job():
             session = await runtime.ensure_session()
@@ -998,6 +1031,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             result = await client.negotiate(
                 session, request_id, prompt_ids, manifest=manifest,
                 media_items=media_items,
+                model=model_name,
             )
             return result, list(manifest.full_block_hashes)
 
@@ -1093,7 +1127,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # notify 在 probe 之后才发,故首请求(首次学习)即生效:非
             # 整除 prompt 的链覆盖到云 hash 粒度,采纳条件恒成立。
             learned = int(result.block_size)
-            cloud_id = self._lwd_default_cloud_id()
+            # 多云选路:probe 回执 cloud_id 供 _lwd_routed_cloud_id 采纳
+            if result.cloud_id is not None:
+                self._lwd_probe_cloud_by_req[request_id] = result.cloud_id
+            cloud_id = self._lwd_routed_cloud_id(request_id)
             self._lwd_hash_bs_by_cloud[cloud_id] = learned
             # 学习云侧 mamba 对齐网格并开启边侧自动对齐重切:此后原生
             # 调度的两个重切点(scheduler.py:436/726)用网格自动收 chunk,
@@ -1532,6 +1569,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_probe_bs_by_req.pop(request_id, None)
             self._lwd_resume_hit_by_req.pop(request_id, None)
             self._lwd_probe_chain_by_req.pop(request_id, None)
+            self._lwd_probe_cloud_by_req.pop(request_id, None)
             # mrope 台账随 abort 清理(多模态准入期预计算的位置缓存)
             self._lwd_mrope_positions_dict.pop(request_id, None)
             # probe 在飞期间的 abort:摘除 inflight(迟到的 probe 结果在
@@ -1540,6 +1578,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             inflight = self._lwd_probe_inflight.pop(request_id, None)
             if inflight is not None:
                 self._lwd_probe_bs_by_req.pop(request_id, None)
+                self._lwd_probe_cloud_by_req.pop(request_id, None)
                 logger.info(
                     "[Lwd][edge-notify] abort req=%s during probe inflight: "
                     "local abort with terminal signal", request_id,
@@ -1587,6 +1626,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_gen_chain_state.pop(request_id, None)
         self._lwd_resume_hit_by_req.pop(request_id, None)
         self._lwd_probe_chain_by_req.pop(request_id, None)
+        self._lwd_probe_cloud_by_req.pop(request_id, None)
         if prompt_ids is None:
             return
         vllm_config = getattr(self, "vllm_config", None)

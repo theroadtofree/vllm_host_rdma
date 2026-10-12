@@ -128,8 +128,18 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         return super().update_from_output(scheduler_output, model_runner_output)
 
     def finish_requests(self, request_ids, finished_status):
-        """原生终结钩子:登记完结台账(classify 区分迟到预告)后透传。"""
-        ids = [request_ids] if isinstance(request_ids, str) else request_ids
+        """原生终结钩子:登记完结台账(classify 区分迟到预告)后透传。
+
+        ``request_ids=None`` 是原生的「终结全部」语义(关停路径
+        ``EngineCore._handle_shutdown`` 就传 None,见 scheduler.py:1850),
+        必须先展开再遍历:直接 for 在 None 上会抛 TypeError,使关停半途
+        fatal、EngineCore 永不退出,父进程卡在等 worker 收尾。"""
+        if request_ids is None:
+            ids = list(self.requests)
+        elif isinstance(request_ids, str):
+            ids = [request_ids]
+        else:
+            ids = request_ids
         for rid in ids:
             self._lwd_note_finished(rid)
         return super().finish_requests(request_ids, finished_status)

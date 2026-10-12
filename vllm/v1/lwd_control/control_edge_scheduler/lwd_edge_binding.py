@@ -5,9 +5,9 @@
   * 范围预告/abort 按 ``cloud_of`` 定向控制面发布;
   * finish/abort 时 ``unbind`` 解绑(释放台账,迟到结果不再认领)。
 
-选路(中央调度器/higress)未接入前,绑定统一落在第一台云
-(``registry.cloud_ids[0]``),即"唯一的云侧 id";选路接入后由
-请求携带的 cloud_id 决定绑定目标,本表接口不变。
+选路由 probe 回执 cloud_id 驱动(``_lwd_routed_cloud_id``):多云时
+按回执绑定;单云/未启用选路时回退 ``registry.cloud_ids[0]``。本表
+接口不变。
 """
 
 from __future__ import annotations

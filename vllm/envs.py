@@ -2010,6 +2010,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Edge-cloud gateway Bearer API token for prefix-negotiation control
+    # plane (sensitive; never log its value). Set on the edge when the
+    # HTTP probe goes through an authenticated AI gateway (Higress/NewAPI).
+    # Unset = no Authorization header (direct unauthenticated cloud).
+    "VLLM_LWD_CLOUD_API_KEY": lambda: os.getenv("VLLM_LWD_CLOUD_API_KEY"),
 }
 
 

@@ -273,9 +273,8 @@ class LwdCloudEngineCore(EngineCoreProc):
         生成段哈希由边侧 ``LwdFinishNotify`` 上报(见 ``apply_finish_chain``),
         云侧不再持租户密钥,故此处 ``generated_hashes=[]``。
 
-        usage 的消费口径与参考分支一致(仅边侧日志留痕,不注入客户端响应);
-        参考经探针 SSE 流末 chunk 承载,我们改挂本步 C2e 回边(见
-        ``_lwd_consume_usage``),故此处直接返回而不经控制面桥。"""
+        usage 双通道:数据面 C2e 回边(边侧留痕) + 控制面桥(SSE 末 chunk,
+        网关计费)。桥未启用时仅走数据面。"""
         coordinator = self._lwd_prefix_coordinator
         if coordinator is None:
             return {}
@@ -300,6 +299,13 @@ class LwdCloudEngineCore(EngineCoreProc):
                 completion_tokens=completion_tokens,
             )
             usages[request_id] = usage
+            # 同步推给控制面桥:HTTP SSE handler 末 chunk 发 usage 供网关计费
+            if self.cloud_control_event_queue is not None:
+                self.cloud_control_event_queue.put({
+                    "type": "usage",
+                    "request_id": request_id,
+                    "usage": usage,
+                })
         return usages
 
     def _lwd_setup_zmq(self) -> None:

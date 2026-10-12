@@ -1,27 +1,31 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""云侧前缀协商 HTTP 控制面(prefill_only 裁剪版)。
+"""云侧前缀协商 HTTP 控制面(SSE 网关形态)。
 
-从参考分支 ``edge_cloud/cloud_control.py`` 裁剪:父进程 FastAPI 应用 + 桥
+从参考分支 ``edge_cloud/cloud_control.py`` 演化:父进程 FastAPI 应用 + 桥
 (LwdCloudControlBridge),子进程处理器(LwdCloudControlProcessor,poll 非阻塞),
-经两条 multiprocessing 队列对接。宿主是 ``LwdCloudEngineCore``(替代参考分支
-的 ``PassiveEngineCore``)。
+经两条 multiprocessing 队列对接。宿主是 ``LwdCloudEngineCore``。
 
-本控制面**只承载 probe 一个事件**(命中结果随 JSON 响应头立即回边)。
-usage 不在此通道:它随数据面步元数据 ``LwdC2eNotify.usages`` 回边(参考分支
-原经探针 SSE 流末 chunk 承载且**只做边侧日志留痕**,我们换通道但保持同一
-消费口径——见 ``LwdEdgeEngineCore._lwd_consume_usage``)。
+控制面承载 probe + usage 两个事件,走 **OpenAI 兼容 SSE**:
+  1. Probe 结果放 ``delta.content`` 的 JSON 控制消息(网关 DTO 转换不丢);
+  2. 紧跟空 delta 帧,冲刷网关末 chunk 缓冲(NewAPI 等);
+  3. 期间每 10s 发 SSE comment 心跳,防网关上游空闲超时;
+  4. 推理完结后发标准 OpenAI usage chunk + ``[DONE]``,网关据此计费。
+
+响应头仍保留 ``X-Edge-Cloud-*`` 供直连调试/网关观测,不参与协商。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import queue
 import threading
+import time
 from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import wrap_req_id
@@ -29,13 +33,19 @@ from vllm.v1.lwd_control.control_communication.lwd_prefix import (
     HEADER_EDGE_ID,
     LwdPrefixManifest,
     LwdProbeResult,
+    LwdUsage,
 )
 
 logger = init_logger(__name__)
 
+# SSE 心跳间隔(秒):须小于网关 stream_idle_timeout,留足余量
+_USAGE_HEARTBEAT_INTERVAL = 10.0
+# usage 等待总超时(秒):覆盖完整推理时长,超时后发空 usage 收流
+_USAGE_WAIT_TIMEOUT = 600.0
+
 
 class LwdCloudControlBridge:
-    """父进程侧:把 HTTP 协程与子进程的 probe 事件用队列对接。
+    """父进程侧:把 HTTP 协程与子进程的 probe/usage 事件用队列对接。
 
     result 回传走 per-request 一次性 queue.Queue(dispatch 线程 put、
     handler 协程经 run_in_executor 阻塞 get):既消掉字典轮询的
@@ -49,6 +59,7 @@ class LwdCloudControlBridge:
         self._command_queue = command_queue
         self._event_queue = event_queue
         self._waiters: dict[str, queue.Queue] = {}
+        self._usage_waiters: dict[str, queue.Queue] = {}
         self._lock = threading.Lock()
         self._closed = False
         self._dispatch_thread = threading.Thread(
@@ -81,10 +92,6 @@ class LwdCloudControlBridge:
         except asyncio.TimeoutError:
             with self._lock:
                 self._waiters.pop(manifest.request_id, None)
-            # 哨兵唤醒 executor 里阻塞的 waiter.get:否则线程永不返回,
-            # 默认线程池被超时泄漏耗尽后所有 run_in_executor 用户停摆
-            # (probe 超时恰是云卡死场景,雪崩叠加)。迟到事件因 waiter
-            # 已摘除直接丢弃;哨兵与迟到 put 竞争用 put_nowait 防堵。
             try:
                 waiter.put_nowait((False, "probe timeout"))
             except queue.Full:
@@ -93,6 +100,46 @@ class LwdCloudControlBridge:
         if ok:
             return payload
         raise RuntimeError(payload or "probe failed")
+
+    async def wait_usage(
+        self, request_id: str, timeout: float = _USAGE_WAIT_TIMEOUT
+    ) -> LwdUsage | None:
+        """等推理完结的 usage 事件;超时返回 None。
+
+        与 probe 同款一次性队列;SSE handler 在 probe 发出后调用,
+        流保持打开直到 usage 到位或超时。"""
+        waiter: queue.Queue = queue.Queue(maxsize=1)
+        with self._lock:
+            self._usage_waiters[request_id] = waiter
+        loop = asyncio.get_running_loop()
+        try:
+            payload = await asyncio.wait_for(
+                loop.run_in_executor(None, waiter.get), timeout
+            )
+            return payload
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Lwd][ctrl] usage wait timeout req=%s", request_id)
+            return None
+        finally:
+            with self._lock:
+                self._usage_waiters.pop(request_id, None)
+
+    def publish_usage(self, request_id: str, usage: LwdUsage) -> None:
+        """子进程/引擎侧推送 usage 事件(dispatch 线程消费后投给 waiter)。
+
+        由 ``LwdCloudEngineCore._lwd_publish_finished_usage`` 在请求完结
+        结算后调用;事件经 mp event_queue 到父进程,再由 dispatch 线程
+        唤醒等待中的 SSE handler。"""
+        try:
+            self._event_queue.put({
+                "type": "usage",
+                "request_id": request_id,
+                "usage": usage,
+            })
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[Lwd][ctrl] publish_usage failed req=%s", request_id)
 
     def _dispatch_events(self) -> None:
         while not self._closed:
@@ -109,8 +156,6 @@ class LwdCloudControlBridge:
                 with self._lock:
                     waiter = self._waiters.pop(event["request_id"], None)
                 if waiter is not None:
-                    # put_nowait:超时探测已摘除 waiter 并放了哨兵,迟到的
-                    # 真实结果无人消费,阻塞 dispatch 线程只增尾延迟抖动
                     try:
                         waiter.put_nowait((
                             bool(event.get("ok")),
@@ -119,14 +164,21 @@ class LwdCloudControlBridge:
                         ))
                     except queue.Full:
                         pass
+            elif kind == "usage":
+                with self._lock:
+                    waiter = self._usage_waiters.pop(event["request_id"], None)
+                if waiter is not None:
+                    try:
+                        waiter.put_nowait(event.get("usage"))
+                    except queue.Full:
+                        pass
 
 
 class LwdCloudControlProcessor:
     """子进程侧:step 循环头部/WAKEUP 后非阻塞 poll,消费 probe 命令。
 
     命令来源是本地线程安全队列(唤醒线程已从 mp 命令队列搬入并敲
-    过 WAKEUP):不再有 mp.Queue.get_nowait 的 feeder 竞态,旧的
-    sleep(0.002)x3 补偿随之删除——poll 纯 drain,零阻塞。"""
+    过 WAKEUP):不再有 mp.Queue.get_nowait 的 feeder 竞态。"""
 
     def __init__(self, pending_queue: Any, event_queue: Any) -> None:
         self._pending_queue = pending_queue
@@ -159,10 +211,32 @@ class LwdCloudControlProcessor:
                     })
 
 
+def _sse_data(obj: Any) -> str:
+    return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
+
+
+def _build_chunk(
+    request_id: str, model: str, choices: list, usage: dict | None = None
+) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": choices,
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
 def create_lwd_cloud_control_app(
     bridge: LwdCloudControlBridge,
 ) -> Any:
-    """FastAPI 控制面应用;/v1/chat/completions 先校验协议头再消费 body。"""
+    """FastAPI 控制面应用;成功响应走 OpenAI 兼容 SSE。
+
+    错误路径仍用 JSONResponse(网关对非 2xx 的 JSON 错误体有标准处理)。
+    """
     app = FastAPI()
 
     @app.post("/v1/chat/completions")
@@ -224,21 +298,74 @@ def create_lwd_cloud_control_app(
             logger.exception("[Lwd][ctrl] handler probe raised")
             return JSONResponse({"error": str(exc)}, status_code=503)
 
-        # 命中结果必须随响应头立即回边。边侧 negotiate 只读响应头、不消费 body;
-# 参考分支曾把 usage 挂在同一条 SSE 流末 chunk(且只做边侧日志留痕),而
-# StreamingResponse 的响应头要等 events() 首 chunk 才发出,会把命中结果
-# 卡到请求完结 → 边侧探针超时。故本控制面只走 JSONResponse(头即结果),
-# usage 改由数据面步元数据 LwdC2eNotify.usages 回边(同一消费口径)。
-        return JSONResponse(
-            content={
-                "request_id": result.request_id,
-                "instance_id": result.instance_id,
-                "block_size": result.block_size,
-                "hit_blocks": result.hit_blocks,
-                "hit_tokens": result.hit_tokens,
-                "alignment_tokens": result.alignment_tokens,
-            },
-            headers=result.to_headers(),
+        # Probe 结果走 SSE delta.content(网关 DTO 转换不丢),响应头保留
+        # 供直连调试/网关观测。usage 在同一条 SSE 流末 chunk,网关据此计费。
+        raw_request_id = manifest.request_id
+        # 回显给边侧的是剥掉 wrap 前缀的原始 id(边侧校验一致性)
+        display_request_id = result.request_id
+        if display_request_id.startswith(f"e{edge_id}-"):
+            display_request_id = display_request_id[len(f"e{edge_id}-"):]
+        model = body.get("model", "edge-cloud-prefix")
+
+        control_message = result.to_control_message()
+        # 控制消息里的 request_id 用回显形式
+        control_message["request_id"] = display_request_id
+
+        async def events():
+            # 1. Probe 控制消息(delta.content 携带,网关 DTO 转换不丢)
+            yield _sse_data(_build_chunk(
+                display_request_id,
+                model,
+                [{"index": 0, "delta": {
+                    "role": "assistant",
+                    "content": json.dumps(control_message, separators=(",", ":")),
+                }, "finish_reason": None}],
+            ))
+            # 2. 空 delta 帧:冲刷网关末 chunk 缓冲(NewAPI 等)
+            yield _sse_data(_build_chunk(
+                display_request_id,
+                model,
+                [{"index": 0, "delta": {}, "finish_reason": None}],
+            ))
+            # 3. 等 usage(推理完结后由引擎推入)
+            usage: LwdUsage | None = None
+            usage_task = asyncio.create_task(
+                bridge.wait_usage(manifest.request_id))
+            try:
+                while not usage_task.done():
+                    done, _ = await asyncio.wait(
+                        {usage_task}, timeout=_USAGE_HEARTBEAT_INTERVAL)
+                    if not done:
+                        yield ": edge-cloud-usage-pending\n\n"
+                usage = usage_task.result()
+            except asyncio.CancelledError:
+                if not usage_task.done():
+                    usage_task.cancel()
+                await asyncio.gather(usage_task, return_exceptions=True)
+                raise
+            # 4. usage 末 chunk + [DONE]
+            usage_dict = (
+                usage.to_openai_dict() if usage is not None else {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                }
+            )
+            yield _sse_data(_build_chunk(
+                display_request_id,
+                model,
+                [],
+                usage=usage_dict,
+            ))
+            yield "data: [DONE]\n\n"
+
+        headers_out = {
+            **result.to_headers(),
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        return StreamingResponse(
+            events(), media_type="text/event-stream", headers=headers_out
         )
 
     return app
