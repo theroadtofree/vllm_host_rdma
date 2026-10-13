@@ -51,7 +51,7 @@ from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
 from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
     LwdControlRouterChannel,
 )
-from vllm.v1.lwd_debug import LwdDebug, LwdLogBase
+from vllm.v1.lwd_debug import LwdLogBase
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
@@ -714,7 +714,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
         # [Lwd][perf] 临时探针:收割时长 = RPC 往返 + worker 执行全长
         # (与 worker 侧 [Lwd][perf] unembed 分段对账,差值即进程往返开销)
-        logger.info(
+        logger.debug(
             "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
         )
         for index, request_id in enumerate(notify.req_ids):
@@ -724,10 +724,12 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 list(sampled_token_map.get(request_id, []))
                 if sampled_token_map else []
             )
-            LwdDebug.edge_tokens_delivered(  # [lwd-debug]
-                request_id, sampled_token_ids, finish_reason,
-                self.vllm_config,
-            )
+            # [lwd-debug] 性能关闭:每拍 tokenizer.decode() 是 CPU 重活,
+            # 诊断乱码时恢复
+            # LwdDebug.edge_tokens_delivered(
+            #     request_id, sampled_token_ids, finish_reason,
+            #     self.vllm_config,
+            # )
             if not sampled_token_ids and not finished:
                 # 行在批里但无 token 且未完结 = unembed 失败,ERROR 优先于
                 # 云侧码(已完结的空行属正常,如 DISABLE_DOWN 下的 ABORT)

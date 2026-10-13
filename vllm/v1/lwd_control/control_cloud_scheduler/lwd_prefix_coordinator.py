@@ -195,7 +195,7 @@ class LwdPrefixCoordinator:
             len(manifest.full_block_hashes),
             chain,
         )
-        logger.info(
+        logger.debug(
             "[Lwd][coord] probe req=%s hit_blocks=%d hit_tokens=%d",
             manifest.request_id, hit_blocks, hit_tokens,
         )
@@ -244,7 +244,7 @@ class LwdPrefixCoordinator:
         # 幂等回填:prompt 算完后每个 decode 步都会被调一次,只有真新增
         # 摘要时才打日志(否则长生成把日志刷满,掩盖 probe 行)
         if len(self._completed_hashes) != before:
-            logger.info(
+            logger.debug(
                 "[Lwd][coord] complete req=%s blocks=%d new=%d",
                 request_id, len(chain), len(self._completed_hashes) - before,
             )

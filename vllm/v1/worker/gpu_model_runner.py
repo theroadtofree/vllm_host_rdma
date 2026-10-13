@@ -2114,13 +2114,16 @@ class GPUModelRunner(
                     self.inputs_embeds.cpu[
                         output_idx : output_idx + actual_num_sched
                     ].copy_(req_embeds[start_pos:actual_end])
-                    from vllm.v1.lwd_debug import LwdDebug
-                    LwdDebug.cloud_fill_window(  # [lwd-debug]
-                        self.input_batch.req_ids[req_idx],
-                        start_pos,
-                        actual_num_sched,
-                        req_embeds[start_pos:actual_end],
-                    )
+                    # [lwd-debug] 性能关闭:实参 window 的 float()/sum()/
+                    # tolist() 会触发 D2H 同步,诊断时连同 LwdDebug.
+                    # cloud_fill_window 内部计算一起恢复
+                    # from vllm.v1.lwd_debug import LwdDebug
+                    # LwdDebug.cloud_fill_window(
+                    #     self.input_batch.req_ids[req_idx],
+                    #     start_pos,
+                    #     actual_num_sched,
+                    #     req_embeds[start_pos:actual_end],
+                    # )
 
                 output_idx += num_sched
 
@@ -3597,13 +3600,15 @@ class GPUModelRunner(
             and is_first_rank
             and not is_encoder_decoder
         ):
-            from vllm.v1.lwd_debug import LwdDebug
-            LwdDebug._log(  # [lwd-debug]
-                "[lwd-branch-dbg] preprocess: MM branch (supports_mm_inputs=True), "
-                "n=%d, input_ids[:8]=%s",
-                num_scheduled_tokens,
-                self.input_ids.gpu[: min(8, num_scheduled_tokens)].tolist(),
-            )
+            # [lwd-debug] 性能关闭:input_ids.gpu[:8].tolist() 是每步 D2H
+            # 同步;诊断时恢复(连同 LwdDebug._log 的级别)
+            # from vllm.v1.lwd_debug import LwdDebug
+            # LwdDebug._log(
+            #     "[lwd-branch-dbg] preprocess: MM branch "
+            #     "(supports_mm_inputs=True), n=%d, input_ids[:8]=%s",
+            #     num_scheduled_tokens,
+            #     self.input_ids.gpu[: min(8, num_scheduled_tokens)].tolist(),
+            # )
             # Run the multimodal encoder if any.
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
@@ -3630,11 +3635,12 @@ class GPUModelRunner(
                 **self._extract_mm_kwargs(scheduler_output),
             }
         elif self.enable_prompt_embeds and is_first_rank:
-            from vllm.v1.lwd_debug import LwdDebug
-            LwdDebug._log(  # [lwd-debug]
-                "[lwd-branch-dbg] preprocess: prompt-embeds branch, n=%d",
-                num_scheduled_tokens,
-            )
+            # [lwd-debug] 性能关闭(分支诊断):见 MM 分支注释
+            # from vllm.v1.lwd_debug import LwdDebug
+            # LwdDebug._log(
+            #     "[lwd-branch-dbg] preprocess: prompt-embeds branch, n=%d",
+            #     num_scheduled_tokens,
+            # )
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
             # TODO(qthequartermasterman): Since even when prompt embeds are
@@ -3661,11 +3667,12 @@ class GPUModelRunner(
             model_kwargs = self._init_model_kwargs()
             input_ids = None
         else:
-            from vllm.v1.lwd_debug import LwdDebug
-            LwdDebug._log(  # [lwd-debug]
-                "[lwd-branch-dbg] preprocess: text-only branch, n=%d",
-                num_scheduled_tokens,
-            )
+            # [lwd-debug] 性能关闭(分支诊断):见 MM 分支注释
+            # from vllm.v1.lwd_debug import LwdDebug
+            # LwdDebug._log(
+            #     "[lwd-branch-dbg] preprocess: text-only branch, n=%d",
+            #     num_scheduled_tokens,
+            # )
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since

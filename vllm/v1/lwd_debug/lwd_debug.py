@@ -25,7 +25,9 @@ class LwdDebug:
             return
         from vllm.logger import init_logger
 
-        init_logger(__name__).info(msg, *args)
+        # debug 级:诊断日志(逐 token/逐 chunk 量级)不污染默认 info 输出;
+        # 排查时提级即可,ENABLED 总开关语义不变
+        init_logger(__name__).debug(msg, *args)
 
     # ------------------------------------------------------------------ #
     # cloud                                                              #
