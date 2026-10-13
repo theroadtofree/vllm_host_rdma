@@ -73,13 +73,16 @@ class LwdCloudControlBridge:
         self._closed = True
 
     async def probe(
-        self, manifest: LwdPrefixManifest, timeout: float = 60.0
+        self, manifest: LwdPrefixManifest, timeout: float = 20.0
     ) -> LwdProbeResult:
         """发探针命令并阻塞等结果;超时抛 TimeoutError(由 handler 转 503)。
 
         等待者先注册再发命令(无丢事件竞态);结果经一次性队列回传,
-        run_in_executor 阻塞等待不碰事件循环(见类 docstring)。"""
-        logger.info("[Lwd][ctrl] bridge probe req=%s", manifest.request_id)
+        run_in_executor 阻塞等待不碰事件循环(见类 docstring)。
+        超时口径与边侧对齐:边侧 probe 看门狗 15s 即 fail-open 直通,
+        云侧多等无意义(请求早已按未命中继续)——20s = 边侧 15s +
+        网络/排队余量,超时结果只用于观测,不再影响请求走向。"""
+        logger.debug("[Lwd][ctrl] bridge probe req=%s", manifest.request_id)
         waiter: queue.Queue = queue.Queue(maxsize=1)
         with self._lock:
             self._waiters[manifest.request_id] = waiter
@@ -147,7 +150,7 @@ class LwdCloudControlBridge:
                 event = self._event_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-            logger.info(
+            logger.debug(
                 "[Lwd][ctrl] dispatch got event type=%s req=%s ok=%s",
                 event.get("type"), event.get("request_id"), event.get("ok"),
             )
@@ -190,7 +193,7 @@ class LwdCloudControlProcessor:
                 command = self._pending_queue.get_nowait()
             except queue.Empty:
                 return
-            logger.info("[Lwd][ctrl] poll consumed command type=%s", command.get("type"))
+            logger.debug("[Lwd][ctrl] poll consumed command type=%s", command.get("type"))
             if command.get("type") == "probe":
                 manifest: LwdPrefixManifest = command["manifest"]
                 try:
@@ -285,15 +288,27 @@ def create_lwd_cloud_control_app(
         )
 
         try:
-            logger.info(
+            logger.debug(
                 "[Lwd][ctrl] handler entering probe req=%s edge=%d",
                 manifest.request_id, edge_id,
             )
             result = await bridge.probe(manifest)
-            logger.info(
+            logger.debug(
                 "[Lwd][ctrl] handler probe resolved req=%s hit=%d",
                 manifest.request_id, result.hit_tokens,
             )
+        except TimeoutError as exc:
+            # 引擎主循环在超时窗口内未消费 probe 命令(负载期步长被数据面
+            # 拉长);边侧 15s 看门狗早已 fail-open,本结果只作观测——
+            # 一行 warning 足够,不打异常栈(频发时会刷屏)。真正需要
+            # 关注的是出现频率:常态化即主循环响应控制面劣化,查步长。
+            logger.warning(
+                "[Lwd][ctrl] probe timeout req=%s edge=%d: %s "
+                "(engine loop did not answer in time; edge already "
+                "failed-open)",
+                manifest.request_id, edge_id, exc,
+            )
+            return JSONResponse({"error": str(exc)}, status_code=503)
         except Exception as exc:  # noqa: BLE001
             logger.exception("[Lwd][ctrl] handler probe raised")
             return JSONResponse({"error": str(exc)}, status_code=503)
