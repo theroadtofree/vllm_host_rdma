@@ -630,15 +630,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     (cloud_id, engine), time.monotonic()
                 )
                 if time.monotonic() - held_since > _LWD_GATE_HELD_FAIL_AFTER_S:
+                    ledger_keys = [
+                        k for k in self._lwd_batch_requests
+                        if k[:2] == (cloud_id, engine)
+                    ]
                     raise RuntimeError(
                         f"[LWD] prefill gate stuck HOLD for "
                         f"{_LWD_GATE_HELD_FAIL_AFTER_S}s on "
                         f"cloud={cloud_id} engine={engine} "
                         f"(pending_chunks={pending}): cloud engine presumed "
                         f"dead after consuming UP without first-token; "
-                        f"batch ledger keys="
-                        f"{[k for k in self._lwd_batch_requests
-                           if k[:2] == (cloud_id, engine)]}"
+                        f"batch ledger keys={ledger_keys}"
                     )
                 return True
             else:
