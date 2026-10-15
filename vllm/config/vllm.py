@@ -994,19 +994,18 @@ class VllmConfig:
                             "(data_parallel_size>1); multi-DP edge is not "
                             "supported")
                 else:
-                    # Legacy 不支持云内多引擎:边侧拿不到云侧 dp 真值,
-                    # 两侧 world 算不齐会在共享 store rendezvous 挂死——
-                    # 云内 DP 部署必须走 --role-registry(registry 声明
-                    # dp_size,全场同源)。
-                    if self.parallel_config.data_parallel_size > 1:
+                    # Legacy 云侧:--data-parallel-size 是引擎数权威(每
+                    # DP rank 一个 LWD 云引擎);--cloud-dp-size 留缺省即
+                    # 采纳之,显式 mismatch 拒绝。边侧则以 --cloud-dp-size
+                    # 为唯一拓扑来源(本地 dp 恒 1)。
+                    dp_size = self.parallel_config.data_parallel_size
+                    if parallel_lwd.cloud_dp_size == 1:
+                        parallel_lwd.cloud_dp_size = dp_size
+                    elif parallel_lwd.cloud_dp_size != dp_size:
                         raise ValueError(
-                            "[Lwd] legacy (no --role-registry) mode does not "
-                            "support cloud data_parallel_size>1: the edge "
-                            "cannot learn the cloud engine count and the "
-                            "shared-world rendezvous would deadlock; use a "
-                            "role registry (dp_size per cloud) instead"
-                        )
-                    parallel_lwd.cloud_dp_size = 1
+                            "Lwd cloud --cloud-dp-size "
+                            f"({parallel_lwd.cloud_dp_size}) must equal "
+                            f"--data-parallel-size ({dp_size})")
                 # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
                 # 每云 engine 一组 TP=cloud_npu_count);配置 tp 回填为真值,
                 # 使头数/KV spec/MoE 切分等配置派生量与运行时组态对齐。

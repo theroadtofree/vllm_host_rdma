@@ -654,6 +654,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if cfg_pair is None:
             return None
         coord_cfg, vllm_config = cfg_pair
+        if getattr(coord_cfg, "placement_only", False):
+            return None
         learned = self._lwd_hash_bs_by_cloud.get(self._lwd_default_cloud_id(), 0)
         if learned <= 0:
             return None
@@ -1218,7 +1220,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         coord_cfg = getattr(vllm_config, "lwd_coordination", None)
         if coord_cfg is None or not getattr(coord_cfg, "enabled", False):
             return None
-        if not coord_cfg.control_url or not coord_cfg.tenant_key_file:
+        if not coord_cfg.control_url:
+            return None
+        # placement_only(纯放置,不建链):无需租户密钥
+        if not coord_cfg.tenant_key_file and not getattr(
+            coord_cfg, "placement_only", False
+        ):
             return None
         return coord_cfg, vllm_config
 
@@ -1226,8 +1233,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """probe 客户端缓存(按当前建链粒度):hasher/密钥只建一次。"""
         client = self._lwd_probe_client_cache
         if client is None or client._hasher.block_size != build_bs:
-            with open(coord_cfg.tenant_key_file, "rb") as f:
-                tenant_key = f.read()
+            if coord_cfg.tenant_key_file:
+                with open(coord_cfg.tenant_key_file, "rb") as f:
+                    tenant_key = f.read()
+            else:
+                # placement_only:无密钥,空 key 占位(链不消费)
+                tenant_key = b""
+
             from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
                 LwdEdgePrefixClient,
             )
@@ -1277,6 +1289,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 model_cfg, "model", None
             )
 
+        placement_only = getattr(coord_cfg, "placement_only", False)
+
         async def _job():
             session = await runtime.ensure_session()
             manifest = client.build_manifest(
@@ -1287,6 +1301,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 media_items=media_items,
                 model=model_name,
             )
+            # placement_only:probe 只取放置回执(engine_index),链不入档
+            # (无前缀复用,HMAC 建链是纯浪费)
+            if placement_only:
+                return result, None
             return result, list(manifest.full_block_hashes)
 
         try:

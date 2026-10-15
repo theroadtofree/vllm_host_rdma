@@ -20,6 +20,10 @@ logger = init_logger(__name__)
 @dataclass
 class LwdCoordinationConfig:
     enabled: bool = False
+    # 仅放置模式:probe 只承担云内 DP 的引擎放置(纯负载,无 HMAC 建链/
+    # 不续算/不上报收尾链),不要求 prefix caching 与租户密钥——供不开
+    # 前缀复用但需云内多引擎的部署(GLM dp>1)
+    placement_only: bool = False
     # 边
     control_url: str | None = None
     tenant_key_file: str | None = None
@@ -38,9 +42,9 @@ class LwdCoordinationConfig:
         if not isinstance(raw, dict):
             return cls()
         known = {
-            "enabled", "control_url", "tenant_key_file", "consumer_id",
-            "listen_host", "listen_port", "instance_id", "connect_timeout",
-            "enforce_mm_abi_match",
+            "enabled", "placement_only", "control_url", "tenant_key_file",
+            "consumer_id", "listen_host", "listen_port", "instance_id",
+            "connect_timeout", "enforce_mm_abi_match",
         }
         kwargs = {k: v for k, v in raw.items() if k in known}
         return cls(**kwargs)
@@ -55,7 +59,7 @@ class LwdCoordinationConfig:
                 "lwd prefix coordination requires lwd_config.mode "
                 "'prefill_only'"
             )
-        if not is_edge and not enable_prefix_caching:
+        if not is_edge and not enable_prefix_caching and not self.placement_only:
             # 仅云侧依赖本地前缀缓存(命中/续算);边侧无 KV,不强求,
             # 且边侧开 enable_prefix_caching 会触发 AscendHybridKVCacheCoordinator
             # 对 prefill_only 空 spec 的 >1 组断言崩溃。
@@ -63,7 +67,7 @@ class LwdCoordinationConfig:
                 "lwd prefix coordination requires cache_config"
                 ".enable_prefix_caching=True on the cloud"
             )
-        if is_edge and not self.tenant_key_file:
+        if is_edge and not self.tenant_key_file and not self.placement_only:
             # 租户密钥只在边侧读取(probe 建链 + 收尾上报生成段链);
             # 云侧不持密钥——这是隐私前提,故仅边侧强制要求。
             raise ValueError(

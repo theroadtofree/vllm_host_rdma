@@ -153,9 +153,9 @@ class LwdParallelConfig:
     """Registry mode: cloud instance id -> 云内 DP 引擎数(与
     cloud_ranks_layout 同处填充;缺省/缺键 = 1,单引擎)。"""
     cloud_dp_size: int = Field(default=1, ge=1)
-    """Legacy(非 registry)路径的云内 DP 引擎数。legacy 不支持云内多
-    引擎(边侧拿不到云侧真值,rendezvous 会挂死),恒 1;云内 DP 部署
-    走 registry(cloud_dp_layout)。"""
+    """Legacy(非 registry)路径的云内 DP 引擎数:来自 ``--cloud-dp-size``
+    (边侧唯一拓扑来源);云侧 ``VllmConfig.__post_init__`` 校验其与
+    ``--data-parallel-size`` 同值。registry 模式以 cloud_dp_layout 为准。"""
 
     def cloud_engine_rank_base(self, dp_rank: int) -> int:
         """Legacy 布局:云 engine ``dp_rank`` 首卡的全局 rank。
@@ -942,11 +942,13 @@ class ParallelConfig:
             and self.lwd_config.cloud_npu_count > 0
         ):
             # Legacy 布局:world = 边 + 每引擎云卡 × 引擎数。引擎数取
-            # data_parallel_size(云侧真值;边侧 dp 恒 1,legacy 边不支持
-            # 多云引擎——多边/多云引擎场景必须走 registry)。
+            # max(--cloud-dp-size, data_parallel_size):边侧 dp 恒 1,
+            # 靠 --cloud-dp-size 得知云侧拓扑;云侧靠 --data-parallel-size
+            # (两者同源校验在 VllmConfig.__post_init__)。
             self.world_size = (
                 self.lwd_config.edge_npu_count
-                + self.lwd_config.cloud_npu_count * self.data_parallel_size
+                + self.lwd_config.cloud_npu_count
+                * max(self.lwd_config.cloud_dp_size, self.data_parallel_size)
             )
 
         if self.distributed_executor_backend == "external_launcher":
