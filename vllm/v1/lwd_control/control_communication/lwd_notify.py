@@ -12,6 +12,16 @@ if TYPE_CHECKING:
     from vllm.v1.engine import EngineCoreOutputs  # noqa: F401
 
 
+# 控制面协议版本:1 = mrope positions 经数据面 UP aux 帧([n,3] int64
+# 第二 P2P 载荷);2 = mrope positions 经控制面 LwdRangeItem.mrope_
+# positions 原始字节直传(数据面 aux 帧自 mrope 退役;aux 机制本身
+# 保留,供 deepstack 等大数据量载荷扩展);3 = 云内多 DP:HELLO 携带
+# engine_index/coord_stats_addr,C2eNotify 携带 engine_index。
+# 两侧必须同版本部署:
+# msgspec 容忍未知字段,版本错配时旧端不会报错,只会 mrope 静默缺失。
+LWD_WIRE_VERSION = 3
+
+
 class LwdRangeItem(msgspec.Struct, gc=False):
     """批量范围预告条目(mixed 组批);offset = 本 chunk 在 prompt 中的
     起点(chunk 支持已启用,lwd_chunked_prefill_design.md),云侧按
@@ -19,13 +29,17 @@ class LwdRangeItem(msgspec.Struct, gc=False):
     的自限块;cap 截断块独占一批。
 
     has_mrope(pdmix 多模态):逐请求标记本 chunk 是否携带 mrope
-    positions 行(UP aux 帧,[n,3] int64 与主帧同 seqno)。混批可含
-    文本+图像混合,批级标记不够;纯文本恒 False,零 aux 流量。"""
+    positions;wire_version>=2 起 positions 经 mrope_positions 原始字节
+    ([3,n] int64 小端,控制面直传)随本条目到达,不再走数据面 aux 帧。
+    混批可含文本+图像混合,批级标记不够;纯文本恒 False,零载荷。"""
 
     request_id: str
     offset: int
     num_tokens: int
     has_mrope: bool = False
+    mrope_positions: bytes = b""
+    """wire_version>=2:mrope positions 原始字节([3,n] int64,n =
+    num_tokens);has_mrope=False 时为空。"""
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):
@@ -143,6 +157,20 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     prefix_alignment_required: bool = False
     """云侧是否必须对齐(MambaSpec 且 align 模式);真时边侧须预留
     一个对齐块 + 满员 decode 预算。"""
+    wire_version: int = 0
+    """控制面协议版本(见 LWD_WIRE_VERSION):1=mrope 经数据面 aux 帧;
+    2=mrope 经控制面 RangeItem.mrope_positions 直传;3=云内多 DP
+    (HELLO 带 engine_index/coord_stats_addr)。缺省 0=旧版未携带。
+    mrope 模型下边侧构造期校验 >=LWD_WIRE_VERSION 并 fail-fast
+    ——msgspec 容忍未知字段,旧云对新字段静默丢弃,mrope 缺失不会
+    有任何报错,必须显式互校。"""
+    engine_index: int = 0
+    """云引擎身份(= 云内 dp_rank),wire_version>=3 起携带;云内多 DP
+    下边侧按它建 per-(cloud,engine) 端点表与路由账。缺省 0 = 单引擎。"""
+    coord_stats_addr: str = ""
+    """云侧 DPCoordinator 的 front 发布地址(tcp://<云可路由IP>:port),
+    边侧据此订阅 stats 对账并上行 FIRST_REQ 唤醒。空 = 无 coordinator
+    (单引擎),边侧不建唤醒通道。registry 声明 coord_port 时两侧互校。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
@@ -168,6 +196,10 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):
     缺省 -1 = 旧版云侧未携带(msgspec 带默认字段,线上 additive 兼容)。"""
     cloud_id: int = 0
     """来源云 id:边据此选 DOWN 通道接收;缺省 0 单云兼容。"""
+    engine_index: int = 0
+    """来源云引擎(= 云内 dp_rank),wire_version>=3 起携带:多云引擎
+    fan-in 下边侧按 (cloud_id, engine_index) 归账 seqno 流与路由账;
+    缺省 0 = 单引擎旧版。"""
     usages: list[dict] = []
     """逐请求 usage 回边(与 req_ids 按位对齐;空列表 = 未携带):
     云侧结算产出的 OpenAI 形状 usage(含 prompt_tokens_details.

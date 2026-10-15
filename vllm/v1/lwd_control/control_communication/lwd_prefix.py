@@ -36,6 +36,8 @@ HEADER_ALIGNMENT_TOKENS = "X-Edge-Cloud-Alignment-Tokens"
 HEADER_MM_ABI = "X-Edge-Cloud-MM-ABI"
 HEADER_CLOUD_ID = "X-Edge-Cloud-Cloud-Id"
 HEADER_PROMPT_TOKENS = "X-Edge-Cloud-Prompt-Tokens"
+# 云内 DP:probe 放置结果(选中引擎的云内 dp_rank);缺省 0 向后兼容
+HEADER_ENGINE_INDEX = "X-Edge-Cloud-Engine-Index"
 
 _FULL_BLOCK_DOMAIN = b"\x01"
 _TAIL_BLOCK_DOMAIN = b"\x02"
@@ -370,6 +372,9 @@ class LwdProbeResult:
     alignment_tokens: int = 0
     # 路由回执的云 id:多云选路时由中央调度器/网关填;None=单云或未启用选路
     cloud_id: int | None = None
+    # 云内 DP 放置结果:命中/预留落在的云内引擎序号(dp_rank);0=单引擎或
+    # 旧版云(未公告),边侧路由登记按 0 处理,向后兼容
+    engine_index: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id or not self.instance_id:
@@ -380,6 +385,8 @@ class LwdProbeResult:
             raise ValueError("hit_tokens must equal hit_blocks * block_size")
         if self.alignment_tokens < 0:
             raise ValueError("alignment_tokens must not be negative")
+        if self.engine_index < 0:
+            raise ValueError("engine_index must not be negative")
 
     def to_headers(self) -> dict[str, str]:
         headers = {
@@ -393,6 +400,8 @@ class LwdProbeResult:
         }
         if self.cloud_id is not None:
             headers[HEADER_CLOUD_ID] = str(self.cloud_id)
+        if self.engine_index:
+            headers[HEADER_ENGINE_INDEX] = str(self.engine_index)
         return headers
 
     def to_control_message(
@@ -414,6 +423,8 @@ class LwdProbeResult:
         }
         if self.cloud_id is not None:
             message["cloud_id"] = self.cloud_id
+        if self.engine_index:
+            message["engine_index"] = self.engine_index
         if mm_abi is not None:
             message["mm_abi"] = mm_abi
         return message
@@ -432,6 +443,10 @@ class LwdProbeResult:
         cloud_id = message.get("cloud_id")
         if cloud_id is not None and type(cloud_id) is not int:
             raise ValueError("probe cloud_id must be an integer or null")
+        # 旧版云不公告 engine_index:缺省 0(单引擎语义),向后兼容
+        engine_index = message.get("engine_index", 0)
+        if type(engine_index) is not int or engine_index < 0:
+            raise ValueError("probe engine_index must be a non-negative integer")
         return cls(
             request_id=message["request_id"],
             instance_id=message["instance_id"],
@@ -440,6 +455,7 @@ class LwdProbeResult:
             hit_tokens=message["hit_tokens"],
             alignment_tokens=int(message.get("alignment_tokens", 0)),
             cloud_id=cloud_id,
+            engine_index=engine_index,
         )
 
     @classmethod
@@ -467,6 +483,10 @@ class LwdProbeResult:
                     HEADER_ALIGNMENT_TOKENS.lower(), "0"
                 )),
                 cloud_id=int(cloud_id_raw) if cloud_id_raw else None,
+                # 旧版云无此头:缺省 0(单引擎语义),向后兼容
+                engine_index=int(values.get(
+                    HEADER_ENGINE_INDEX.lower(), "0"
+                )),
             )
         except ValueError as exc:
             raise ValueError("cloud prefix result contains invalid integers") from exc

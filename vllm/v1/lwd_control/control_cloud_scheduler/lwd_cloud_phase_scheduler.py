@@ -15,7 +15,10 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler as _NativeScheduler
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import parse_edge_id
-from vllm.v1.lwd_control.control_communication.lwd_notify import LwdRangeNotify
+from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_WIRE_VERSION,
+    LwdRangeNotify,
+)
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
@@ -251,6 +254,12 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                         has_mrope=[
                             _item0.has_mrope if _item0 else notify.has_mrope
                         ],
+                        # 幽灵批同样逐 item 透传(空 bytes 占位):
+                        # runner 的长度核验要求 mrope_positions 与
+                        # req_ids 等长,缺字段(空 list)会必崩
+                        mrope_positions=[
+                            _item0.mrope_positions if _item0 else b""
+                        ],
                         ghost_req_ids=[notify.request_id],
                     ),
                 )
@@ -324,6 +333,18 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
         # 预告无 mrope 概念,恒 False。
         edge_id, _ = parse_edge_id(notify.request_id)
         _item0 = notify.items[0] if notify.items else None
+        if (
+            _item0 is not None
+            and _item0.has_mrope
+            and not _item0.mrope_positions
+        ):
+            raise RuntimeError(
+                f"[Lwd][cloud-sched] mrope payload missing "
+                f"req={_item0.request_id} seqno={notify.seqno}: "
+                f"has_mrope=True 但控制面未携带 positions 字节——边侧仍按"
+                f"数据面 aux 帧协议运行(wire_version<{LWD_WIRE_VERSION}),"
+                f"两侧必须同版本部署"
+            )
         out.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -335,6 +356,9 @@ class LwdCloudPhaseScheduler(LwdBaseScheduler):
                 has_mrope=[
                     _item0.has_mrope if _item0 else notify.has_mrope
                 ],
+                # mrope positions 控制面字节透传(wire_version>=2,
+                # 数据面 aux 帧已退役);无 items 的旧版预告为空 bytes
+                mrope_positions=[_item0.mrope_positions if _item0 else b""],
             ),
         )
         return out

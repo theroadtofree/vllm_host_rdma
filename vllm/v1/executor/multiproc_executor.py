@@ -170,18 +170,28 @@ class MultiprocExecutor(Executor):
         try:
             if self.parallel_config.lwd_config.enable_lwd:
                 # 多实例(registry):本进程按自身实例条目的全局 rank 列表
-                # 逐 worker 分配(支持任意布局);缺省走 1E1C 连续
-                # edge-first 布局(边 [0,E),云 [E,E+C))
-                instance_ranks = self.parallel_config.lwd_config.instance_ranks()
-                if instance_ranks is not None:
-                    global_ranks = list(instance_ranks)
+                # 逐 worker 分配(支持任意布局);云内 DP 下每个引擎的
+                # executor 只 spawn 本引擎的 rank 段(engine i =
+                # ranks[i*C:(i+1)*C]);缺省走 1E1C 连续 edge-first 布局
+                # (边 [0,E),云 engine i [E+iC, E+(i+1)C))
+                lwd_cfg = self.parallel_config.lwd_config
+                engine_ranks = lwd_cfg.instance_engine_ranks(
+                    self.parallel_config.data_parallel_rank
+                )
+                if engine_ranks is not None:
+                    global_ranks = list(engine_ranks)
+                    global_start_rank = global_ranks[0]
+                elif lwd_cfg.instance_ranks() is not None:
+                    global_ranks = list(lwd_cfg.instance_ranks())
                     global_start_rank = global_ranks[0]
                 else:
                     global_ranks = None
                     global_start_rank = (
                         0
-                        if self.parallel_config.lwd_config.is_edge_node
-                        else self.parallel_config.lwd_config.edge_npu_count
+                        if lwd_cfg.is_edge_node
+                        else lwd_cfg.cloud_engine_rank_base(
+                            self.parallel_config.data_parallel_rank
+                        )
                     )
             else:
                 global_ranks = None
@@ -308,15 +318,27 @@ class MultiprocExecutor(Executor):
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
             # Each side's first rank is its own engine's driver worker
-            # (edge rank 0, cloud rank edge_npu_count); the native
-            # ``rank % tp_size`` picks the wrong worker under the
-            # edge-first asymmetric layout.
+            # (edge rank 0, cloud engine i rank E+i*C / registry 引擎段首
+            # 卡); the native ``rank % tp_size`` picks the wrong worker
+            # under the edge-first asymmetric layout.
             lwd = self.parallel_config.lwd_config
+            engine_ranks = lwd.instance_engine_ranks(
+                self.parallel_config.data_parallel_rank
+            )
+            if engine_ranks is not None:
+                # 云内 DP(registry):本引擎段首卡为 driver
+                return rank == engine_ranks[0]
             instance_ranks = lwd.instance_ranks()
             if instance_ranks is not None:
                 # 云侧复用(registry):本实例首个全局 rank 为 driver
                 return rank == instance_ranks[0]
-            return rank == (0 if lwd.is_edge_node else lwd.edge_npu_count)
+            return rank == (
+                0
+                if lwd.is_edge_node
+                else lwd.cloud_engine_rank_base(
+                    self.parallel_config.data_parallel_rank
+                )
+            )
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:

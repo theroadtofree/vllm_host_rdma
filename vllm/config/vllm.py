@@ -906,6 +906,12 @@ class VllmConfig:
                 parallel_lwd.cloud_ranks_layout = {
                     int(c["id"]): list(c["ranks"]) for c in _reg["clouds"]
                 }
+                # 云内 DP(GLM MoE):每云引擎数 = dp_size 字段(缺省 1);
+                # 云条目 ranks = 全引擎连续段(len = tp×dp)。
+                parallel_lwd.cloud_dp_layout = {
+                    int(c["id"]): int(c.get("dp_size", 1))
+                    for c in _reg["clouds"]
+                }
                 _self_id = (
                     parallel_lwd.edge_id
                     if self.lwd_config.is_edge
@@ -922,7 +928,39 @@ class VllmConfig:
                         f"found in role registry {parallel_lwd.role_registry}; "
                         f"known ids={sorted(_layout)}"
                     )
-                self.parallel_config.tensor_parallel_size = len(_layout[_self_id])
+                _self_ranks = _layout[_self_id]
+                _self_dp = 1
+                if not self.lwd_config.is_edge:
+                    # 云内 DP:本实例 TP = 每引擎卡数(len/dp);云侧
+                    # --data-parallel-size 必须与 registry dp_size 一致。
+                    _self_dp = parallel_lwd.cloud_dp_layout.get(_self_id, 1)
+                    if len(_self_ranks) % _self_dp != 0:
+                        raise ValueError(
+                            f"Lwd cloud {_self_id} ranks({len(_self_ranks)}) "
+                            f"not divisible by dp_size={_self_dp} in registry"
+                        )
+                    cli_dp = self.parallel_config.data_parallel_size
+                    if cli_dp != _self_dp:
+                        raise ValueError(
+                            f"Lwd cloud {_self_id}: --data-parallel-size "
+                            f"({cli_dp}) must equal registry dp_size "
+                            f"({_self_dp})"
+                        )
+                    if _self_dp > 1 and not (
+                        self.model_config is not None
+                        and self.model_config.is_moe
+                    ):
+                        # 云内 DP 的锁步(wave/dummy-run)只有 MoE 路径
+                        # 提供(DPEngineCoreProc);非 MoE dp>1 的引擎间
+                        # 无同步,组合行为未定义——拉起期拒绝
+                        raise ValueError(
+                            f"Lwd cloud {_self_id}: dp_size={_self_dp} "
+                            "requires an MoE model (wave lockstep is only "
+                            "provided on the MoE DP path)"
+                        )
+                self.parallel_config.tensor_parallel_size = (
+                    len(_self_ranks) // _self_dp
+                )
                 self.parallel_config.world_size = sum(
                     len(r) for r in parallel_lwd.edge_ranks_layout.values()
                 ) + sum(len(r) for r in parallel_lwd.cloud_ranks_layout.values())
@@ -943,17 +981,44 @@ class VllmConfig:
             else:
                 if self.lwd_config.is_edge and parallel_lwd.edge_npu_count <= 0:
                     raise ValueError("--edge-npu-count must be positive on the LWD edge process")
+                if self.lwd_config.is_edge:
+                    # 共享边单卡(glm_dp2 同则):多卡/多 DP 边不支持。
+                    if parallel_lwd.edge_npu_count != 1:
+                        raise ValueError(
+                            "LWD edge must be a single shared NPU "
+                            f"(--edge-npu-count={parallel_lwd.edge_npu_count}); "
+                            "multi-card edge is not supported")
+                    if self.parallel_config.data_parallel_size > 1:
+                        raise ValueError(
+                            "[Lwd] prefill_only edge must be single-card "
+                            "(data_parallel_size>1); multi-DP edge is not "
+                            "supported")
+                else:
+                    # Legacy 不支持云内多引擎:边侧拿不到云侧 dp 真值,
+                    # 两侧 world 算不齐会在共享 store rendezvous 挂死——
+                    # 云内 DP 部署必须走 --role-registry(registry 声明
+                    # dp_size,全场同源)。
+                    if self.parallel_config.data_parallel_size > 1:
+                        raise ValueError(
+                            "[Lwd] legacy (no --role-registry) mode does not "
+                            "support cloud data_parallel_size>1: the edge "
+                            "cannot learn the cloud engine count and the "
+                            "shared-world rendezvous would deadlock; use a "
+                            "role registry (dp_size per cloud) instead"
+                        )
+                    parallel_lwd.cloud_dp_size = 1
                 # 运行时并行组按 LWD 布局构建(边单例 TP=edge_npu_count,
-                # 云一组 TP=cloud_npu_count);配置 tp 回填为真值,使头数/
-                # KV spec/MoE 切分等配置派生量与运行时组态对齐。
+                # 每云 engine 一组 TP=cloud_npu_count);配置 tp 回填为真值,
+                # 使头数/KV spec/MoE 切分等配置派生量与运行时组态对齐。
                 self.parallel_config.tensor_parallel_size = (
                     parallel_lwd.edge_npu_count
                     if self.lwd_config.is_edge
                     else parallel_lwd.cloud_npu_count
                 )
                 # 边云模式并行度由拓扑推导,不接受 CLI 指定(对齐参考实现
-                # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云;PP 恒为
-                # 2(边 rank0 与云 rank0 成两段流水线,其余云 rank 单例);
+                # v0.23.0_lwd_prefill_only 70151bf):world = 边 + 云 × 引擎数
+                # (边为全部云 engine 共享的单实例);PP 恒为 2(边 rank0 与
+                # 云 rank0 成两段流水线,其余云 rank 单例);
                 # TP 边取 edge_npu_count、云取 cloud_npu_count(云侧按此切权重)。
                 if (self.parallel_config.tensor_parallel_size != 1
                         or self.parallel_config.pipeline_parallel_size != 1):
@@ -963,9 +1028,7 @@ class VllmConfig:
                         self.parallel_config.tensor_parallel_size,
                         self.parallel_config.pipeline_parallel_size,
                     )
-                self.parallel_config.world_size = (
-                    parallel_lwd.edge_npu_count + parallel_lwd.cloud_npu_count
-                )
+                self.parallel_config.world_size = parallel_lwd.lwd_world_size
                 self.parallel_config.pipeline_parallel_size = 2
                 self.parallel_config.tensor_parallel_size = (
                     parallel_lwd.edge_npu_count

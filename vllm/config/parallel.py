@@ -146,7 +146,36 @@ class LwdParallelConfig:
     ``VllmConfig.__post_init__``; empty in the legacy single-pair layout)."""
     cloud_ranks_layout: dict[int, list[int]] = Field(default_factory=dict)
     """Registry mode: cloud instance id -> its global ranks (filled in
-    ``VllmConfig.__post_init__``; empty in the legacy single-pair layout)."""
+    ``VllmConfig.__post_init__``; empty in the legacy single-pair layout).
+    云内 DP 下该列表是该云全部引擎的 rank(len = tp_size × dp_size,
+    连续段布局,engine i 占 [i*C, (i+1)*C))。"""
+    cloud_dp_layout: dict[int, int] = Field(default_factory=dict)
+    """Registry mode: cloud instance id -> 云内 DP 引擎数(与
+    cloud_ranks_layout 同处填充;缺省/缺键 = 1,单引擎)。"""
+    cloud_dp_size: int = Field(default=1, ge=1)
+    """Legacy(非 registry)路径的云内 DP 引擎数。legacy 不支持云内多
+    引擎(边侧拿不到云侧真值,rendezvous 会挂死),恒 1;云内 DP 部署
+    走 registry(cloud_dp_layout)。"""
+
+    def cloud_engine_rank_base(self, dp_rank: int) -> int:
+        """Legacy 布局:云 engine ``dp_rank`` 首卡的全局 rank。
+        布局:edge [0, E),engine i [E + i*C, E + (i+1)*C)。
+        Registry 模式请用 LwdRoleRegistry.cloud_engine_ranks。"""
+        return self.edge_npu_count + dp_rank * self.cloud_npu_count
+
+    @property
+    def lwd_world_size(self) -> int:
+        """Legacy 布局的共享 torch world:边 + 云 × cloud_dp。
+        Registry 模式的世界以 layout 求和为准,不读本值。"""
+        return self.edge_npu_count + self.cloud_npu_count * self.cloud_dp_size
+
+    def cloud_engine_count(self, cloud_id: int | None = None) -> int:
+        """该云的 DP 引擎数:registry 模式按 cloud_dp_layout,legacy
+        按 cloud_dp_size;cloud_id 缺省取本进程 cloud_id。"""
+        if self.cloud_dp_layout:
+            cid = self.cloud_id if cloud_id is None else cloud_id
+            return self.cloud_dp_layout.get(cid, 1)
+        return self.cloud_dp_size
 
     def instance_ranks(self) -> list[int] | None:
         """Registry mode: this process's own instance global ranks; legacy
@@ -156,18 +185,31 @@ class LwdParallelConfig:
         layout = self.edge_ranks_layout if self.is_edge_node else self.cloud_ranks_layout
         return layout.get(self.edge_id if self.is_edge_node else self.cloud_id)
 
+    def instance_engine_ranks(self, engine_idx: int) -> list[int] | None:
+        """Registry 云模式:本进程引擎 engine_idx(= dp_rank)的 rank 段;
+        边/legacy 返回 None。"""
+        ranks = self.instance_ranks()
+        if ranks is None or self.is_edge_node:
+            return None
+        dp = self.cloud_dp_layout.get(self.cloud_id, 1)
+        c = len(ranks) // dp
+        return ranks[engine_idx * c:(engine_idx + 1) * c]
+
     def edge_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance edge NPU count."""
-        return self.edge_npu_count // data_parallel_size
+        """Per-DP-instance edge NPU count. 边是全部云 engine 共享的单
+        实例,恒为 edge_npu_count(保留供按 DP 迭代的调用方)。"""
+        return self.edge_npu_count
 
     def cloud_npu_count_per_dp(self, data_parallel_size: int) -> int:
-        """Per-DP-instance cloud NPU count."""
-        return self.cloud_npu_count // data_parallel_size
+        """Per-DP-instance (per-engine) cloud NPU count——字段本身即
+        每引擎语义,不做除法。"""
+        return self.cloud_npu_count
 
     def is_shared_model_edge(self, data_parallel_size: int) -> bool:
         """True when the LWD edge is a single shared rank across all DP
         instances (one NPU shared by the virtual DP workers)."""
-        return (self.enable_lwd and self.edge_npu_count_per_dp(data_parallel_size) == 1 and data_parallel_size > 1)
+        return (self.enable_lwd and self.edge_npu_count == 1
+                and self.cloud_engine_count() > 1)
 
 
 @config
@@ -743,7 +785,13 @@ class ParallelConfig:
             # asymmetric edge/cloud topology.
             instance_ranks = self.lwd_config.instance_ranks()
             if instance_ranks is not None:
-                # 云侧复用(registry):本进程 spawn 自身实例条目的 rank 数
+                # 云侧复用(registry):边 spawn 自身条目全部 rank;云内 DP
+                # 下每引擎 executor 只 spawn 本引擎的 C 张卡(device 切片
+                # 按 local_world_size,见 set_device_control_env_var)。
+                if not self.lwd_config.is_edge_node:
+                    dp = self.lwd_config.cloud_dp_layout.get(
+                        self.lwd_config.cloud_id, 1)
+                    return len(instance_ranks) // dp
                 return len(instance_ranks)
             return (
                 self.lwd_config.edge_npu_count
@@ -893,8 +941,12 @@ class ParallelConfig:
             self.lwd_config.edge_npu_count > 0
             and self.lwd_config.cloud_npu_count > 0
         ):
+            # Legacy 布局:world = 边 + 每引擎云卡 × 引擎数。引擎数取
+            # data_parallel_size(云侧真值;边侧 dp 恒 1,legacy 边不支持
+            # 多云引擎——多边/多云引擎场景必须走 registry)。
             self.world_size = (
-                self.lwd_config.edge_npu_count + self.lwd_config.cloud_npu_count
+                self.lwd_config.edge_npu_count
+                + self.lwd_config.cloud_npu_count * self.data_parallel_size
             )
 
         if self.distributed_executor_backend == "external_launcher":
