@@ -230,6 +230,32 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_gate_pending: dict[str, LwdRequestNotify] = {}
         self._lwd_seqno_registry: dict[str, list[int]] = {}
         self.scheduler.lwd_seqno_registry = self._lwd_seqno_registry
+        # [Lwd][pre-recv] 提前收:提示下发通道 = 引擎 -> 云端点 worker 通信线程。
+        # 走 executor 上的旁路 MQ(不是 rpc_broadcast_mq:那条由 busy_loop 单线程
+        # 消费,会被几百毫秒的 prefill 前向堵住,提示就"早"不起来了)。引擎在
+        # super().__init__ 里就把 executor 建好了,故此处直接取。
+        # 顺序:必须排在泵线程启动之前——泵线程一起来就会分发 notify 并调
+        # post_irecv_hint,注册晚一步首条提示就会被丢(闸门永不放行)。
+        hint_mq = getattr(self.model_executor, "lwd_recv_hint_mq", None)
+        if self._lwd_early_recv and hint_mq is not None:
+            from vllm_ascend.distributed.lwd_comm.pre_recv import (
+                register_hint_sender,
+            )
+
+            # 阻塞投递:闸门开启时提示是正确性依赖,丢一条就没人提前挂该 recv,
+            # 水位不前进,闸门后的批永不下发。
+            register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint))
+            logger.info(
+                "[Lwd][pre-recv] hint sender registered (PD_mix -> hint MQ)"
+            )
+        else:
+            # armed=False 是相位调度分支的正常形态;armed=True 却没有 hint MQ
+            # 就是接线坏了(提示发不出去 ⇒ 闸门永不放行),必须显式可见。
+            logger.warning(
+                "[Lwd][pre-recv] hint sender NOT registered armed=%s "
+                "hint_mq=%s",
+                self._lwd_early_recv, hint_mq is not None,
+            )
         threading.Thread(
             target=self._lwd_pre_out_loop, daemon=True, name="lwd-pre-out"
         ).start()
