@@ -220,6 +220,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             num_speculative_tokens=(
                 getattr(spec_config, "num_speculative_tokens", None) or 0
             ),
+            # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
+            wire_version=LWD_WIRE_VERSION,
         )
         # 业务层就绪通告:通道 HELLO/WELCOME 只证明 TCP 连通,本通告
         # 证明云全量初始化(权重/KV/图编译)完成,边侧以此放行
