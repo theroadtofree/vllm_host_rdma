@@ -1040,18 +1040,81 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
-        # LWD: sample_tokens 的采集在主流末尾异步物化 pinned meta,
-        # 发送响应前必须等其落地(此处是输出线程/同步路径的入队点,
-        # 非计算关键路径),保证控制面读到的 meta 是完整的。
-        # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
-        ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
+        # LWD: 步 meta 收割(此处是输出线程/同步路径的入队点,非计算
+        # 关键路径)。就绪事件随输出对象逐步传递(采集时 record 的当步
+        # 独立对象;worker 共享属性存在"已赋值未 record"的窗口,sync
+        # 未 record 的事件会立即放行);Event 不可序列化,摘除不出进程。
+        # 跨流依赖必须建在设备侧:本平台 host 侧事件同步不足以给另一条
+        # 流上的后续拷贝排序——拷贝流 wait_event 就绪事件,完成事件
+        # record 在拷贝流上(与原生异步输出拷贝同模式)。多边 carrier
+        # 列表逐边收割:每边由未收割 6 元组(edge_id, meta_dev,
+        # seg_lens_host, req_ids, numel, seqno)重写为成品 5 元组
+        # (edge_id, cpu 张量, req_ids, numel, seqno),线布局
+        # [meta|seg_lens] 不变,引擎零改动;本步各边共享同一就绪事件
+        # 与同一次拷贝流围栏。
+        inner = getattr(output, "_model_runner_output", output)
+        ready_event = getattr(inner, "lwd_meta_ready_event", None)
         if ready_event is not None:
+            delattr(inner, "lwd_meta_ready_event")
+        carriers = getattr(inner, "lwd_down_carrier", None)
+        if carriers:
+            # 不变量:carrier 与就绪事件在 worker 侧成对挂接;缺失即
+            # 挂接被破坏,fail-fast 而不是读未围栏的设备内存
+            assert ready_event is not None, "lwd carrier without ready event"
+            stream = getattr(self, "_lwd_harvest_stream", None)
+            if stream is None:
+                stream = self._lwd_harvest_stream = torch.npu.Stream()
+            n_total = sum(
+                c[1].numel() + (len(c[2]) if c[2] is not None else 0)
+                for c in carriers
+            )
+            # 每步一整块 pinned(4 深轮换,覆盖 batch_queue 深度 + 引擎
+            # 滞后),本步各边取不相交切片:多边同窗期间互不覆写
+            ring = getattr(self, "_lwd_harvest_ring", None)
+            if ring is None or ring[0].numel() < n_total:
+                ring = [
+                    torch.empty(max(n_total, 4096), dtype=torch.int32,
+                                pin_memory=True)
+                    for _ in range(4)
+                ]
+                self._lwd_harvest_ring = ring
+                self._lwd_harvest_ring_idx = 0
+            ridx = self._lwd_harvest_ring_idx
+            self._lwd_harvest_ring_idx = (ridx + 1) % len(ring)
+            buf = ring[ridx]
             _t_sync = time.monotonic()
-            ready_event.synchronize()
-            # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
-            # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
-            logger.debug(
-                "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
+            with torch.npu.stream(stream):
+                stream.wait_event(ready_event)
+                off = 0
+                for _edge, meta_dev, _seg, _reqs, _numel, _seqno in carriers:
+                    n_dev = meta_dev.numel()
+                    buf[off : off + n_dev].copy_(meta_dev, non_blocking=True)
+                    off += n_dev
+                done = torch.npu.Event()
+                done.record()
+            done.synchronize()
+            harvested = []
+            off = 0
+            for (edge_id, meta_dev, seg_lens_host, req_ids,
+                 hidden_numel, seqno) in carriers:
+                n_dev = meta_dev.numel()
+                n_seg = (len(seg_lens_host)
+                         if seg_lens_host is not None else 0)
+                if n_seg:
+                    buf.numpy()[off + n_dev : off + n_dev + n_seg] = (
+                        seg_lens_host
+                    )
+                harvested.append(
+                    (edge_id, buf[off : off + n_dev + n_seg], req_ids,
+                     hidden_numel, seqno)
+                )
+                off += n_dev + n_seg
+            inner.lwd_down_carrier = harvested
+            # 输出线程收割耗时(含等主流计算排空):~0 即设备已空闲,
+            # 大则响应腿被拖
+            logger.info(
+                "[Lwd][perf] meta-harvest edges=%d dur=%.2fms ts=%.3f",
+                len(harvested),
                 (time.monotonic() - _t_sync) * 1000, time.monotonic(),
             )
 

@@ -684,15 +684,34 @@ class LwdEdgeEngineCore(EngineCoreProc):
             unembed_batch, non_block=True
         )
 
+    @staticmethod
+    def _lwd_row_disposition(
+        accepted: int, has_tokens: bool, finished: bool
+    ) -> str:
+        """逐行交付裁定(pad-and-skip):
+
+        - "skip":零接受活行(accepted=0 且未完结)——mid-prefill 非参与
+          行,无内容无终态,通告里保留只为 DOWN 张量对位,不交付、
+          不 ERROR、不标记首 token(修复前此形态被 ERROR 杀请求);
+        - "error":声明 accepted>0 却无 token = unembed 真失败,ERROR
+          优先于云侧完成码(原语义保留);
+        - "deliver":其余(含零接受但带完结码的收尾行——终结信号必须
+          透传,吞掉会丢完结)。"""
+        if accepted == 0 and not finished:
+            return "skip"
+        if not has_tokens and not finished:
+            return "error"
+        return "deliver"
+
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, future, outputs: list, finished_reqs: set,
     ) -> None:
         """UNEMBED 批收割侧:等 worker 应答取采样 token 表,逐请求交付。
         不感知提交时机,只消费 (notify, future)。应答契约:
         token ids 按 ModelRunnerOutput 的 req_ids x sampled_token_ids
-        按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);请求
-        缺席或行无 token = unembed 失败,ERROR 优先于云侧完成码;
-        迟到载荷幂等丢弃。"""
+        按位对齐还原(批的 req_ids 原样下发,worker 逐位回填);行裁定
+        走 _lwd_row_disposition(零接受活行跳过,accepted>0 缺 token 才
+        ERROR);迟到载荷幂等丢弃。"""
         _t = time.monotonic()
         if future is None:
             # DISABLE_DOWN 直通:无 worker 批,token 直接取自 c2e 通告。
@@ -717,6 +736,9 @@ class LwdEdgeEngineCore(EngineCoreProc):
         logger.debug(
             "[Lwd][perf] harvest dur=%.2fms", (time.monotonic() - _t) * 1000
         )
+        # accepted 与行按位对齐(lwd_build_unembed_batch 断言保证);
+        # DISABLE_DOWN 旁路不带 accepted,以回填 token 有无代替
+        accepts = notify.num_accepted_tokens
         for index, request_id in enumerate(notify.req_ids):
             finish_reason = self._lwd_finish_code(notify, index)
             finished = finish_reason is not None
@@ -724,15 +746,25 @@ class LwdEdgeEngineCore(EngineCoreProc):
                 list(sampled_token_map.get(request_id, []))
                 if sampled_token_map else []
             )
+            accepted = (
+                accepts[index] if accepts
+                else (1 if sampled_token_ids else 0)
+            )
+            disposition = self._lwd_row_disposition(
+                accepted, bool(sampled_token_ids), finished
+            )
+            if disposition == "skip":
+                # 零接受活行:不交付不出空输出,也无谓打调试税
+                continue
             # [lwd-debug] 性能关闭:每拍 tokenizer.decode() 是 CPU 重活,
             # 诊断乱码时恢复
             # LwdDebug.edge_tokens_delivered(
             #     request_id, sampled_token_ids, finish_reason,
             #     self.vllm_config,
             # )
-            if not sampled_token_ids and not finished:
-                # 行在批里但无 token 且未完结 = unembed 失败,ERROR 优先于
-                # 云侧码(已完结的空行属正常,如 DISABLE_DOWN 下的 ABORT)
+            if disposition == "error":
+                # 声明接受却无 token = unembed 失败,ERROR 优先于云侧码
+                # (已完结的空行属正常,如 DISABLE_DOWN 下的 ABORT)
                 finish_reason = FinishReason.ERROR
                 finished = True
             if not self.scheduler.lwd_edge_deliver_tokens(
