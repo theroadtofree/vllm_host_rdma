@@ -65,6 +65,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 ->
         # 混排步消费的间隔与中间插入的 decode-only 步数)
         self._lwd_sched_step = 0
+        # 并发观测日志的限频水位(见 schedule())
+        self._lwd_conc_last_log = time.monotonic()
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
         # 缺省 None 按 0),无 spec 配置即 1
@@ -672,6 +674,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         logger.debug(
             "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
         )
+        # 云侧实际并发观测:running 数即在飞请求数,限频 10s 一条,
+        # 供容量/并发评估(不携带请求信息)
+        now = time.monotonic()
+        if now - self._lwd_conc_last_log >= 10.0:
+            self._lwd_conc_last_log = now
+            logger.info(
+                "[Lwd][sched] cloud concurrency: running=%d",
+                len(self.running),
+            )
         return out
 
     def _lwd_log_sched_batch(self, out: SchedulerOutput) -> None:
