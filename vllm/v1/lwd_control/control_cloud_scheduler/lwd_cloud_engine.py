@@ -14,7 +14,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
 )
@@ -65,8 +65,10 @@ LWD_PRE_OUT_RECV_TIMEOUT_MS = 5000
 _LWD_C2E_SEND_RETRY_SLEEP_S = 0.05
 
 
-class LwdCloudEngineCore(EngineCoreProc):
-    """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+class LwdCloudEngineCoreMixin:
+    """云 PO 引擎的 LWD 接缝集合(调度器注入/PRE_OUT 接收/c2e 通告),
+    不含基座;具体类按部署形态选基座:dp=1 用 EngineCoreProc,
+    MoE DP>1 用 DPEngineCoreProc(wave/dummy-run/stats 上报语义必须保留)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
@@ -681,3 +683,17 @@ class LwdCloudEngineCore(EngineCoreProc):
                 )
                 return
             time.sleep(_LWD_C2E_SEND_RETRY_SLEEP_S)
+
+
+class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
+    """云 PO 引擎(dp=1):EngineCoreProc 基座,行为与 mixin 拆分前一致。"""
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
+    """云 PO 引擎(MoE DP>1):DPEngineCoreProc 基座。
+
+    MRO 上 mixin 在前:LWD 接缝(调度器注入/PRE_OUT 线程/c2e 通告)覆写
+    原生同名方法;wave 状态机、dummy batch、`_maybe_publish_request_counts`、
+    START_DP_WAVE 处理等 DP 语义不经 mixin,原样取自 DPEngineCoreProc。
+    由 `lwd_resolve_engine_cls` 在 cloud 角色且 data_parallel_size>1 时选中。
+    """
