@@ -1086,10 +1086,19 @@ class WorkerProc:
             with torch.npu.stream(stream):
                 stream.wait_event(ready_event)
                 off = 0
-                for _edge, meta_dev, _seg, _reqs, _numel, _seqno in carriers:
+                for (_edge, meta_dev, seg_lens_host, _reqs, _numel,
+                     _seqno) in carriers:
                     n_dev = meta_dev.numel()
+                    # 打包步长必须与下方宿主拼装循环严格一致
+                    # (n_dev + n_seg):设备拷贝只写 meta 前缀,但为该边
+                    # 的 seg_lens 尾段预留空隙——若只按 n_dev 背靠背
+                    # 打包,边 i 的宿主尾段写入会覆写边 i+1 的 meta
+                    # 前缀(多边混合步实测:边1 秩表前段被边0 段长
+                    # 覆盖,重放错 token = 单边正常、混合时后到边掉精度)
+                    n_seg = (len(seg_lens_host)
+                             if seg_lens_host is not None else 0)
                     buf[off : off + n_dev].copy_(meta_dev, non_blocking=True)
-                    off += n_dev
+                    off += n_dev + n_seg
                 done = torch.npu.Event()
                 done.record()
             done.synchronize()
