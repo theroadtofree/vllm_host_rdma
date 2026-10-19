@@ -624,12 +624,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             candidates = list(self.skipped_waiting) + list(self.waiting)
             picked = [candidates[0].request_id] if candidates else []
             return picked, {}, self.max_num_scheduled_tokens
-        # cap 语义:批 Σchunk ≤ 预算 − 在途数 × spec 系数(云混排步里
-        # decode 每请求占 1+k token,MTP 下 k = num_spec_tokens;在途数
-        # 是 decode 人口的恒成立上界,设计 §2.2)。边云预算部署对齐,
-        # 本地 max_num_scheduled_tokens 即云侧预算
+        # cap 语义:批 Σchunk ≤ 预算 − 满员 × spec 系数(**静态最坏口径**,
+        # 与构造期活性校验同源)。云混排步里 decode 每请求占 1+k token;
+        # chunk 在边侧当下切、在云侧未来执行——切时点的在途数预测不了
+        # 执行时点的 decode 人口(实测:首 chunk 在途=0 切出满预算
+        # 8192 的块,到云侧恰逢 decode 活动,8192+8 顶爆 runner 按
+        # 8192 开死的输入缓冲)。静态预留后 chunk + decode ≤ 预算恒成立,
+        # 云侧 preflight 预算闸门永不误响、缓冲永不溢出。
+        # 边云预算部署对齐,本地 max_num_scheduled_tokens 即云侧预算。
         inflight = len(self.running) + len(self._lwd_awaiting)
-        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
+        cap = (
+            self.max_num_scheduled_tokens
+            - self.max_num_running_reqs * self._lwd_spec_factor
+        )
         free_seq = self.max_num_running_reqs - inflight
         picked: list[str] = []
         expected: dict[str, int] = {}
