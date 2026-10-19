@@ -300,6 +300,44 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         if len(self._lwd_recent_finished) > self._LWD_RECENT_FINISHED_CAP:
             self._lwd_recent_finished.popitem(last=False)
 
+    def _lwd_pre_recv_ready(
+        self, notify: LwdRangeNotify, items: list[LwdRangeItem]
+    ) -> bool:
+        """提前收闸门:该批(本 chunk 批)的 UP 数据收完了没。
+
+        收完才允许下发这个 prefill 批 —— 此时 embeds 主帧已在云 worker 的
+        接收 buffer 里,注入侧 future.wait() 立刻返回;没收完就本步只下
+        decode(notify 留队首,下步再判),不把等待塞进 worker 前向。
+
+        判据是引擎维护的按边水位(worker 通信线程上报收完的 seqno):
+        每 (edge, channel) 完成序 = seqno 序(通道 FIFO),所以
+        seqno <= 水位 即精确判据。edge_id 从批内首条目的包装 req_id 反解
+        (一批一通知单 seqno,批内条目恒同边——边侧一批一云一通知)。
+
+        幽灵批不过本闸门:全失效分支在到达本判据之前已被弹队消费
+        (照收不注入要尽快排空,幽灵 recv 由消费点兜底补挂)。
+        """
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            is_irecv_complete,
+            watermark,
+        )
+        from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+
+        edge_id = parse_edge_id(items[0].request_id)[0]
+        ready = is_irecv_complete(edge_id, LwdChannelType.UP, notify.seqno)
+        # 闸门读数:与 HINT/SUBMIT/DONE/REPORT 同一单调钟(DEBUG 级,
+        # 默认静默;排查时可把"预告到达->挂recv->收完上报->放行"四段相减)
+        logger.debug(
+            "[Lwd][pre-recv] gate edge=%d seqno=%d watermark=%d ready=%s "
+            "ts=%.3f",
+            edge_id,
+            notify.seqno,
+            watermark(edge_id, LwdChannelType.UP),
+            ready,
+            time.monotonic(),
+        )
+        return ready
+
     def _lwd_preflight_ok(
         self, items: list[LwdRangeItem], num_decode: int
     ) -> bool:
@@ -426,6 +464,11 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     "request(s) not added yet",
                     notify.seqno,
                 )
+                notify = None
+            elif not self._lwd_pre_recv_ready(notify, items):
+                # 提前收闸门:UP 张量还没收完 -> 本步不下发这个 prefill 批
+                # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
+                # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
                 notify = None
             elif not self._lwd_preflight_ok(items, len(decode_ids)):
                 # 预算/名额/KV 不足:预告留队首,decode 泄压后重试

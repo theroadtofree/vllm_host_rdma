@@ -162,6 +162,9 @@ class MultiprocExecutor(Executor):
                 connect_ip=mq_connect_ip,
             )
             scheduler_output_handle = self.rpc_broadcast_mq.export_handle()
+        # LWD 提前收:逐边建下行提示 MQ(必须在 worker 被创建之前,handle
+        # 走环境变量)
+        self._lwd_init_early_recv_mq()
         # Create workers
         context = get_mp_context()
         shared_worker_lock = context.Lock()
@@ -271,6 +274,11 @@ class MultiprocExecutor(Executor):
             for response_mq in self.response_mqs:
                 response_mq.wait_until_ready()
 
+            # LWD 提前收:挂各边上行完成上报 MQ 的 reader(worker 是 writer,
+            # handle 随 READY 握手回传)。此处不做 wait_until_ready:writer 在
+            # worker 的 init_device 之后才开始上报,而 init_device 晚于 READY。
+            self._lwd_attach_irecv_done_mqs()
+
             self.futures_queue = deque[FutureWrapper]()
 
             self._post_init_executor()
@@ -304,6 +312,93 @@ class MultiprocExecutor(Executor):
 
     def _post_init_executor(self) -> None:
         pass
+
+    # ------------------------------------------------------------------ #
+    # LWD 提前收(pre-recv)的旁路消息队列(按边)                            #
+    # ------------------------------------------------------------------ #
+    def _lwd_init_early_recv_mq(self) -> None:
+        """逐边建下行提示 MQ(writer),并把 handle 交给即将创建的 worker。
+
+        为什么必须是**独立 MQ**、不能借 ``rpc_broadcast_mq``:
+        ``worker_busy_loop`` 是单线程的,它会在 ``execute_model`` 里为一个
+        prefill 批阻塞几百毫秒;提示排在那条队列上,就要等这一步跑完才会被
+        取走 —— 提前挂 recv 的重叠就没了。所以走一条只由 worker 侧通信线程
+        消费的旁路。多边多云下每边一条(端点 rank 按边轮转,单条 MQ 的
+        单 reader 语义要求按边拆分)。
+
+        只有云侧(LWD 且非边节点)建;边侧/非 LWD 保持空 dict,不导 handle。
+        相位调度逃生分支(prefill_first/decode_first)不发提示,不建 MQ
+        (armed 判据与引擎同源)。上行的完成上报 MQ 方向相反(worker 建
+        writer、handle 随 READY 回传),见 ``_lwd_attach_irecv_done_mqs``。
+        """
+        self.lwd_recv_hint_mqs: dict[int, MessageQueue] = {}
+        self.lwd_irecv_done_mqs: dict[int, MessageQueue] = {}
+        lwd = self.parallel_config.lwd_config
+        if not (lwd.enable_lwd and not lwd.is_edge_node):
+            return
+        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+            LwdConfig,
+        )
+
+        scheduler_name = LwdConfig.from_env_and_config(
+            self.vllm_config
+        ).scheduler_name
+        if scheduler_name in ("prefill_first", "decode_first"):
+            return
+        from vllm_ascend.distributed.lwd_comm.pre_recv import create_hint_mq
+
+        for edge_id in self._lwd_early_recv_edge_ids():
+            self.lwd_recv_hint_mqs[edge_id] = create_hint_mq(edge_id)
+        logger.info(
+            "[Lwd][pre-recv] hint MQs created on cloud executor edges=%s "
+            "(local_world_size=%d)",
+            sorted(self.lwd_recv_hint_mqs), self.local_world_size,
+        )
+
+    def _lwd_early_recv_edge_ids(self) -> list[int]:
+        """边清单:registry 模式取 registry.edge_ids;1E1C(无 registry)恒 [0]。"""
+        from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+            get_role_registry,
+            init_role_registry,
+        )
+        from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import (
+            LwdConfig,
+        )
+
+        cfg = LwdConfig.from_env_and_config(self.vllm_config)
+        if not cfg.registry_path:
+            return [0]
+        registry = get_role_registry()
+        if registry is None:
+            registry = init_role_registry(cfg.registry_path)
+        return sorted(registry.edge_ids)
+
+    def _lwd_attach_irecv_done_mqs(self) -> None:
+        """从 worker 的 READY 载荷里逐边收完成上报 MQ 的 reader。
+
+        每边只有它的云端点 rank 会建 writer(它才真的收该边跨机数据);
+        缺边 = 该边水位永不前进、闸门永堵 —— 启动期 fail-fast。
+        """
+        if not self.lwd_recv_hint_mqs:
+            return
+        for worker in self.workers:
+            for edge_id, mq in (worker.irecv_done_mqs or {}).items():
+                if edge_id in self.lwd_irecv_done_mqs:
+                    raise RuntimeError(
+                        f"[Lwd][pre-recv] duplicate done MQ for edge={edge_id} "
+                        "(endpoint rotation broken)"
+                    )
+                self.lwd_irecv_done_mqs[edge_id] = mq
+        missing = set(self.lwd_recv_hint_mqs) - set(self.lwd_irecv_done_mqs)
+        if missing:
+            raise RuntimeError(
+                f"[Lwd][pre-recv] done MQ missing for edges={sorted(missing)}: "
+                "their endpoint ranks did not hand back a writer handle"
+            )
+        logger.info(
+            "[Lwd][pre-recv] done MQs attached on cloud executor edges=%s",
+            sorted(self.lwd_irecv_done_mqs),
+        )
 
     def _is_driver_worker(self, rank: int) -> bool:
         if self.parallel_config.lwd_config.enable_lwd:
@@ -615,6 +710,10 @@ class WorkerProcHandle:
     # `peer_worker_response_mqs[i]`
     peer_worker_response_mqs: list[MessageQueue | None]
     death_writer: Connection | None = None
+    # LWD 提前收:worker 通信线程上报"哪条 recv 收完了"的 MQ(worker 建
+    # writer,本进程挂 reader),按 edge_id 分域。只有该边的云端点 rank 的
+    # 条目非空。
+    irecv_done_mqs: dict[int, MessageQueue] | None = None
 
     @classmethod
     def from_unready_handle(
@@ -622,6 +721,7 @@ class WorkerProcHandle:
         unready_handle: UnreadyWorkerProcHandle,
         worker_response_mq: MessageQueue | None,
         peer_worker_response_mqs: list[MessageQueue | None],
+        irecv_done_mqs: dict[int, MessageQueue] | None = None,
     ) -> "WorkerProcHandle":
         return cls(
             proc=unready_handle.proc,
@@ -629,6 +729,7 @@ class WorkerProcHandle:
             worker_response_mq=worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
             death_writer=unready_handle.death_writer,
+            irecv_done_mqs=irecv_done_mqs,
         )
 
 
@@ -638,6 +739,9 @@ class WorkerProc:
     READY_STR = "READY"
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
+    # LWD 提前收:worker 侧建的按边上报 MQ(writer),READY 时把 handle
+    # 回传引擎
+    irecv_done_mqs: dict[int, MessageQueue] | None
 
     def _init_message_queues(
         self, input_shm_handle: Handle, vllm_config: VllmConfig
@@ -752,6 +856,10 @@ class WorkerProc:
         # (nnodes_within_dp > 1) require distributed groups to be initialized
         self._init_message_queues(input_shm_handle, vllm_config)
 
+        # LWD 提前收:云端点 worker 在 init_device 里建好了按边完成上报 MQ
+        # (writer),取到它并随 READY 载荷回传,引擎据此挂 reader。
+        self.irecv_done_mqs = getattr(self.worker, "irecv_done_mqs", None)
+
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
         enable_envs_cache()
@@ -826,10 +934,17 @@ class WorkerProc:
             else None
             for handle in peer_response_handles
         ]
+        # LWD 提前收:worker 侧建的按边完成上报 MQ(1 读 1 写),此处挂 reader
+        irecv_done_handles = handles.get("irecv_done_handles") or {}
+        irecv_done_mqs: dict[int, MessageQueue] = {
+            edge_id: MessageQueue.create_from_handle(handle, 0)
+            for edge_id, handle in irecv_done_handles.items()
+        }
         return WorkerProcHandle.from_unready_handle(
             proc_handle,
             worker_response_mq,
             peer_worker_response_mqs=peer_worker_response_mqs,
+            irecv_done_mqs=irecv_done_mqs,
         )
 
     @staticmethod
@@ -977,6 +1092,16 @@ class WorkerProc:
                     "status": WorkerProc.READY_STR,
                     "handle": worker.worker_response_mq.export_handle(),
                     "peer_response_handles": worker.peer_response_handles,
+                    # LWD 提前收:按边完成上报 MQ 的 handle(仅云端点
+                    # worker 非空)
+                    "irecv_done_handles": (
+                        {
+                            edge_id: mq.export_handle()
+                            for edge_id, mq in worker.irecv_done_mqs.items()
+                        }
+                        if worker.irecv_done_mqs
+                        else None
+                    ),
                 }
             )
 
