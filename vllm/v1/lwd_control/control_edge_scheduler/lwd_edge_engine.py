@@ -568,7 +568,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             sched.max_num_seqs,
             getattr(spec_config, "num_speculative_tokens", None) or 0,
         )
-        remote = triples[ref_iid]
+        remote = triples[ref_key]
         if local[:2] != remote[:2]:
             self._lwd_shutdown_planes()
             raise RuntimeError(
