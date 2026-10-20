@@ -164,6 +164,11 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     携带。mrope 模型下边侧构造期校验 >=LWD_WIRE_VERSION 并 fail-fast
     ——msgspec 容忍未知字段,旧云对新字段静默丢弃,mrope 缺失不会
     有任何报错,必须显式互校。"""
+    prefix_hash_block_size: int = 0
+    """云侧前缀摘要(hash)粒度 = 各 KV 组块大小 GCD(可被
+    cache_config.hash_block_size 覆盖)。边侧 probe/生成段建链须同粒度:
+    边本地是组块 LCM,与云 GCD 不等时首笔链落在错域,该笔的块对后续
+    请求永久不可命中。0 = 旧版云未携带,边侧退回 probe 回执学习。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值
