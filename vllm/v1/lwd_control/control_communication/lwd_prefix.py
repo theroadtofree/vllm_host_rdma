@@ -56,13 +56,14 @@ class _MediaItem(Protocol):
     length: int
 
 
-def _encode_digest(digest: bytes) -> str:
+def encode_digest(digest: bytes) -> str:
+    """base64url(去填充)——摘要上线的唯一编码口径。"""
     if len(digest) != DIGEST_SIZE:
         raise ValueError(f"digest must contain {DIGEST_SIZE} bytes")
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _decode_digest(value: str) -> bytes:
+def decode_digest(value: str) -> bytes:
     try:
         raw = value.encode("ascii")
         digest = base64.b64decode(
@@ -120,20 +121,26 @@ class LwdPrefixManifest:
 
     def to_messages(self) -> list[dict[str, str]]:
         messages = [
-            {"role": "user", "content": BLOCK_HASH_PREFIX + _encode_digest(d)}
+            {"role": "user", "content": BLOCK_HASH_PREFIX + encode_digest(d)}
             for d in self.full_block_hashes
         ]
         if self.tail_hash is not None:
             messages.append(
                 {"role": "user",
-                 "content": TAIL_HASH_PREFIX + _encode_digest(self.tail_hash)})
+                 "content": TAIL_HASH_PREFIX + encode_digest(self.tail_hash)})
         return messages
 
     def to_headers(self) -> dict[str, str]:
+        """请求侧必需头(文档「Edge 向平台发送请求」表格口径)。
+
+        ``prompt_tokens`` 只走头:真实输入长度不在 body 里(网关 DTO 转换会
+        剥非标准字段),缺它云侧直接 400——所以它是 manifest 自带的一部分,
+        不靠调用方外挂。"""
         return {
             HEADER_PROTOCOL: PROTOCOL_VERSION,
             HEADER_REQUEST_ID: self.request_id,
             HEADER_BLOCK_SIZE: str(self.block_size),
+            HEADER_PROMPT_TOKENS: str(self.prompt_tokens),
         }
 
     @classmethod
@@ -171,23 +178,27 @@ class LwdPrefixManifest:
             if content.startswith(BLOCK_HASH_PREFIX):
                 if tail_hash is not None:
                     raise ValueError("a full block hash cannot follow the tail hash")
-                full_hashes.append(_decode_digest(content[len(BLOCK_HASH_PREFIX):]))
+                full_hashes.append(decode_digest(content[len(BLOCK_HASH_PREFIX):]))
             elif content.startswith(TAIL_HASH_PREFIX):
                 if tail_hash is not None or index != len(messages) - 1:
                     raise ValueError("the tail hash must be the final unique message")
-                tail_hash = _decode_digest(content[len(TAIL_HASH_PREFIX):])
+                tail_hash = decode_digest(content[len(TAIL_HASH_PREFIX):])
             else:
                 raise ValueError("message content is not an edge-cloud hash")
 
         # prompt_tokens 只从 header 取(与参考分支一致):NewAPI 等网关
         # DTO 转换会剥掉 body 非标准字段。
+        # 严格十进制:不用 int() —— 它会收下 "+1024"/" 1024"/"1_0"/全角数字,
+        # 而这些"看着能解析"的值一旦落到 manifest 上,长度与摘要条数就不再
+        # 自证一致,错配只会表现为命中异常而不是 400。
         prompt_tokens_raw = normalized_headers.get(HEADER_PROMPT_TOKENS.lower())
         if prompt_tokens_raw is None:
             raise ValueError(f"missing required header {HEADER_PROMPT_TOKENS}")
-        try:
-            prompt_tokens_value = int(prompt_tokens_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"{HEADER_PROMPT_TOKENS} must be a non-negative integer") from exc
+        if not (prompt_tokens_raw.isascii() and prompt_tokens_raw.isdecimal()):
+            raise ValueError(
+                f"{HEADER_PROMPT_TOKENS} must be a non-negative integer"
+            )
+        prompt_tokens_value = int(prompt_tokens_raw)
         return cls(
             request_id=request_id,
             prompt_tokens=prompt_tokens_value,

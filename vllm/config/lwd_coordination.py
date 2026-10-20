@@ -30,6 +30,15 @@ class LwdCoordinationConfig:
     instance_id: str = "cloud-0"
     # 通用
     connect_timeout: float = 10.0
+    # 探针端到端上限(边侧等首帧的时长)。三处按它派生,保证
+    # "云先作答(含 503)、边后放弃、看门狗只兜线程死":
+    #   云侧 handler 上限 = probe_timeout - 5
+    #   边侧 client 等待 = probe_timeout
+    #   边侧调度器看门狗 = probe_timeout + 5
+    # 缺省 25 是为保住本支已调好的云侧 20s(cdebeef89:负载期引擎主循环步长被
+    # 数据面拉长,云多等无意义);代价是边侧 fail-open 由 15s 变 25s,换来的是
+    # "云先作答"不再倒挂。
+    probe_timeout: float = 25.0
     enforce_mm_abi_match: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -40,7 +49,7 @@ class LwdCoordinationConfig:
         known = {
             "enabled", "control_url", "tenant_key_file", "consumer_id",
             "listen_host", "listen_port", "instance_id", "connect_timeout",
-            "enforce_mm_abi_match",
+            "probe_timeout", "enforce_mm_abi_match",
         }
         kwargs = {k: v for k, v in raw.items() if k in known}
         return cls(**kwargs)
@@ -81,8 +90,16 @@ class LwdCoordinationConfig:
             raise ValueError("control_url must use http:// or https://")
         if not 1 <= self.listen_port <= 65535:
             raise ValueError("listen_port must be between 1 and 65535")
+        if self.probe_timeout <= 5.0:
+            # 云侧上限按 probe_timeout - 5 派生(必须给云留出"先于边作答"的
+            # 余量),所以边侧等待本身必须大于这个余量。
+            raise ValueError(
+                "probe_timeout must be greater than 5s (the cloud answers"
+                " at probe_timeout-5; the edge gives up at probe_timeout)"
+            )
         logger.info(
-            "[Lwd][coord] enabled: control_url=%r listen=%s:%s instance=%s",
+            "[Lwd][coord] enabled: control_url=%r listen=%s:%s instance=%s "
+            "probe_timeout=%.1fs",
             self.control_url, self.listen_host, self.listen_port,
-            self.instance_id,
+            self.instance_id, self.probe_timeout,
         )
