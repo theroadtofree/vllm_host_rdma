@@ -539,20 +539,20 @@ class LwdCloudEngineCoreMixin:
         model_output: ModelRunnerOutput,
         engine_core_outputs: dict[int, EngineCoreOutputs],
     ) -> ModelRunnerOutput:
-        """rank-replay:解码 worker 主流末尾 pinned 物化的步 meta(就绪由
-        响应入队处的 event synchronize 保证),组 c2e 通告经 POST_OUT
-        先于 hidden 发边;finish 码取自 engine_core_outputs。
+        """rank-replay:解码 worker 组装的步 meta(收割拼装在响应入队处、
+        就绪事件同步之后完成),组 c2e 通告经 POST_OUT 先于 hidden 发边;
+        finish 码取自 engine_core_outputs。
 
-        pinned 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
+        meta 布局:[ranks(各调度段行)..., counts(accepted/请求)...,
         seg_lens(段长/请求)...];top_id_ths 按段长切,被拒行一并携带,
         边侧按 num_accepted 取有效前缀。"""
         # [Lwd][perf] cloud-step dt 已由 exec 时长替代(见 step_with_batch_queue
         # 覆写):开始执行→执行结束,不含无请求的空等。
         carrier = getattr(model_output, "lwd_down_carrier", None)
         if carrier is not None:
-            pinned, req_ids, hidden_numel, seqno = carrier
+            packed, req_ids, hidden_numel, seqno = carrier
             n_req = len(req_ids)
-            vals = pinned.tolist()
+            vals = packed.tolist()
             counts = vals[-2 * n_req : -n_req]
             seg_lens = vals[-n_req:]
             ranks_flat = vals[: -2 * n_req]
@@ -576,6 +576,20 @@ class LwdCloudEngineCoreMixin:
                 meta.req_ids, off, seqno,
             )
             LwdDebug.cloud_step(self.scheduler, meta, engine_core_outputs)  # [lwd-debug]
+            # 交付计数与调度器记账同源(覆盖收集器计数):收集器计数是
+            # 采样矩阵的设备侧派生量,不含 check_stop 截断(stop/EOS/
+            # max_tokens),而边侧交付链路对 token 流不做本地停止检查
+            # ——num_accepted 即客户端可见长度,必须与完结判定严格
+            # 同源。meta 里没有输出的请求取 0,边侧按 pad-and-skip
+            # 裁定跳过
+            committed = {
+                out.request_id: len(out.new_token_ids)
+                for outputs in engine_core_outputs.values()
+                for out in outputs.outputs
+            }
+            meta.num_accepted_tokens = [
+                committed.get(rid, 0) for rid in meta.req_ids
+            ]
             _t = time.monotonic()
             # 诊断旁路(SKIP_SAMPLE 边免采样 / DISABLE_DOWN 全直通):
             # 把本步逐请求 accepted token ids 捎带给边侧直接交付。
