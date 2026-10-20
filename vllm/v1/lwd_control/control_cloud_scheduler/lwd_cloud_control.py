@@ -200,7 +200,13 @@ class LwdCloudControlBridge:
             if stale_probe is not None and not stale_probe.done():
                 stale_probe.set_exception(RuntimeError(
                     f"control request {request_id} superseded by a newer probe"))
-        self._command_queue.put({"type": "probe", "manifest": manifest})
+        # [Lwd][perf] I8a:t_cmd = 命令投递时刻(父进程 CLOCK_MONOTONIC)。
+        # 云父/子进程同机,单调钟同源可比;跨节点不可比,别拿边/云时钟差读。
+        self._command_queue.put({
+            "type": "probe",
+            "manifest": manifest,
+            "t_cmd": time.monotonic(),
+        })
         try:
             return await asyncio.wait_for(probe_future, timeout)
         except BaseException:
@@ -486,12 +492,18 @@ class LwdCloudControlProcessor:
         self._pending_queue = pending_queue
         self._event_queue = event_queue
 
-    def poll(self, coordinator: Any) -> None:
+    def poll(self, coordinator: Any) -> int:
+        """消费待处理命令,返回本轮消费条数([Lwd][perf] I4)。
+
+        条数 >1 即"探针在等云引擎步头被批量消费"——探针服务能力受云
+        侧步频约束的直接证据。"""
+        consumed = 0
         while True:
             try:
                 command = self._pending_queue.get_nowait()
             except queue.Empty:
-                return
+                return consumed
+            consumed += 1
             logger.debug("[Lwd][ctrl] poll consumed command type=%s", command.get("type"))
             if command.get("type") == "probe":
                 manifest: LwdPrefixManifest = command["manifest"]
@@ -501,11 +513,27 @@ class LwdCloudControlProcessor:
                 #   engine_index  应答回显(Bridge 识别来源引擎)。
                 reserve = command.get("reserve", True)
                 reply_key = command.get("reply_key", manifest.request_id)
+                # [Lwd][perf] I8a:cmd_wait_ms = 命令从父进程投递到被主循环
+                # 取走的排队时长(含 mp 队列 + 唤醒线程 + 等步头)。它若接近
+                # 边侧看到的 http_ms,说明卡在"主循环没空取命令";它若≈0,
+                # 那 456ms 花在结果回传/结算那一段。
+                t_take = time.monotonic()
+                t_cmd = command.get("t_cmd")
+                cmd_wait_ms = (
+                    (t_take - t_cmd) * 1000.0 if t_cmd is not None else -1.0
+                )
                 try:
                     if reserve:
                         result = coordinator.probe(manifest)
                     else:
                         result = coordinator.peek(manifest)
+                    logger.info(
+                        "[Lwd][perf][cloud] probe_consumed req=%s "
+                        "cmd_wait_ms=%.1f probe_ms=%.1f",
+                        manifest.request_id,
+                        cmd_wait_ms,
+                        (time.monotonic() - t_take) * 1000.0,
+                    )
                     event = {
                         "type": "probe",
                         "request_id": reply_key,

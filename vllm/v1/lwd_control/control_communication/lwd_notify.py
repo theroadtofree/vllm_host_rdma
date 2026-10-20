@@ -174,6 +174,11 @@ class LwdHelloNotify(msgspec.Struct, gc=False, tag=True):
     """云侧 DPCoordinator 的 front 发布地址(tcp://<云可路由IP>:port),
     边侧据此订阅 stats 对账并上行 FIRST_REQ 唤醒。空 = 无 coordinator
     (单引擎),边侧不建唤醒通道。registry 声明 coord_port 时两侧互校。"""
+    prefix_hash_block_size: int = 0
+    """云侧前缀摘要(hash)粒度 = 各 KV 组块大小 GCD(可被
+    cache_config.hash_block_size 覆盖)。边侧 probe/生成段建链须同粒度:
+    边本地是组块 LCM,与云 GCD 不等时首笔链落在错域,该笔的块对后续
+    请求永久不可命中。0 = 旧版云未携带,边侧退回 probe 回执学习。"""
 
 
 # 完成码哨兵:finish_reasons 中的"本步未终结"值

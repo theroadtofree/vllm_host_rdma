@@ -94,6 +94,10 @@ _LWD_C2E_PENDING_FAIL_AFTER_S = 30.0
 
 # 云侧复用 consume 阻塞拍:空批时短暂等待,避免忙转
 _LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
+# [Lwd][perf] I8b:两次 poll 触发之间主循环的停顿告警阈值(毫秒)。
+# poll 挂在步循环头部与 WAKEUP 后,正常应随步频(几十 ms)出现;
+# 超阈值即"主循环有一段没回到任何 poll 点"——探针与 decode 同时被卡。
+_LWD_PERF_POLL_GAP_MS = 200.0
 
 # seqno 登记台账容量:条目在 abort 时保留(重连补投抑制依据),自然
 # 完结由 LwdFinishNotify 清理;超容量逐出最旧兜底长尾残留
@@ -137,6 +141,13 @@ class LwdCloudEngineCoreMixin:
         # 协调是否启用);后设会与之竞态(实测 AttributeError → EXECUTOR_FAILED)。
         self._lwd_prefix_coordinator: LwdPrefixCoordinator | None = None
         self._lwd_cloud_control_processor: LwdCloudControlProcessor | None = None
+        # [Lwd][perf] I4 计数器(super 前占位:poll 只在主循环线程调用,
+        # 无需加锁)——探针是否被步频批量消费、单条 probe 的主线程成本
+        self._lwd_perf_poll_calls = 0
+        self._lwd_perf_probes = 0
+        self._lwd_perf_poll_ms = 0.0
+        self._lwd_perf_sweep_ms = 0.0
+        self._lwd_perf_last_poll: float | None = None
         # probe 命令本地暂存(唤醒线程生产/主循环消费):super 前占位,
         # has_work 覆写与 step 覆写随时可读
         self._lwd_coord_pending: queue.Queue = queue.Queue()
@@ -186,6 +197,14 @@ class LwdCloudEngineCoreMixin:
             hash_block_size,
             instance_id=coord_cfg.instance_id,
             kv_cache_manager=getattr(self.scheduler, "kv_cache_manager", None),
+            # 本云 id 随 probe 回执公告:边侧 _lwd_routed_cloud_id 据此采纳
+            # 路由结果。与数据面 identity=cloud{cloud_id} 同源,不新造标识。
+            cloud_id=int(
+                getattr(
+                    self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
+                )
+                or 0
+            ),
         )
         # probe 命令事件驱动(E3 根治):mp 命令队列由唤醒线程阻塞消费,
         # 进本地线程安全队列 + WAKEUP 敲主循环——probe 应答不再等
@@ -241,8 +260,49 @@ class LwdCloudEngineCoreMixin:
         processor = self._lwd_cloud_control_processor
         coordinator = self._lwd_prefix_coordinator
         if processor is not None and coordinator is not None:
-            processor.poll(coordinator)
+            # [Lwd][perf] I4:poll 只在步循环头部/WAKEUP 后跑,故本轮
+            # probes>1 即"探针排队等步头"(服务能力=云步频)的直接证据;
+            # poll_ms/probes 即单条 probe 的主线程成本(命中查找+touch+
+            # 预留登记)。节流打印:每 200 次、或批量消费、或单次 >20ms。
+            t0 = time.monotonic()
+            # [Lwd][perf] I8b:主循环回到 poll 点的间隔。>阈值即抓到"不规则
+            # 停顿段"——与 ITL 尖峰同量级就说明探针被它卡住,而非步频不足。
+            last_poll = self._lwd_perf_last_poll
+            self._lwd_perf_last_poll = t0
+            if last_poll is not None:
+                gap_ms = (t0 - last_poll) * 1000.0
+                if gap_ms > _LWD_PERF_POLL_GAP_MS:
+                    logger.info(
+                        "[Lwd][perf][cloud] poll_gap_ms=%.1f calls=%d "
+                        "(main loop stalled away from poll point)",
+                        gap_ms,
+                        self._lwd_perf_poll_calls,
+                    )
+            probes = processor.poll(coordinator)
+            t1 = time.monotonic()
             coordinator.sweep_expired(time.monotonic())
+            t2 = time.monotonic()
+            self._lwd_perf_poll_calls += 1
+            self._lwd_perf_probes += probes
+            self._lwd_perf_poll_ms += (t1 - t0) * 1000.0
+            self._lwd_perf_sweep_ms += (t2 - t1) * 1000.0
+            poll_ms = (t1 - t0) * 1000.0
+            if (
+                self._lwd_perf_poll_calls % 200 == 0
+                or probes > 1
+                or poll_ms > 20.0
+            ):
+                logger.info(
+                    "[Lwd][perf][cloud] poll_ms=%.2f probes=%d sweep_ms=%.2f "
+                    "cum calls=%d probes=%d poll_ms=%.1f mean_poll_ms=%.3f",
+                    poll_ms,
+                    probes,
+                    (t2 - t1) * 1000.0,
+                    self._lwd_perf_poll_calls,
+                    self._lwd_perf_probes,
+                    self._lwd_perf_poll_ms,
+                    self._lwd_perf_poll_ms / self._lwd_perf_poll_calls,
+                )
 
     def _process_input_queue(self) -> None:
         """空闲等待覆写:仅协调启用时生效(未启用走原生,零行为变化)。
@@ -361,6 +421,11 @@ class LwdCloudEngineCoreMixin:
         scheduler_block_size = int(
             getattr(coordinator, "scheduler_block_size", 0) or 0
         )
+        # 前缀摘要粒度(组块 GCD,与协调器/块池登记同源)。边侧本地只有
+        # LCM,取不到云侧 GCD,故随 HELLO 公告——首笔 probe 就要用它建链。
+        prefix_hash_block_size = resolve_kv_cache_block_sizes(
+            self.scheduler.kv_cache_config, self.vllm_config
+        )[1]
         prefix_alignment_tokens = (
             lcm(
                 scheduler_block_size,
@@ -427,6 +492,7 @@ class LwdCloudEngineCoreMixin:
             coord_stats_addr=self._lwd_coord_stats_addr(
                 config, self.frontend_stats_publish_address
             ),
+            prefix_hash_block_size=prefix_hash_block_size,
         )
         if config.is_cloud_reuse:
             registry = _lwd_registry

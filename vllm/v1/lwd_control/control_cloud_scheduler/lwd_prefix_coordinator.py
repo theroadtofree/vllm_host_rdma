@@ -64,11 +64,15 @@ class LwdPrefixCoordinator:
         hash_block_size: int,
         instance_id: str = "cloud-0",
         kv_cache_manager=None,
+        cloud_id: int | None = None,
     ) -> None:
         if hash_block_size <= 0:
             raise ValueError("hash_block_size must be positive")
         self._hash_block_size = hash_block_size
         self._instance_id = instance_id
+        # 本云 id:随 probe 回执公告给边侧(多云选路的回执通道)。None = 不
+        # 公告(单边/未接选路),边侧沿用默认绑定云,行为与旧版一致。
+        self._cloud_id = cloud_id
         self._completed_hashes: set[bytes] = set()
         self._reservations: dict[str, LwdReservation] = {}
         # 收尾校验用:request_id -> (manifest 块粒度, prompt 满块数, 协调链)。
@@ -182,6 +186,16 @@ class LwdPrefixCoordinator:
                 f"size ({manifest.block_size} % {self._hash_block_size})"
             )
         ratio = manifest.block_size // self._hash_block_size
+        if ratio != 1:
+            # 复制扩展只是"凑条数":一个粗粒度摘要被当作 ratio 个细粒度
+            # 块的键,与按云粒度建链的请求不同域,该请求的块永不可命中,
+            # 而长度门(len(链)==prompt//粒度)恰好放行,失败是静默的。
+            logger.warning(
+                "[Lwd][coord] manifest granularity %d != hash granularity %d "
+                "(ratio=%d): this request's blocks are registered under "
+                "replicated digests and can never be hit by later requests",
+                manifest.block_size, self._hash_block_size, ratio,
+            )
         return [d for d in manifest.full_block_hashes for _ in range(ratio)]
 
     def peek(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
@@ -268,6 +282,7 @@ class LwdPrefixCoordinator:
             hit_blocks=hit_blocks,
             hit_tokens=hit_tokens,
             alignment_tokens=self._resolve_alignment_tokens(),
+            cloud_id=self._cloud_id,
         )
 
     def _resolve_alignment_tokens(self) -> int:

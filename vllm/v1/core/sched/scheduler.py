@@ -692,11 +692,6 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    logger.debug(
-                        "sched dbg: num_new=%s computed=%s num_tokens=%s prompt=%s status=%s",
-                        num_new_tokens, num_computed_tokens, request.num_tokens,
-                        request.num_prompt_tokens, request.status,
-                    )
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
