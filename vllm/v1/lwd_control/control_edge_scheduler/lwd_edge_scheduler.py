@@ -1238,6 +1238,34 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """probe 完成队列非空(引擎 has_work 计入:WAKEUP 后须进步回灌)。"""
         return not self._lwd_probe_done.empty()
 
+    def _try_schedule_encoder_inputs(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        num_new_tokens: int,
+        encoder_compute_budget: int,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[int], int, int, list[int]]:
+        """边侧直通:不排 encoder 输入、不耗预算、不回滚。
+
+        边侧视觉塔执行与编码缓存由边侧 worker 自管(惰性编码 + 按请求
+        缓存),边侧链路(lwd_control 全目录 + vllm-ascend 边侧 worker)
+        从不读 scheduled_encoder_inputs,调度侧原生 encoder 预算/缓存
+        簿记对边侧纯冗余;而其预算或全局 encoder cache 被在途 mm 请求
+        的非 freeable 条目占满时会合法回滚(只排图像占位之前的文本),
+        这会破坏 picker 的 chunk 契约——picker 切块必须被原生调度逐字
+        复现(_lwd_schedule_batch 步后核验),回滚一改窗口即触发
+        fail-fast 炸引擎(主干实录:encoder cache 占满后图像请求被回滚
+        到图像起点,expected 2081 / scheduled 4;云侧同款严格核验在位,
+        mrope 全链路 + image 白名单使路径可达,图像并发超 cache 承载
+        即触发)。
+
+        直通后 mm 占位 token 与文本同等切块,真实编码压力由 worker 侧
+        承担;encode/dec cache 簿记恒空,finish 时 free() 为空操作。
+        多边多云无需额外适配:encoder gating 是边侧调度器的本地簿记,
+        不涉云交互。"""
+        return [], num_new_tokens, encoder_compute_budget, []
+
     def lwd_edge_max_num_seqs_check(self) -> bool:
         """max_num_seqs 适配检查:云侧在途水位(running + awaiting)是否
         还有名额,True=可开新请求。
