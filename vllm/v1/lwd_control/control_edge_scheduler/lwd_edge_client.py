@@ -6,7 +6,8 @@ SSE 解析 Probe 控制消息 + 后台排空 usage 流。原始 messages/采样�
 
 协议形态(OpenAI 兼容,经网关透明转发):
   请求: POST control_url, body 为 manifest 影子体, headers 带
-        X-Edge-Cloud-* + 可选 Authorization Bearer。
+        X-Edge-Cloud-* + 可选 Authorization Bearer。图片请求协议声明
+        ``edge-cloud-prefix-v2`` 并附 ``X-Edge-Cloud-MM-ABI`` 指纹。
   响应: SSE 流——首 chunk 的 delta.content 内嵌 edge_cloud_probe JSON
         控制消息;随后空 delta 帧;心跳 comment;末 chunk 为标准 OpenAI
         usage + [DONE]。网关(delta.content 不丢)可据此计费。
@@ -24,9 +25,15 @@ from typing import Any
 
 from vllm import envs
 from vllm.logger import init_logger
+from vllm.v1.lwd_control.control_communication.lwd_mm_identity import (
+    mm_abi_header_value,
+)
 from vllm.v1.lwd_control.control_communication.lwd_prefix import (
     HEADER_EDGE_ID,
-    HEADER_PROMPT_TOKENS,
+    HEADER_MM_ABI,
+    HEADER_PROTOCOL,
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_MM,
     LwdPrefixHasher,
     LwdPrefixManifest,
     LwdProbeResult,
@@ -74,19 +81,31 @@ class LwdEdgePrefixClient:
         consumer_id: str | None = None,
         connect_timeout: float = 10.0,
         processor_fingerprint: bytes | None = None,
+        probe_timeout: float = 30.0,
     ) -> None:
         if not control_url.startswith(("http://", "https://")):
             raise ValueError("control_url must use http:// or https://")
+        if probe_timeout <= 0:
+            raise ValueError("probe_timeout must be positive")
         self._control_url = control_url
         self._hasher = LwdPrefixHasher(
             tenant_key, block_size, processor_fingerprint
         )
+        # 图片请求的 MM-ABI 头值(由本地处理器指纹渲染);无指纹则 v2 无法发声
+        self._mm_abi_header: str | None = (
+            mm_abi_header_value(processor_fingerprint)
+            if processor_fingerprint is not None
+            else None
+        )
         self._edge_id = edge_id
         self._consumer_id = consumer_id
         self._connect_timeout = connect_timeout
-        # 探针流后台排空 task(按 req_id 持强引用:asyncio 只持弱引用,
-        # 无引用可能被 GC 半途丢账)
-        self._drain_tasks: dict[str, Any] = {}
+        # 整段探针(建连+等首帧)的端到端上限;云侧上限是它减余量,
+        # 所以正常情况下云先作答。值来自 lwd_coordination.probe_timeout。
+        self._probe_timeout = probe_timeout
+        # 探针流后台排空 task(asyncio 只持弱引用,这里必须持强引用;
+        # set 而非按 req_id 索引 —— 见 _start_drain)
+        self._drain_tasks: set[Any] = set()
         # 网关 Bearer 令牌(敏感,不入日志):env 读取,缺省 None = 不发
         api_key = envs.VLLM_LWD_CLOUD_API_KEY
         if api_key is not None:
@@ -118,15 +137,30 @@ class LwdEdgePrefixClient:
         )
 
     def build_control_request(
-        self, manifest: LwdPrefixManifest, model: str | None = None
+        self,
+        manifest: LwdPrefixManifest,
+        model: str | None = None,
+        *,
+        multimodal: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
         """白名单影子体:仅 manifest/stream,采样参数不过网。
 
-        与参考分支(thujenkinbot)一致:prompt_tokens 只走 header
-        (NewAPI 等网关 DTO 转换会剥 body 非标准字段);model 可选透传。"""
+        必需控制头(含 ``X-Edge-Cloud-Prompt-Tokens``)由
+        ``LwdPrefixManifest.to_headers()`` 一次给全,这里只补边侧身份与网关
+        相关的头;model 可选透传(网关按它选渠道)。
+        ``multimodal`` 由调用方按建链时的 media_items 决定:媒体覆盖块走
+        0x04/0x05 域,协议必须同步声明 v2 并带 MM-ABI 指纹,否则云侧无从
+        判定这套链的口径。"""
         headers = manifest.to_headers()
+        if multimodal:
+            if self._mm_abi_header is None:
+                raise ValueError(
+                    "multimodal probe needs a processor fingerprint for "
+                    f"{HEADER_MM_ABI}"
+                )
+            headers[HEADER_PROTOCOL] = PROTOCOL_VERSION_MM
+            headers[HEADER_MM_ABI] = self._mm_abi_header
         headers[HEADER_EDGE_ID] = str(self._edge_id)
-        headers[HEADER_PROMPT_TOKENS] = str(manifest.prompt_tokens)
         headers["Accept"] = "text/event-stream"
         if self._consumer_id:
             headers["X-Mse-Consumer"] = self._consumer_id
@@ -157,21 +191,69 @@ class LwdEdgePrefixClient:
         (避免一次探测两次 O(N) 建链);缺省现建(media_items 须与
         调用方建链口径一致,防缺省路径漏掺多模态身份)。
 
-        SSE 流在 Probe 解析后由后台 task 排空(等 usage 末 chunk),
-        不阻塞主流程。"""
-        import aiohttp
-
+        整段(建连 + 等首帧)由 ``probe_timeout`` 钳住。云侧 handler 的上限是
+        ``probe_timeout - 5``,所以正常慢法是**云先作答**(200 或 503),这条
+        超时只在云/网关真没答时兜底——不再是边侧抢先放弃、把仍在等 usage 的
+        流掐掉。放弃时计费流的归属见 ``_post_and_read_probe``。"""
         if manifest is None:
             manifest = self.build_manifest(
                 request_id, prompt_token_ids, media_items
             )
-        headers, body = self.build_control_request(manifest, model=model)
+        # 媒体身份非空 ⇔ 建链掺了 0x04/0x05 域 ⇔ 必须以 v2 发声
+        multimodal = bool(media_items)
+        headers, body = self.build_control_request(
+            manifest, model=model, multimodal=multimodal
+        )
+        try:
+            response, sse_data, probe = await asyncio.wait_for(
+                self._post_and_read_probe(
+                    session, headers, body,
+                    request_id=request_id,
+                    prompt_token_ids=prompt_token_ids,
+                    multimodal=multimodal,
+                ),
+                self._probe_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"prefix probe timed out after {self._probe_timeout}s "
+                f"url={self._control_url}"
+            ) from exc
+        # probe 到手即返回,但**不能**在这里关流:云侧 handler 要等推理完结
+        # 才发 usage 末 chunk(最长 600s),真实 token 用量在这一帧落地。
+        self._start_drain(request_id, response, sse_data)
+
+        logger.info(
+            "[Lwd][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s",
+            request_id, probe.hit_tokens, probe.cloud_id,
+        )
+        return probe
+
+    async def _post_and_read_probe(
+        self,
+        session: Any,
+        headers: dict[str, str],
+        body: dict[str, Any],
+        *,
+        request_id: str,
+        prompt_token_ids: list[int],
+        multimodal: bool,
+    ) -> tuple[Any, AsyncIterator[str], LwdProbeResult]:
+        """发影子体、读 Probe;放弃时决定"交排空还是关闭"。
+
+        200 已到手 = 云侧 handler 已经挂在这笔的 usage 上。此后无论放弃原因
+        是超时、被取消还是回显校验不过,都**不能** close:边侧提前断开会让
+        网关记成 client_gone/context canceled,这笔真实用量永久丢失。"""
+        import aiohttp
+
         timeout = aiohttp.ClientTimeout(
             total=None, connect=self._connect_timeout
         )
         response = await session.post(
             self._control_url, json=body, headers=headers, timeout=timeout
         )
+        # 非 None ⇔ 200 已到手且拿到了流迭代器(放弃时据此决定排空还是关闭)
+        sse_data: AsyncIterator[str] | None = None
         try:
             if response.status != 200:
                 detail = await self._read_error_body(response)
@@ -181,7 +263,9 @@ class LwdEdgePrefixClient:
                 )
             # 与排空 task 共用同一迭代器:probe 帧之后的剩余帧由 task 续读
             sse_data = _iter_sse_data(response.content)
-            probe = await self._read_probe_from_sse(sse_data)
+            probe = await self._read_probe_from_sse(
+                sse_data, multimodal=multimodal
+            )
             if probe.request_id != request_id:
                 raise RuntimeError("cloud returned a different request ID")
             # 块粒度不强求一致:混合模型(如 Mamba/SWA)下云 hash 粒度可
@@ -190,31 +274,33 @@ class LwdEdgePrefixClient:
             if probe.hit_tokens > len(prompt_token_ids):
                 raise RuntimeError("cloud prefix hit exceeds the prompt length")
         except BaseException:
-            response.close()
+            if sse_data is not None:
+                self._start_drain(request_id, response, sse_data)
+            else:
+                response.close()
             raise
-        # probe 到手即返回,但**不能**在这里关流:云侧 handler 要等推理完结
-        # 才发 usage 末 chunk(最长 600s),边侧提前断开会让网关记成
-        # client_gone/context canceled,真实 token 用量丢失、改按文本估算。
-        # 剩余帧交后台 task 排空(同条 loop,不占 _job 返回路径)。
+        assert sse_data is not None  # 成功路径必已建流
+        return response, sse_data, probe
+
+    def _start_drain(
+        self,
+        request_id: str,
+        response: Any,
+        sse_data: AsyncIterator[str],
+    ) -> Any:
+        """把 probe 帧之后的剩余帧交后台 task 排空(同条 loop,不占 _job 返回路径)。
+
+        登记必须是 **set** 而不是按 req_id 索引的 dict:asyncio 只持弱引用,
+        而挂在网络读上的协程没有待执行回调,这份登记就是它唯一的强引用。同
+        req_id 重发(re-add/重试)时按 id 覆盖会丢掉**上一条**流的唯一强引用,
+        那条流可能在读完 usage 之前被 GC 掉——网关记 client_gone、这笔用量丢。
+        返回 task 只为测试可断言登记归属。"""
         task = asyncio.create_task(
             self._drain_stream(request_id, response, sse_data)
         )
-        self._drain_tasks[request_id] = task
-        task.add_done_callback(
-            lambda done, rid=request_id: self._finish_drain(rid, done)
-        )
-
-        logger.info(
-            "[Lwd][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s "
-            "engine_index=%d",
-            request_id, probe.hit_tokens, probe.cloud_id, probe.engine_index,
-        )
-        return probe
-
-    def _finish_drain(self, request_id: str, task: Any) -> None:
-        """同 id 重发时旧 task 不摘除新 task 的登记。"""
-        if self._drain_tasks.get(request_id) is task:
-            self._drain_tasks.pop(request_id, None)
+        self._drain_tasks.add(task)
+        task.add_done_callback(self._drain_tasks.discard)
+        return task
 
     async def _drain_stream(
         self,
@@ -226,8 +312,9 @@ class LwdEdgePrefixClient:
 
         本侧只留痕不消费(记账以云侧 C2e 回边的 ``[Lwd][edge] usage`` 为准),
         但必须读完:读完才让云侧 handler 正常走到末 chunk + [DONE]。
-        云侧 usage 等待有 600s 上限,超时也必发空 usage 收流,故 task 数
-        有界(= 在飞请求数),无需额外超时钳制。"""
+        云侧 usage 等待有 600s 上限,超时也照样以 [DONE] 收流(只是不带
+        usage 帧),故 task 数有界(= 在飞请求数),无需额外超时钳制。
+        usage 缺席按 warning 留痕——这一笔网关侧无上游用量可计。"""
         usage: dict | None = None
         try:
             async for payload in sse_data:
@@ -283,17 +370,29 @@ class LwdEdgePrefixClient:
             return f"<unreadable: {type(exc).__name__}>"
 
     async def _read_probe_from_sse(
-        self, sse_data: AsyncIterator[str]
+        self, sse_data: AsyncIterator[str], *, multimodal: bool
     ) -> LwdProbeResult:
-        """从 SSE 流解析首个 edge_cloud_probe 控制消息(delta.content 累积)。"""
+        """从 SSE 流解析首个 edge_cloud_probe 控制消息(delta.content 累积)。
+
+        回显必校验(fail-closed):云侧 ack 的 protocol 必须是本端发声的那一套
+        ——v2 图片被静默降回 v1 意味着媒体覆盖块按文本口径入账,命中会错位;
+        v2 还须回带与本端一致的 MM-ABI 指纹,纯文本则不得出现该字段。probe
+        之前出现 usage/error 帧说明流序不对,同样抛错而不是当残缺握手用。
+        content 被网关分片送达时逐帧拼接,故只在拼出完整对象后判定。"""
+        expected_protocol = (
+            PROTOCOL_VERSION_MM if multimodal else PROTOCOL_VERSION
+        )
         content_buf = ""
         async for payload in sse_data:
             if payload == "[DONE]":
                 break
-            try:
-                chunk = json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+            chunk = json.loads(payload)
+            if not isinstance(chunk, dict):
+                raise ValueError("cloud returned a non-object SSE chunk")
+            if chunk.get("usage") is not None or chunk.get("error") is not None:
+                raise RuntimeError(
+                    "cloud returned usage or an error before the probe"
+                )
             choices = chunk.get("choices") or []
             if not choices:
                 continue
@@ -304,7 +403,24 @@ class LwdEdgePrefixClient:
             try:
                 message = json.loads(content_buf)
             except json.JSONDecodeError:
-                continue
-            if isinstance(message, dict) and message.get("type") == "edge_cloud_probe":
-                return LwdProbeResult.from_control_message(message)
+                continue  # 分片未拼全,续读
+            if not isinstance(message, dict):
+                raise ValueError("cloud probe must contain a JSON object")
+            if "protocol" not in message:
+                continue  # 恰好切在首个键之后:再拼一帧
+            if message["protocol"] != expected_protocol:
+                raise RuntimeError(
+                    f"cloud did not acknowledge {expected_protocol} "
+                    f"(returned {message['protocol']!r})"
+                )
+            mm_abi = message.get("mm_abi")
+            if multimodal:
+                if mm_abi != self._mm_abi_header:
+                    raise RuntimeError(
+                        "cloud MM-ABI fingerprint does not match the local "
+                        "processor fingerprint"
+                    )
+            elif mm_abi is not None:
+                raise RuntimeError("cloud returned MM-ABI for a text-only probe")
+            return LwdProbeResult.from_control_message(message)
         raise RuntimeError("edge-cloud probe control message not found in SSE stream")

@@ -9,19 +9,24 @@
   1. Probe 结果放 ``delta.content`` 的 JSON 控制消息(网关 DTO 转换不丢);
   2. 紧跟空 delta 帧,冲刷网关末 chunk 缓冲(NewAPI 等);
   3. 期间每 10s 发 SSE comment 心跳,防网关上游空闲超时;
-  4. 推理完结后发标准 OpenAI usage chunk + ``[DONE]``,网关据此计费。
+  4. 推理完结后发标准 OpenAI usage chunk + ``[DONE]``,网关据此计费;拿不到
+     真实用量时只发 comment + ``[DONE]``,绝不伪造零用量帧。
 
-响应头仍保留 ``X-Edge-Cloud-*`` 供直连调试/网关观测,不参与协商。
+协议门禁:文本走 ``edge-cloud-prefix-v1``;图片走 ``edge-cloud-prefix-v2``
+且必带 ``X-Edge-Cloud-MM-ABI`` 指纹(媒体覆盖块的建链口径),两套栈不得互相
+降级。响应头仍保留 ``X-Edge-Cloud-*`` 供直连调试/网关观测,不参与协商。
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import json
 import queue
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace as dataclass_replace
 from typing import Any
 
@@ -30,8 +35,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
 from vllm.v1.lwd_control.control_communication.lwd_id_adapter import wrap_req_id
+from vllm.v1.lwd_control.control_communication.lwd_mm_identity import (
+    compute_processor_fingerprint,
+    mm_abi_header_value,
+    validate_mm_abi_header,
+)
 from vllm.v1.lwd_control.control_communication.lwd_prefix import (
     HEADER_EDGE_ID,
+    HEADER_MM_ABI,
+    HEADER_PROTOCOL,
+    HEADER_REQUEST_ID,
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_MM,
     LwdPrefixManifest,
     LwdProbeResult,
     LwdUsage,
@@ -41,19 +56,33 @@ logger = init_logger(__name__)
 
 # SSE 心跳间隔(秒):须小于网关 stream_idle_timeout,留足余量
 _USAGE_HEARTBEAT_INTERVAL = 10.0
-# usage 等待总超时(秒):覆盖完整推理时长,超时后发空 usage 收流
+# usage 等待总超时(秒):覆盖完整推理时长,超时后结束流(不伪造用量)
 _USAGE_WAIT_TIMEOUT = 600.0
+# 云侧探针上限 = 边侧 ``lwd_coordination.probe_timeout`` 减这个余量:必须让云
+# 先作答(200 或 503),否则边侧超时放弃时云侧可能仍在等子进程,那笔预留与
+# 计费流都成了白挂。503 时边侧按 fail-open 走全量,行为与今天一致。
+_CLOUD_PROBE_HEADROOM_S = 5.0
 
 
 class LwdCloudControlBridge:
     """父进程侧:把 HTTP 协程与子进程的 probe/usage 事件用队列对接。
 
-    result 回传走 per-request 一次性 queue.Queue(dispatch 线程 put、
-    handler 协程经 run_in_executor 阻塞 get):既消掉字典轮询的
-    20ms 级延迟,又刻意避开「跨线程 asyncio.Future +
-    call_soon_threadsafe」——后者在 uvicorn 挂线程 + uvloop 环境下
-    会出现 future 不 resolve、响应头迟迟不发的诡异卡死。
-    queue.Queue.get 在线程池里阻塞,与事件循环零交互,简单可观测。
+    等待走 **per-request asyncio.Future**,零线程占用(沿用参考分支
+    ``edge_cloud/cloud_control.py`` 的形态,该形态已过 NewAPI/Higress 真机
+    验收):dispatch 线程只把事件经 ``loop.call_soon_threadsafe`` 投回事件
+    循环,handler 协程直接 await。``_loop`` 在 ``probe()``(handler 协程内)
+    捕获,即 uvicorn 实际跑着的那条循环——不在启动线程取,避免"投给了没在跑
+    的循环"。
+
+    为什么不用 ``run_in_executor(None, waiter.get)``:usage 等待要常驻到请求
+    推理完结(真机 hold≈8s),线程池形态下一笔在飞 = 一条 executor 线程,默认
+    池上限 ``min(32, cpu+4)`` 一撞顶,新探针连"等结果"都排不上队(真机证据见
+    8cfb9f499:busy_usage=32、exec_delay_ms=-1、probe total_ms=60000);更糟的是
+    ``wait_for`` 超时后已开跑的线程**不可取消**,而 waiter 已从字典摘除、迟到
+    事件唤不醒它 → 每笔超时永久漏一条线程,漏满一池控制面彻底不答。Future
+    形态下超时只是取消一个协程,在飞数与线程数解耦,池尺寸这个容量参数整体
+    作废。早期本类 docstring 写"跨线程 future 不 resolve 会诡异卡死"并因此
+    改用队列,查提交历史无该事故的记录(该形态出自初次移植 2e0979767)。
     """
 
     def __init__(self, command_queue: Any, event_queue: Any) -> None:
@@ -65,10 +94,11 @@ class LwdCloudControlBridge:
             self._command_queues = [command_queue]
         self._command_queue = self._command_queues[0]
         self._event_queue = event_queue
-        self._waiters: dict[str, queue.Queue] = {}
-        self._usage_waiters: dict[str, queue.Queue] = {}
+        self._probe_futures: dict[str, asyncio.Future] = {}
+        self._usage_futures: dict[str, asyncio.Future] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
         # 扇出/预留应答收集:键为 reply_key(扇出 "<rid>#probe"、赢家预留
-        # "<rid>#reserve"),与单引擎 _waiters 命名空间隔离,迟到的扇出
+        # "<rid>#reserve"),与单引擎 future 命名空间隔离,迟到的扇出
         # 应答找不到 waiter 即丢弃,不污染后续同 rid 流量
         self._fanout_waiters: dict[str, queue.Queue] = {}
         # 并列轮转计数器(命中并列时依次轮换赢家引擎,防热点钉死)
@@ -83,42 +113,116 @@ class LwdCloudControlBridge:
         self._dispatch_thread.start()
 
     def close(self) -> None:
+        """关停:停 dispatch 线程,并把仍在等的 future 置异常。
+
+        由 ``start_lwd_cloud_control_server`` 注册的 atexit 钩子调用——本支
+        uvicorn 起在守护线程、没有 shutdown 通道,不接这个钩子的话退出路径
+        上 dispatch 线程只能靠 daemon 被硬杀。"""
         self._closed = True
+        with self._lock:
+            pending = [
+                *self._probe_futures.values(), *self._usage_futures.values()
+            ]
+            self._probe_futures.clear()
+            self._usage_futures.clear()
+            loop = self._loop
+        alive = [future for future in pending if not future.done()]
+        if loop is None or not alive:
+            return
+        error = RuntimeError("cloud control plane stopped")
+
+        def _fail_pending() -> None:
+            for future in alive:
+                if future.done():
+                    continue
+                future.set_exception(error)
+                # usage future 常常无人认领(handler 已随边侧断开退场):取一次
+                # 清 log 标记,否则循环退出时刷 "exception was never retrieved"
+                future.exception()
+
+        try:
+            loop.call_soon_threadsafe(_fail_pending)
+        except RuntimeError:
+            # 循环已停:无人再等这些 future,丢弃即可
+            logger.info(
+                "[Lwd][ctrl] close: loop already stopped, drop %d waiters",
+                len(alive),
+            )
 
     async def probe(
         self, manifest: LwdPrefixManifest, timeout: float = 20.0
     ) -> LwdProbeResult:
-        """发探针命令并阻塞等结果;超时抛 TimeoutError(由 handler 转 503)。
+        """发探针命令并等结果;超时抛 TimeoutError(由 handler 转 503)。
 
-        等待者先注册再发命令(无丢事件竞态);结果经一次性队列回传,
-        run_in_executor 阻塞等待不碰事件循环(见类 docstring)。
-        超时口径与边侧对齐:边侧 probe 看门狗 15s 即 fail-open 直通,
-        云侧多等无意义(请求早已按未命中继续)——20s = 边侧 15s +
-        网络/排队余量,超时结果只用于观测,不再影响请求走向。"""
-        logger.debug("[Lwd][ctrl] bridge probe req=%s", manifest.request_id)
+        **同时**登记 probe 与 usage 两个 future:usage 由云侧结算线程随时
+        推来,晚注册就会丢(结算可能早于 handler 走到 wait_usage)。等待者
+        先注册再发命令,事件不会落在注册之前。
+
+        超时口径与边侧对齐:边侧 probe 看门狗在 ``lwd_coordination.probe_timeout``
+        +5 才放弃,本上限由调用方按同一配置减余量派生,保证**云先作答**(200 或
+        503)而不是边先弃——负载期引擎主循环步长被数据面拉长时,probe 命令可能
+        躺到超时才被消费,那种情况下结果只用于观测。
+
+        同 req_id 重发是正常路径(同一 id 被重新 add_request:客户端重试、
+        abort 后同 id 重投。引擎侧的 id 由 ``X-Request-Id`` 头决定,缺省才用
+        random uuid——见 entrypoints/openai/engine/serving.py:387-396,所以
+        重试时重放同一个头就会复用同一 id,这条路径不是理论上的。边侧 nonce 与
+        协调器 ``probe()`` 的"同键重复 probe(边侧重试)释放旧 pin"都是为它
+        准备的),故重复不拒绝而是**取代**:旧 usage future 就地给 None(它那笔
+        的用量归新流,旧流以"无用量"收口),旧 probe future 置异常(旧 handler
+        转 503;此时 200 尚未发出,无计费可丢)。参考分支的 ``edge_client`` 是
+        "重复即拒",那是对着它自己 ``probe.block_size`` 严格相等校验的形态写的
+        (它不存在同 id 二次探测);照搬到本支会把重试路径打断。
+
+        云内 dp>1 走 ``_probe_fanout``(逐引擎只读求命中 → 放置 → 赢家落预留),
+        应答经 ``_fanout_waiters`` 收集,不走 future 命名空间。"""
+        request_id = manifest.request_id
+        logger.debug("[Lwd][ctrl] bridge probe req=%s", request_id)
         if len(self._command_queues) > 1:
             # 云内 DP:扇出逐引擎只读求命中 → 放置 → 赢家引擎落预留
             return await self._probe_fanout(manifest, timeout)
-        waiter: queue.Queue = queue.Queue(maxsize=1)
-        with self._lock:
-            self._waiters[manifest.request_id] = waiter
-        self._command_queue.put({"type": "probe", "manifest": manifest})
         loop = asyncio.get_running_loop()
-        try:
-            ok, payload = await asyncio.wait_for(
-                loop.run_in_executor(None, waiter.get), timeout
+        self._loop = loop
+        with self._lock:
+            stale_probe = self._probe_futures.pop(request_id, None)
+            stale_usage = self._usage_futures.pop(request_id, None)
+            probe_future: asyncio.Future = loop.create_future()
+            usage_future: asyncio.Future = loop.create_future()
+            self._probe_futures[request_id] = probe_future
+            self._usage_futures[request_id] = usage_future
+        if stale_probe is not None or stale_usage is not None:
+            logger.warning(
+                "[Lwd][ctrl] duplicate control request req=%s: superseding "
+                "the previous registration", request_id,
             )
-        except asyncio.TimeoutError:
+            if stale_usage is not None and not stale_usage.done():
+                stale_usage.set_result(None)
+            if stale_probe is not None and not stale_probe.done():
+                stale_probe.set_exception(RuntimeError(
+                    f"control request {request_id} superseded by a newer probe"))
+        self._command_queue.put({"type": "probe", "manifest": manifest})
+        try:
+            return await asyncio.wait_for(probe_future, timeout)
+        except BaseException:
+            # 探针没成(超时/取消/云侧报错):这笔控制请求到此为止,usage
+            # future 一并摘除——handler 不会再等 usage,留着就是无人认领的
+            # 字典项(成功路径由 _deliver_event 摘)
             with self._lock:
-                self._waiters.pop(manifest.request_id, None)
-            try:
-                waiter.put_nowait((False, "probe timeout"))
-            except queue.Full:
-                pass
-            raise TimeoutError(f"prefix probe timed out after {timeout}s")
-        if ok:
-            return payload
-        raise RuntimeError(payload or "probe failed")
+                if self._probe_futures.get(request_id) is probe_future:
+                    self._probe_futures.pop(request_id, None)
+                if self._usage_futures.get(request_id) is usage_future:
+                    self._usage_futures.pop(request_id, None)
+            raise
+
+    def release(self, request_id: str) -> None:
+        """摘除该控制请求的登记(幂等)。
+
+        SSE 生成器结束时必须调:客户端在启动消息之后就断开的话,
+        ``wait_usage`` 从未被调用,字典项只能等进程 ``close()`` 收——那是
+        兜底,不是正常路径。迟到的结算由此走孤儿分支丢弃。"""
+        with self._lock:
+            self._probe_futures.pop(request_id, None)
+            self._usage_futures.pop(request_id, None)
 
     async def _probe_fanout(
         self, manifest: LwdPrefixManifest, timeout: float
@@ -242,26 +346,26 @@ class LwdCloudControlBridge:
     async def wait_usage(
         self, request_id: str, timeout: float = _USAGE_WAIT_TIMEOUT
     ) -> LwdUsage | None:
-        """等推理完结的 usage 事件;超时返回 None。
-
-        与 probe 同款一次性队列;SSE handler 在 probe 发出后调用,
-        流保持打开直到 usage 到位或超时。"""
-        waiter: queue.Queue = queue.Queue(maxsize=1)
+        """等推理完结的 usage 事件;超时或无此控制请求返回 None(handler 收流
+        但不发用量帧)。future 已在 ``probe()`` 里登记,故结算先到也不丢。"""
         with self._lock:
-            self._usage_waiters[request_id] = waiter
-        loop = asyncio.get_running_loop()
-        try:
-            payload = await asyncio.wait_for(
-                loop.run_in_executor(None, waiter.get), timeout
-            )
-            return payload
-        except asyncio.TimeoutError:
+            future = self._usage_futures.get(request_id)
+        if future is None:
             logger.warning(
-                "[Lwd][ctrl] usage wait timeout req=%s", request_id)
+                "[Lwd][ctrl] usage wait without control request req=%s",
+                request_id,
+            )
+            return None
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[Lwd][ctrl] usage wait timeout req=%s", request_id)
             return None
         finally:
             with self._lock:
-                self._usage_waiters.pop(request_id, None)
+                # 只摘自己那条:同 req_id 若已被新探针取代,别动新登记
+                if self._usage_futures.get(request_id) is future:
+                    self._usage_futures.pop(request_id, None)
 
     def publish_usage(self, request_id: str, usage: LwdUsage) -> None:
         """子进程/引擎侧推送 usage 事件(dispatch 线程消费后投给 waiter)。
@@ -280,53 +384,96 @@ class LwdCloudControlBridge:
                 "[Lwd][ctrl] publish_usage failed req=%s", request_id)
 
     def _dispatch_events(self) -> None:
+        """单常驻线程:搬事件进事件循环,自己不碰 future(线程亲和性归循环)。"""
         while not self._closed:
             try:
                 event = self._event_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
+            kind = event.get("type")
+            request_id = event.get("request_id")
+            with self._lock:
+                table = (self._probe_futures if kind == "probe"
+                         else self._usage_futures)
+                registered = request_id in table
+                loop = self._loop
+            # 每事件一条:降噪到 debug(与本支热点路径日志口径一致)
             logger.debug(
                 "[Lwd][ctrl] dispatch got event type=%s req=%s ok=%s engine=%s",
-                event.get("type"), event.get("request_id"), event.get("ok"),
-                event.get("engine_index"),
+                kind, request_id, event.get("ok"), event.get("engine_index"),
             )
-            kind = event.get("type")
-            if kind == "probe":
-                if "engine_index" in event:
-                    # 扇出/预留应答(云内 DP):按 reply_key 找收集队列;
-                    # 迟到应答(等待已结束)无 waiter,丢弃无害
-                    with self._lock:
-                        waiter = self._fanout_waiters.get(event["request_id"])
-                    if waiter is not None:
-                        try:
-                            waiter.put_nowait((
-                                bool(event.get("ok")),
-                                int(event.get("engine_index", 0)),
-                                event.get("result")
-                                if event.get("ok") else event.get("error"),
-                            ))
-                        except queue.Full:
-                            pass
-                    continue
+            # 扇出/预留应答(云内 DP):按 reply_key 找收集队列;迟到应答
+            # (等待已结束)无 waiter,丢弃无害。这些事件携带 engine_index,
+            # 不走 future 结算路径。
+            if kind == "probe" and "engine_index" in event:
                 with self._lock:
-                    waiter = self._waiters.pop(event["request_id"], None)
+                    waiter = self._fanout_waiters.get(request_id)
                 if waiter is not None:
                     try:
                         waiter.put_nowait((
                             bool(event.get("ok")),
+                            int(event.get("engine_index", 0)),
                             event.get("result")
                             if event.get("ok") else event.get("error"),
                         ))
                     except queue.Full:
                         pass
-            elif kind == "usage":
-                with self._lock:
-                    waiter = self._usage_waiters.pop(event["request_id"], None)
-                if waiter is not None:
-                    try:
-                        waiter.put_nowait(event.get("usage"))
-                    except queue.Full:
-                        pass
+                continue
+            if not registered or loop is None:
+                # 等待者已超时/断开摘除(迟到结算),或事件早于首个 probe
+                # (数据面请求不经探针也能完结):丢弃,不报错
+                logger.warning(
+                    "[Lwd][ctrl] orphan %s event req=%s (no waiter/loop)",
+                    kind, request_id,
+                )
+                continue
+            try:
+                loop.call_soon_threadsafe(self._deliver_event, event)
+            except RuntimeError:
+                # 循环已关(uvicorn 停机与 atexit 竞态):此时没有任何协程还
+                # 等得到结算,继续搬只会每笔刷一条 traceback ⇒ 收线程。
+                # 与 close() 里的同款保护保持对称。
+                logger.info(
+                    "[Lwd][ctrl] dispatch stopping: loop closed (%d control "
+                    "request(s) abandoned)",
+                    len(self._probe_futures) + len(self._usage_futures),
+                )
+                return
+
+    def _deliver_event(self, event: dict[str, Any]) -> None:
+        """在事件循环线程上结算 future(唯一 set_result/set_exception 点)。"""
+        kind = event.get("type")
+        request_id = event.get("request_id")
+        if kind == "probe":
+            with self._lock:
+                future = self._probe_futures.pop(request_id, None)
+            if future is None or future.done():
+                return  # 已超时/取消:边侧早已 fail-open,结果作废
+            if event.get("ok"):
+                future.set_result(event.get("result"))
+            else:
+                future.set_exception(
+                    RuntimeError(event.get("error") or "probe failed"))
+            return
+        if kind == "usage":
+            # 结算只带 request_id,不带"哪一代探针"的信息,所以这里只能投给
+            # 当前登记的那条 future。这么做的依据不是"云侧会丢弃重复请求"——
+            # lwd_cloud_engine.py:654-658 的忽略只覆盖**门池窗口**(还没过门);
+            # 过门之后再投同 rid 会走到原生 Scheduler.add_request
+            # (vllm/v1/core/sched/scheduler.py:1823-1836):流式输入会话被折叠
+            # 成一条 update,否则撞上 assert "duplicate request id"。
+            # 也就是说"一个 rid 只有一个在飞尝试"是整栈的**前提**(边侧
+            # nonce/abort 墓碑 + 协调器单预留覆写 + 门池窗口共同维持,并由该断言
+            # 兜底),而不是云侧会替我们温和去重。推并发安全性请从这三处推,别把
+            # "忽略"当全局保证。
+            with self._lock:
+                future = self._usage_futures.get(request_id)
+            if future is None or future.done():
+                logger.warning(
+                    "[Lwd][ctrl] usage event arrived too late req=%s", request_id
+                )
+                return
+            future.set_result(event.get("usage"))
 
 
 class LwdCloudControlProcessor:
@@ -378,6 +525,39 @@ class LwdCloudControlProcessor:
                 self._event_queue.put(event)
 
 
+def _negotiate_lwd_protocol_headers(
+    headers: Mapping[str, str],
+    expected_mm_abi: str | None,
+    *,
+    enforce_mm_abi_match: bool,
+) -> str | None:
+    """返回 v2 请求校验通过的 MM-ABI 头值;v1 请求返回 None。
+
+    v1 保持原语义;v1 却带 MM-ABI、v2 缺或畸形 MM-ABI 一律拒绝——两套协议
+    栈不得互相降级(否则图片链以文本口径入账,命中会静默错位)。
+    ``enforce_mm_abi_match`` 打开时另要求 v2 头值等于云侧本地指纹渲染值:
+    边云异构镜像的模型标识常不一致,故缺省关,只做存在性/格式门禁。"""
+    normalized = {k.lower(): v for k, v in headers.items()}
+    protocol = normalized.get(HEADER_PROTOCOL.lower())
+    mm_abi = normalized.get(HEADER_MM_ABI.lower())
+    if protocol == PROTOCOL_VERSION_MM:
+        value = validate_mm_abi_header(mm_abi)
+        if enforce_mm_abi_match:
+            if expected_mm_abi is None:
+                raise ValueError(
+                    f"{PROTOCOL_VERSION_MM} requires a locally computed "
+                    f"{HEADER_MM_ABI} fingerprint on the cloud"
+                )
+            if value != expected_mm_abi:
+                raise ValueError(
+                    f"{HEADER_MM_ABI} fingerprint does not match this cloud"
+                )
+        return value
+    if mm_abi is not None:
+        raise ValueError(f"{HEADER_MM_ABI} requires protocol {PROTOCOL_VERSION_MM}")
+    return None
+
+
 def _sse_data(obj: Any) -> str:
     return f"data: {json.dumps(obj, separators=(',', ':'))}\n\n"
 
@@ -399,12 +579,28 @@ def _build_chunk(
 
 def create_lwd_cloud_control_app(
     bridge: LwdCloudControlBridge,
+    processor_fingerprint: bytes | None = None,
+    *,
+    enforce_mm_abi_match: bool = False,
+    probe_timeout: float = 25.0,
 ) -> Any:
     """FastAPI 控制面应用;成功响应走 OpenAI 兼容 SSE。
 
     错误路径仍用 JSONResponse(网关对非 2xx 的 JSON 错误体有标准处理)。
-    """
+    ``processor_fingerprint`` 为云侧本地处理器指纹,仅在
+    ``enforce_mm_abi_match`` 打开时参与 v2 仲裁;``probe_timeout`` 是本进程
+    等探针结果的硬上限(由边侧 ``probe_timeout`` 减余量派生,见常量注释)。"""
     app = FastAPI()
+    expected_mm_abi = (
+        mm_abi_header_value(processor_fingerprint)
+        if processor_fingerprint is not None
+        else None
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        """网关主动健康检查/探活口(不参与边云协商)。"""
+        return {"status": "ok"}
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Any:
@@ -414,7 +610,23 @@ def create_lwd_cloud_control_app(
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
         try:
-            manifest = LwdPrefixManifest.from_openai_request(headers, body)
+            mm_abi_header = _negotiate_lwd_protocol_headers(
+                headers, expected_mm_abi,
+                enforce_mm_abi_match=enforce_mm_abi_match,
+            )
+            parse_headers: Mapping[str, str] = headers
+            if mm_abi_header is not None:
+                # v2 的 manifest 线格式与 v1 同构:协议标记与 ABI 校验通过后,
+                # 按 v1 解析器读消息体(解析器只认 v1 标记)
+                parse_headers = {
+                    k: v
+                    for k, v in headers.items()
+                    if k.lower() != HEADER_PROTOCOL.lower()
+                }
+                parse_headers[HEADER_PROTOCOL] = PROTOCOL_VERSION
+            manifest = LwdPrefixManifest.from_openai_request(
+                parse_headers, body
+            )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -456,16 +668,17 @@ def create_lwd_cloud_control_app(
                 "[Lwd][ctrl] handler entering probe req=%s edge=%d",
                 manifest.request_id, edge_id,
             )
-            result = await bridge.probe(manifest)
+            result = await bridge.probe(manifest, timeout=probe_timeout)
             logger.debug(
                 "[Lwd][ctrl] handler probe resolved req=%s hit=%d",
                 manifest.request_id, result.hit_tokens,
             )
         except TimeoutError as exc:
-            # 引擎主循环在超时窗口内未消费 probe 命令(负载期步长被数据面
-            # 拉长);边侧 15s 看门狗早已 fail-open,本结果只作观测——
-            # 一行 warning 足够,不打异常栈(频发时会刷屏)。真正需要
-            # 关注的是出现频率:常态化即主循环响应控制面劣化,查步长。
+            # 本上限已由边侧 probe_timeout 减余量派生,正常情况下云是先作答
+            # (200/503)而非边先弃;走到这里说明引擎主循环连派生窗口内都没消费
+            # probe 命令(负载期步长被数据面拉长)。此时边侧多半已按 fail-open
+            # 继续,本结果只作观测——一行 warning 足够,不打异常栈(频发会刷屏)。
+            # 真正要关注的是出现频率:常态化即主循环响应控制面劣化,查步长。
             logger.warning(
                 "[Lwd][ctrl] probe timeout req=%s edge=%d: %s "
                 "(engine loop did not answer in time; edge already "
@@ -479,18 +692,21 @@ def create_lwd_cloud_control_app(
 
         # Probe 结果走 SSE delta.content(网关 DTO 转换不丢),响应头保留
         # 供直连调试/网关观测。usage 在同一条 SSE 流末 chunk,网关据此计费。
-        raw_request_id = manifest.request_id
         # 回显给边侧的是剥掉 wrap 前缀的原始 id(边侧校验一致性)
         display_request_id = result.request_id
         if display_request_id.startswith(f"e{edge_id}-"):
             display_request_id = display_request_id[len(f"e{edge_id}-"):]
         model = body.get("model", "edge-cloud-prefix")
 
-        control_message = result.to_control_message()
+        # 回显按协商结果:边侧据此校验云确实按本端协议应答(不得静默降 v1)
+        protocol = (
+            PROTOCOL_VERSION_MM if mm_abi_header is not None else PROTOCOL_VERSION
+        )
+        control_message = result.to_control_message(protocol, mm_abi_header)
         # 控制消息里的 request_id 用回显形式
         control_message["request_id"] = display_request_id
 
-        async def events():
+        async def _events_inner():
             # 1. Probe 控制消息(delta.content 携带,网关 DTO 转换不丢)
             yield _sse_data(_build_chunk(
                 display_request_id,
@@ -523,26 +739,47 @@ def create_lwd_cloud_control_app(
                 await asyncio.gather(usage_task, return_exceptions=True)
                 raise
             # 4. usage 末 chunk + [DONE]
-            usage_dict = (
-                usage.to_openai_dict() if usage is not None else {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0,
-                }
-            )
+            if usage is None:
+                # 拿不到真实用量就**不发** usage 帧:伪造 0 会让网关按零 Token
+                # 出账(quota=0 的白嫖账),而协议口径是 usage 恒为真实推理量。
+                # 仍以 comment + [DONE] 正常收流——半途断流会触发网关侧
+                # client_gone/错误统计,比"这笔没有上游用量"更糟。
+                logger.error(
+                    "[Lwd][ctrl] usage unavailable req=%s: ending stream "
+                    "without usage frame (never bill fabricated zeros)",
+                    manifest.request_id,
+                )
+                yield ": edge-cloud-usage-unavailable\n\n"
+                yield "data: [DONE]\n\n"
+                return
             yield _sse_data(_build_chunk(
                 display_request_id,
                 model,
                 [],
-                usage=usage_dict,
+                usage=usage.to_openai_dict(),
             ))
             yield "data: [DONE]\n\n"
 
+        async def events():
+            try:
+                async for frame in _events_inner():
+                    yield frame
+            finally:
+                # 正常收流、边侧提前断开、生成器被取消都要摘登记:否则
+                # usage future 一直悬在字典里,只能等进程 close() 收口
+                bridge.release(manifest.request_id)
+
         headers_out = {
             **result.to_headers(),
+            # 协调器持的是 wrap 后的云内 id,响应头必须回剥壳形式:边侧发的
+            # 就是原始 id,否则按 req id 跨边/云对账时两条口径不一致
+            HEADER_REQUEST_ID: display_request_id,
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         }
+        if mm_abi_header is not None:
+            headers_out[HEADER_PROTOCOL] = PROTOCOL_VERSION_MM
+            headers_out[HEADER_MM_ABI] = mm_abi_header
         return StreamingResponse(
             events(), media_type="text/event-stream", headers=headers_out
         )
@@ -579,7 +816,21 @@ def start_lwd_cloud_control_server(
     event_queue = mp_ctx.Queue()
     bridge = LwdCloudControlBridge(command_queues, event_queue)
     bridge.start()
-    app = create_lwd_cloud_control_app(bridge)
+    # uvicorn 跑在守护线程、没有 shutdown 通道:接 atexit,让 dispatch 线程
+    # 正常收口并把仍在等的 future 置异常(否则退出路径只能靠 daemon 硬杀)
+    atexit.register(bridge.close)
+    # 云侧本地指纹与边侧 _lwd_processor_fingerprint 同源(mm_identity 单点
+    # 实现);仅在 enforce_mm_abi_match 打开时参与 v2 仲裁。
+    # 探针上限取边侧 probe_timeout 减余量:保证云先作答(200/503)。
+    cloud_probe_timeout = max(
+        coord_cfg.probe_timeout - _CLOUD_PROBE_HEADROOM_S, 1.0
+    )
+    app = create_lwd_cloud_control_app(
+        bridge,
+        compute_processor_fingerprint(vllm_config.model_config),
+        enforce_mm_abi_match=coord_cfg.enforce_mm_abi_match,
+        probe_timeout=cloud_probe_timeout,
+    )
     threading.Thread(
         target=uvicorn.run,
         args=(app,),
@@ -593,8 +844,10 @@ def start_lwd_cloud_control_server(
     ).start()
     logger.info(
         "[Lwd] cloud control HTTP server listening on %s:%s "
-        "(cloud dp_size=%d, %d engine command queue(s))",
+        "(cloud dp_size=%d, %d engine command queue(s), "
+        "probe_timeout=%.1fs enforce_mm_abi_match=%s)",
         coord_cfg.listen_host, coord_cfg.listen_port,
         dp_size, len(command_queues),
+        cloud_probe_timeout, coord_cfg.enforce_mm_abi_match,
     )
     return command_queues, event_queue

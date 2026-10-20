@@ -82,9 +82,11 @@ logger = init_logger(__name__)
 # 用 sleep 阻塞主循环)
 _LWD_PENDING_FAIL_AFTER_S = 30.0
 
-# probe 看门狗时限:远大于钳制后的 connect_timeout(3s)+云侧处理余量,
-# 只兜「probe 线程静默死亡」的底,正常 RTT 不会触发
-_LWD_PROBE_WATCHDOG_S = 15.0
+# probe 看门狗余量(秒):整段探针已由客户端按 ``lwd_coordination.probe_timeout``
+# 钳住,看门狗只兜「probe 线程/事件循环静默死亡、future 永不完成」的底,所以
+# 必须**大于**客户端上限。原先硬编码 15s 而云侧上限 60s,慢探针必然由边侧先
+# 放弃(倒挂),这才是 fail-open 白付协商成本的根因。
+_LWD_PROBE_WATCHDOG_HEADROOM_S = 5.0
 
 # 探针会话连接上限:usage 排空会常驻占住一条连接直到请求完结(≈推理时长),
 # 与探测同池共享会话若用 aiohttp 默认 100,高并发下新 probe 会排队等连接、
@@ -1213,18 +1215,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ]
 
     def _lwd_processor_fingerprint(self) -> bytes:
-        """处理器指纹(32B):模型 + mm_processor_kwargs 的 sha256。
-        掺入媒体覆盖块 HMAC,换模型/换 processor 配置即链分叉。"""
+        """处理器指纹(32B):掺入媒体覆盖块 HMAC,换模型/换 processor 配置
+        即链分叉。算法在 lwd_mm_identity 单点实现——云侧 MM-ABI 仲裁用同一
+        函数,且材料刻意不含模型本地路径(边云常挂不同路径)。"""
         if self._lwd_processor_fp is None:
-            model_cfg = self.vllm_config.model_config
-            material = "|".join((
-                str(model_cfg.model),
-                # InitVar 可能不在实例属性上,缺省 None 参与摘要
-                repr(getattr(model_cfg, "mm_processor_kwargs", None)),
-            ))
-            self._lwd_processor_fp = hashlib.sha256(
-                material.encode("utf-8")
-            ).digest()
+            from vllm.v1.lwd_control.control_communication.lwd_mm_identity import (
+                compute_processor_fingerprint,
+            )
+
+            self._lwd_processor_fp = compute_processor_fingerprint(
+                self.vllm_config.model_config
+            )
         return self._lwd_processor_fp
 
     def _lwd_probe_coord_cfg(self):
@@ -1269,6 +1270,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 connect_timeout=min(coord_cfg.connect_timeout, 3.0),
                 # 指纹与 _lwd_prefix_hasher 同源(缺此参数 mm 建链必抛)
                 processor_fingerprint=self._lwd_processor_fingerprint(),
+                # 探针端到端上限(配置单点):云侧 handler 用
+                # probe_timeout-5 先作答,看门狗再用 probe_timeout+5 兜底
+                probe_timeout=coord_cfg.probe_timeout,
             )
             self._lwd_probe_client_cache = client
         return client
@@ -1353,8 +1357,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if wakeup is not None:
                 wakeup()
 
-        timer = threading.Timer(_LWD_PROBE_WATCHDOG_S, _watchdog)
-        timer.daemon = True  # 不拖累进程退出(残留计时器最多 15s 自灭)
+        # 看门狗必须晚于客户端自己的 probe_timeout 触发:否则又变回
+        # "边侧先放弃、云侧还在等 usage" 的倒挂。
+        timer = threading.Timer(
+            coord_cfg.probe_timeout + _LWD_PROBE_WATCHDOG_HEADROOM_S, _watchdog
+        )
+        timer.daemon = True  # 不拖累进程退出(残留计时器自灭,不等它)
 
         def _done(fut) -> None:
             timer.cancel()  # 正常完成即取消看门狗:否则 Timer(线程子类)
