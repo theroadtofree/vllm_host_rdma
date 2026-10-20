@@ -32,7 +32,6 @@ import time
 from collections import deque
 
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     LwdBatch,
     LwdBatchType,
@@ -111,15 +110,12 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         self._lwd_recent_finished: OrderedDict[str, None] = OrderedDict()
         # 当次消费的幽灵条目(classify 写入,建批/释放读取)
         self._lwd_cur_ghost_items: list[LwdRangeItem] = []
-        # KV preflight 的分组块粒度:混合模型块池跨组共享,占用须逐组
-        # 对齐 allocate_slots 的真实口径——attention 组按 cdiv(chunk +
-        # lookahead, bs)(lookahead 进 num_tokens_need_slot 可顶破块
-        # 边界);mamba align 组首准入恒 1+num_speculative_blocks(最新
-        # 状态块+草稿快照,与 chunk 长度无关),续传至多 +1,lookahead
-        # 豁免。用 self.block_size(=scheduler_block_size,混合下为组块
-        # LCM 网格)按单粒度估会少算 ~组数倍,preflight 失守放进批 →
-        # allocate_slots 失败 → 步后核验以 scheduled=0 炸(实测
-        # seqno=195)
+        # KV preflight 的组数:混合模型块池跨组共享,decode 项按「每请求
+        # 每组至多 +1 块」保守计入(1+k token 远小于块粒度)。逐组的真实
+        # 块需求不再在此推算,改由 coordinator.get_num_blocks_to_allocate
+        # 给出(见 _lwd_preflight_ok);单粒度(self.block_size = 组块 LCM
+        # 网格)估会少算 ~组数倍,preflight 失守放进批 → allocate_slots
+        # 失败 → 步后核验以 scheduled=0 炸(实测 seqno=195)。
         self._lwd_group_specs = [
             group.kv_cache_spec
             for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups
@@ -340,15 +336,17 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         return ready
 
     def _lwd_preflight_ok(
-        self, items: list[LwdRangeItem], num_decode: int
+        self, items: list[LwdRangeItem], decode_ids: list[str]
     ) -> bool:
         """放行三检:token 预算 / 并发名额 / KV 保守预估。
 
         预算与名额本由边侧 cap 保证(设计 §2),此处是双保险;KV 预估
-        按各 KV 组块粒度分别求和(混合模型块池跨组共享,单粒度估计会
-        按 LCM 倍率少算),且忽略前缀缓存命中(命中只降占用,高估是
-        安全方向)。decode 占用
-        按 1+k 计(MTP 草稿 token 同样吃预算;KV 块预留同系数上取整)。"""
+        逐组问真实分配器(混合模型块池跨组共享,单粒度估计会按 LCM
+        倍率少算),且忽略前缀缓存命中(命中只降占用,高估是安全
+        方向)。decode 的 token 占用按 1+k 计(MTP 草稿 token 同样吃
+        预算);其 KV 占用先用「每请求每组 +1 块」的严格上界粗判,不过
+        再逐请求精算(见 _lwd_decode_blocks_exact)。"""
+        num_decode = len(decode_ids)
         need_tokens = (
             sum(item.num_tokens for item in items)
             + num_decode * self._lwd_spec_factor
@@ -386,23 +384,77 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 len(self.running), new_items, self.max_num_running_reqs,
             )
             return False
-        # 逐组对齐 allocate_slots 真实口径(口径依据见 __init__ 注释);
-        # resume 命中块只 touch 不占空闲池,忽略之是保守方向
-        spec_tokens = self._lwd_spec_factor - 1  # lookahead(MTP 草稿)占块
-        need_blocks = 0
+        # 逐组块需求直接问真实分配器:coordinator.get_num_blocks_to_allocate
+        # 就是 allocate_slots 用的入口,压缩组的 //= compress_ratio 与
+        # running 请求已持有块的扣减都由它给出。此处曾手写第二套公式
+        # (cdiv(chunk, bs) 逐组求和),漏掉这两项:DSv4 的 C4 组高估 4×、
+        # C128 组高估 128×,且续传 chunk 会重复索要已持有的块。
+        # 前缀命中量此刻未知,按空传入:命中只降占用,高估是安全方向。
+        # apply_admission_cap=False 对齐 mixed 步的 per-step 口径
+        # (scheduler_reserve_full_isl 恒 False,不套整序列准入门)。
+        coordinator = self.kv_cache_manager.coordinator
+        no_hits = tuple([] for _ in coordinator.single_type_managers)
+        # 先按 allocate_slots 的次序为每个候选请求回收窗外块
+        # (kv_cache_manager.py:407),再读空闲块数。缺了这一步会把「本请求
+        # 即将自己释放的块」算成缺口:DSv4 的 compressor state 组
+        # block_size 只有 8/32,每 chunk 占 chunk/8 + chunk/32 块,续传时
+        # 其中绝大部分会被 remove_skipped_blocks 立刻回收(state 只需保留
+        # 最近 coff×ratio 个 token 的位置)。20480 的 chunk 上这项缺口高达
+        # ~3200 块,而真实净增只有个位数 —— 于是空闲块一旦掉到该水位以下,
+        # 续传 chunk 永久 hold:半途 prefill 的请求既跑不完也腾不出块,
+        # 叠加禁抢占 + 队首阻塞即不可自愈(实测 20480 挂死、8192 正常)。
+        # 提前回收是安全的:上游明示「即使本请求因块不足排不下也可以做」
+        # (kv_cache_manager.py:403-404),且该函数幂等——遇到已置 null 的
+        # 块即 break(single_type_kv_cache_manager.py:493-497),
+        # allocate_slots 稍后重复调用是无操作。
         for item in items:
-            fresh = item.request_id not in running_ids
-            for spec in self._lwd_group_specs:
-                num_spec_blocks = getattr(spec, "num_speculative_blocks", 0)
-                if getattr(spec, "mamba_cache_mode", None) == "align":
-                    need_blocks += (1 + num_spec_blocks) if fresh else 1
-                else:
-                    need_blocks += (
-                        cdiv(item.num_tokens + spec_tokens, spec.block_size)
-                        + num_spec_blocks
-                    )
-        need_blocks += num_decode * len(self._lwd_group_specs)
+            request = self.requests[item.request_id]
+            coordinator.remove_skipped_blocks(
+                item.request_id,
+                min(request.num_computed_tokens, self.max_model_len),
+            )
+        prefill_blocks = 0
+        for item in items:
+            request = self.requests[item.request_id]
+            total_computed = min(request.num_computed_tokens, self.max_model_len)
+            num_tokens_main_model = total_computed + item.num_tokens
+            prefill_blocks += coordinator.get_num_blocks_to_allocate(
+                request_id=item.request_id,
+                num_tokens=min(
+                    num_tokens_main_model + self.num_lookahead_tokens,
+                    self.max_model_len,
+                ),
+                new_computed_blocks=no_hits,
+                num_encoder_tokens=0,
+                total_computed_tokens=total_computed,
+                num_tokens_main_model=num_tokens_main_model,
+                apply_admission_cap=False,
+            )
+        # decode 项两段式:先用严格上界「每请求每组 +1 块」(一个 token 最多
+        # 在每组各顶破一个块边界),热路径零额外开销;只有粗判不过时才逐请求
+        # 精算复核。真机实录(threshold=8192、4 个 decode、free=1440):粗上界
+        # 给 4×6=24 块,而 decode 每步只加 1+k token,对 bs8 的 state 组平均
+        # 8 步才跨一个块边界,精确值约 1 块;正是这多算的 23 块把 need 从
+        # 1425 顶到 1448、越过 free,造成 9 次 hold(最长 28.4s / 445 步)。
+        decode_blocks = num_decode * len(self._lwd_group_specs)
+        need_blocks = prefill_blocks + decode_blocks
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        if need_blocks > free_blocks and num_decode:
+            decode_blocks = self._lwd_decode_blocks_exact(decode_ids)
+            need_blocks = prefill_blocks + decode_blocks
+            # 精算会顺带回收 decode 请求自己的窗外块(与 allocate_slots 同序),
+            # 空闲数随之变化,必须重读
+            free_blocks = (
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+            )
+        if need_blocks > free_blocks:
+            # 第三段:回收「在飞但本步不是候选」的常驻请求的窗外块
+            # (见 _lwd_recycle_resident_blocks)。need_blocks 不变——候选项的
+            # 需求与别人释放多少无关——只重读空闲数。
+            self._lwd_recycle_resident_blocks(coordinator)
+            free_blocks = (
+                self.kv_cache_manager.block_pool.get_num_free_blocks()
+            )
         if need_blocks > free_blocks:
             logger.debug(
                 "[Lwd][cloud-sched] preflight hold: kv blocks %d > free %d",
@@ -410,6 +462,68 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             )
             return False
         return True
+
+    def _lwd_decode_blocks_exact(self, decode_ids: list[str]) -> int:
+        """decode 请求的精确块需求:逐请求「先回收窗外块、再问真实分配器」,
+        与 allocate_slots(kv_cache_manager.py:407/411)同序。
+
+        粗上界(每请求每组 +1 块)是双向高估:既不信用这些请求上一个 prefill
+        chunk 留在 state 组、本步即将被回收的块,也不扣已持有块。decode 每步
+        只加 1+k token,精确值通常远小于粗上界。
+
+        num_new 取 self._lwd_spec_factor(= 1+k),是对 _schedule_mixed 里
+        decode_exact 逐字复刻的近似,但方向保守——被 max_tokens 守卫或
+        next_decode_eligible_step 跳过的请求真实消耗 0,此处仍按 1+k 计。
+        仅在本步粗判已不过时调用,不进热路径。"""
+        coordinator = self.kv_cache_manager.coordinator
+        no_hits = tuple([] for _ in coordinator.single_type_managers)
+        total = 0
+        for request_id in decode_ids:
+            request = self.requests[request_id]
+            computed = min(request.num_computed_tokens, self.max_model_len)
+            coordinator.remove_skipped_blocks(request_id, computed)
+            num_tokens_main_model = computed + self._lwd_spec_factor
+            total += coordinator.get_num_blocks_to_allocate(
+                request_id=request_id,
+                num_tokens=min(
+                    num_tokens_main_model + self.num_lookahead_tokens,
+                    self.max_model_len,
+                ),
+                new_computed_blocks=no_hits,
+                num_encoder_tokens=0,
+                total_computed_tokens=computed,
+                num_tokens_main_model=num_tokens_main_model,
+                apply_admission_cap=False,
+            )
+        return total
+
+    def _lwd_recycle_resident_blocks(self, coordinator) -> None:
+        """回收「在飞但本步不是候选」的常驻请求的窗外块。
+
+        vLLM 的块回收是惰性、由分配触发、逐请求的:remove_skipped_blocks 只
+        在 allocate_slots(kv_cache_manager.py:407)与 connector 收尾
+        (scheduler.py:2135,LWD 云侧 connector 为 None 故不走)里被调用。于是
+        一个请求只要本步没被调度,它上一个 chunk 留在 state 组的窗外块就一直
+        占着池子——而这些块 ref_cnt>0,BlockPool 的驱逐也动不了(驱逐只回收
+        「已释放但仍在 prefix cache 里」的块)。
+
+        DSv4 上这项滞留 = chunk × (1/8 + 1/32):chunk=20352 时每个半途 prefill
+        请求白占 ~3182 块,而池子只有 ~5723 ⇒ 只能容 1 个在飞(真机实录
+        running=1);chunk=8192 时 ~1280 ⇒ 容 ~6 个(running=6)。这正是
+        「首块进不来 → 常驻请求拿不到续传 → 它的垃圾永不回收」这个循环等待
+        的发动机:垃圾被那条卡住的队列本身扣为人质。
+
+        提前回收的安全性论证与本文件候选项那段相同(上游明示即使排不下也可
+        以做、幂等、req_to_blocks 是 defaultdict、全注意力组
+        get_num_skipped_tokens 返回 0 直接早退),且窗口内那 1~4 块会被保留,
+        常驻请求的续传照常能算。代价:带 hash 的块更早变成可驱逐,prefix
+        cache 保留率略降。仅在前两段都判不过时调用,不进热路径。"""
+        for queue in (self.running, self.waiting, self.skipped_waiting):
+            for request in queue:
+                coordinator.remove_skipped_blocks(
+                    request.request_id,
+                    min(request.num_computed_tokens, self.max_model_len),
+                )
 
     @staticmethod
     def _lwd_verify_full_admission(
@@ -471,7 +585,7 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
                 # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
                 notify = None
-            elif not self._lwd_preflight_ok(items, len(decode_ids)):
+            elif not self._lwd_preflight_ok(items, decode_ids):
                 # 预算/名额/KV 不足:预告留队首,decode 泄压后重试
                 notify = None
             else:
