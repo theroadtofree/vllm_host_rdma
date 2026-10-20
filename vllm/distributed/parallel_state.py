@@ -1577,27 +1577,38 @@ def init_distributed_environment(
         and not enable_elastic_ep
     ):
         parallel_config = config.parallel_config
-        # adjust to take into account data parallelism
-        # offset the rank by the data parallel rank
-        rank = parallel_config.data_parallel_rank * world_size + rank
-        # adjust the world size to take into account data parallelism
-        world_size = parallel_config.world_size_across_dp
-
-        # Use appropriate IP and port based on configuration
-        if parallel_config.nnodes > 1:
-            ip = parallel_config.master_addr
-            port = parallel_config.master_port
-            distributed_init_method = get_distributed_init_method(ip, port)
-        else:
-            ip = parallel_config.data_parallel_master_ip
-            port = parallel_config.get_next_dp_init_port()
-            distributed_init_method = get_distributed_init_method(ip, port)
-            logger.debug(
-                "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
-                world_size,
-                rank,
-                distributed_init_method,
+        if parallel_config.lwd_config.enable_lwd:
+            # LWD 边云共享世界:executor 分配的 rank 已是全局 rank、
+            # world_size 已含全部云 engine(云内 DP),原生的 rank 偏移与
+            # world 放大必须跳过(否则世界内没有 rank 0——LWD 的 rank 0 是
+            # 边——无人 bind store,全员挂死在连接重试)。但 rendezvous 地址
+            # 沿用部署配置的 master_addr:master_port(边 rank0 host store,
+            # 边与全部云 engine 共用同一地址汇合)。
+            distributed_init_method = get_distributed_init_method(
+                parallel_config.master_addr, parallel_config.master_port
             )
+        else:
+            # adjust to take into account data parallelism
+            # offset the rank by the data parallel rank
+            rank = parallel_config.data_parallel_rank * world_size + rank
+            # adjust the world size to take into account data parallelism
+            world_size = parallel_config.world_size_across_dp
+
+            # Use appropriate IP and port based on configuration
+            if parallel_config.nnodes > 1:
+                ip = parallel_config.master_addr
+                port = parallel_config.master_port
+                distributed_init_method = get_distributed_init_method(ip, port)
+            else:
+                ip = parallel_config.data_parallel_master_ip
+                port = parallel_config.get_next_dp_init_port()
+                distributed_init_method = get_distributed_init_method(ip, port)
+                logger.debug(
+                    "Adjusting world_size=%d rank=%d distributed_init_method=%s for DP",
+                    world_size,
+                    rank,
+                    distributed_init_method,
+                )
     if not torch.distributed.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
@@ -1687,7 +1698,14 @@ def init_distributed_environment(
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
-        if parallel_config.data_parallel_size > 1:
+        if (
+            parallel_config.data_parallel_size > 1
+            # LWD 边云:世界已是共享边布局(边 + 各云全引擎),「dp 实例内
+            # 世界」的网格切分不适用;且 _INNER_DP_WORLD 的唯一消费方
+            # (executor 跨节点 MQ)在 LWD 下不走(LWD 用本地 shm MQ),
+            # 直接挂 _WORLD 占位。
+            and not parallel_config.lwd_config.enable_lwd
+        ):
             world_size_inner_dp = parallel_config.world_size
             group_ranks = [
                 [dp_rank * world_size_inner_dp + i for i in range(world_size_inner_dp)]
@@ -1779,12 +1797,19 @@ def initialize_model_parallel(
                 f"declares {expected_world}")
             edge_rank_set = {r for ranks in edge_layout.values() for r in ranks}
 
-            # TP:每个实例的 ranks 一组
+            # TP:边实例各自一组;云按 (cloud, engine) 细分子组——
+            # 云内 DP 下每引擎独立切一份权重。
             assert _TP is None, "tensor model parallel group is already initialized"
-            tp_groups: list[list[int]] = (
-                [list(edge_layout[e]) for e in sorted(edge_layout)]
-                + [list(cloud_layout[c]) for c in sorted(cloud_layout)]
-            )
+            tp_groups: list[list[int]] = [
+                list(edge_layout[e]) for e in sorted(edge_layout)
+            ]
+            for c in sorted(cloud_layout):
+                dp = lwd.cloud_dp_layout.get(c, 1)
+                c_ranks = list(cloud_layout[c])
+                eng = len(c_ranks) // dp
+                tp_groups.extend(
+                    c_ranks[i * eng:(i + 1) * eng] for i in range(dp)
+                )
             _TP = init_model_parallel_group(
                 tp_groups,
                 get_world_group().local_rank,
@@ -1793,7 +1818,10 @@ def initialize_model_parallel(
                 group_name="tp",
             )
 
-            # PP:首边首卡与首云首卡成两段流水线对,其余单例
+            # PP:首边首卡与首云首卡成两段流水线对,其余单例。
+            # 云内 DP 下不为每引擎建 PP 对(与 legacy 分支的 M 对不同):
+            # prefill_only 下 PP 仅承载 first/last 语义且建组后即被
+            # _LWD_FULL_HEAD_TAIL 中性化,运行期 PP 链不走,单对即可。
             assert _PP is None, "pipeline model parallel group is already initialized"
             pp_edge_first = edge_layout[min(edge_layout)][0]
             pp_cloud_first = cloud_layout[min(cloud_layout)][0]
@@ -1829,19 +1857,36 @@ def initialize_model_parallel(
                 group_name="pcp",
             )
 
-            # DP:dp=1(边云模式),全单例
+            # DP:边 rank 全单例;每云内部、跨引擎同位 rank 一组
+            # (DPEngineCoreProc wave / MoE dp 域的语义来源;云间不锁步,
+            # 不建跨云 DP 组)。
             assert _DP is None, "data parallel group is already initialized"
-            dp_groups = singleton_groups
+            dp_groups: list[list[int]] = [
+                [r] for ranks in edge_layout.values() for r in ranks
+            ]
+            for c in sorted(cloud_layout):
+                c_ranks = list(cloud_layout[c])
+                dp = lwd.cloud_dp_layout.get(c, 1)
+                eng = len(c_ranks) // dp
+                dp_groups.extend(
+                    [c_ranks[i * eng + r] for i in range(dp)]
+                    for r in range(eng)
+                )
             _DP = init_model_parallel_group(
                 dp_groups, get_world_group().local_rank, backend, group_name="dp"
             )
 
-            # EP(仅 MoE):全部边 rank 一组、全部云 rank 一组
+            # EP(仅 MoE):全部边 rank 一组;每云一组(该云全部引擎的
+            # rank,EP=云内 dp×tp 分片域,与 ascend 侧 MC2 组同域;云间
+            # 无 wave 锁步,不建跨云 EP)。
             if config.model_config is not None and config.model_config.is_moe:
                 assert _EP is None, "expert parallel group is already initialized"
+                ep_groups: list[list[int]] = [sorted(edge_rank_set)]
+                ep_groups.extend(
+                    sorted(cloud_layout[c]) for c in sorted(cloud_layout)
+                )
                 _EP = init_model_parallel_group(
-                    [sorted(edge_rank_set),
-                     sorted(r for r in range(world_size) if r not in edge_rank_set)],
+                    ep_groups,
                     get_world_group().local_rank,
                     backend,
                     group_name="ep",
@@ -1861,19 +1906,23 @@ def initialize_model_parallel(
 
         edge_count = lwd.edge_npu_count
         cloud_count = lwd.cloud_npu_count
-        world_per_dp = edge_count + cloud_count
-        assert world_size == data_parallel_size * world_per_dp, (
+        # 云 DP 引擎数以 LWD 拓扑配置为准(边侧本地 data_parallel_size
+        # 恒 1,拿不到云侧真值;云侧已回填为 data_parallel_size)。
+        cloud_dp = lwd.cloud_dp_size
+        assert world_size == lwd.lwd_world_size, (
             f"Lwd world size mismatch: got {world_size}, expected "
-            f"{data_parallel_size} * ({edge_count} + {cloud_count})")
-        is_edge = rank % world_per_dp < edge_count
+            f"{edge_count} + {cloud_count} * {cloud_dp}")
+        is_edge = rank < edge_count
 
-        # TP:每个 dp 实例内,边 rank 一组、云 rank 一组
+        def cloud_engine_ranks(dp_idx: int) -> list[int]:
+            base = lwd.cloud_engine_rank_base(dp_idx)
+            return [base + r for r in range(cloud_count)]
+
+        # TP:边一组;每云 engine 一组
         assert _TP is None, "tensor model parallel group is already initialized"
-        tp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            tp_groups.append([base + r for r in range(edge_count)])
-            tp_groups.append([base + edge_count + r for r in range(cloud_count)])
+        tp_groups = [[r for r in range(edge_count)]]
+        for dp_idx in range(cloud_dp):
+            tp_groups.append(cloud_engine_ranks(dp_idx))
         _TP = init_model_parallel_group(
             tp_groups,
             get_world_group().local_rank,
@@ -1882,15 +1931,19 @@ def initialize_model_parallel(
             group_name="tp",
         )
 
-        # PP:每实例边 rank0 与云 rank0 成两段 pp 对,其余 rank 单例
+        # PP:边 rank0 与每云 engine 首卡成两段 pp 对,其余 rank 单例。
+        # 边 rank0 同时属于全部 M 对——LWD 下 PP 链仅承载 first/last 语义
+        # (且被 _LWD_FULL_HEAD_TAIL 中性化),组成员歧义无运行期影响。
         assert _PP is None, "pipeline model parallel group is already initialized"
-        pp_groups: list[list[int]] = []
-        for dp_idx in range(data_parallel_size):
-            base = dp_idx * world_per_dp
-            pp_groups.append([base + 0, base + edge_count])
-            for r in range(1, world_per_dp):
-                if r != edge_count:
-                    pp_groups.append([base + r])
+        pp_groups = []
+        pp_pair_members = {0}
+        for dp_idx in range(cloud_dp):
+            pair = [0, lwd.cloud_engine_rank_base(dp_idx)]
+            pp_groups.append(pair)
+            pp_pair_members.update(pair)
+        pp_groups.extend(
+            [r] for r in range(world_size) if r not in pp_pair_members
+        )
         _PP = init_model_parallel_group(
             pp_groups,
             get_world_group().local_rank,
@@ -1919,25 +1972,25 @@ def initialize_model_parallel(
             group_name="pcp",
         )
 
-        # DP:各 dp 实例同位置的 rank 一组
+        # DP:边单例;云各 engine 同位置的 rank 一组
         assert _DP is None, "data parallel group is already initialized"
-        dp_groups = [
-            [pos + dp_idx * world_per_dp for dp_idx in range(data_parallel_size)]
-            for pos in range(world_per_dp)
-        ]
+        dp_groups = [[r] for r in range(edge_count)]
+        dp_groups.extend(
+            [lwd.cloud_engine_rank_base(dp_idx) + r for dp_idx in range(cloud_dp)]
+            for r in range(cloud_count)
+        )
         _DP = init_model_parallel_group(
             dp_groups, get_world_group().local_rank, backend, group_name="dp"
         )
 
-        # EP(仅 MoE):边 rank 一组、云 rank 一组
+        # EP(仅 MoE):边一组;全部云 rank 一组(跨 engine,与原生
+        # EP=DP×TP 语义对齐,靠 DPEngineCoreProc 的 wave 锁步防挂死)
         if config.model_config is not None and config.model_config.is_moe:
             assert _EP is None, "expert parallel group is already initialized"
-            ep_edge_ranks: list[int] = []
-            ep_cloud_ranks: list[int] = []
-            for dp_idx in range(data_parallel_size):
-                base = dp_idx * world_per_dp
-                ep_edge_ranks.extend(range(base, base + edge_count))
-                ep_cloud_ranks.extend(range(base + edge_count, base + world_per_dp))
+            ep_edge_ranks = [r for r in range(edge_count)]
+            ep_cloud_ranks = []
+            for dp_idx in range(cloud_dp):
+                ep_cloud_ranks.extend(cloud_engine_ranks(dp_idx))
             _EP = init_model_parallel_group(
                 [ep_edge_ranks, ep_cloud_ranks],
                 get_world_group().local_rank,
@@ -1947,12 +2000,13 @@ def initialize_model_parallel(
 
         logger.info(
             "Lwd edge-cloud mode initialized: rank %s, is_edge=%s, "
-            "edge_npu_count=%s, cloud_npu_count=%s, world_size=%s, "
-            "TP groups=%s, PP groups=%s, DP groups=%s",
+            "edge_npu_count=%s, cloud_npu_count=%s, cloud_dp=%d, "
+            "world_size=%s, TP groups=%s, PP groups=%s, DP groups=%s",
             rank,
             is_edge,
             edge_count,
             cloud_count,
+            cloud_dp,
             world_size,
             tp_groups,
             pp_groups,

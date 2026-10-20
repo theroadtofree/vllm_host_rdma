@@ -18,7 +18,7 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.engine import EngineCoreRequestType, FinishReason
-from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
 from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 from vllm.v1.lwd_control.control_communication.lwd_control_publisher import (
     LwdControlPublisher,
@@ -52,6 +52,7 @@ from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
 )
 from vllm.v1.lwd_control.control_communication.lwd_router_channel import (
     LwdControlRouterChannel,
+    _instance_identity,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_assemble import LwdConfig
 from vllm.v1.lwd_debug import LwdDebug
@@ -99,8 +100,11 @@ _LWD_ROUTER_CONSUME_TIMEOUT_S = 1.0
 _LWD_SEQNO_REGISTRY_CAP = 4096
 
 
-class LwdCloudEngineCore(EngineCoreProc):
-    """云 PO 引擎:覆写 socket IO 线程入口,其余全走原生。"""
+class LwdCloudEngineCoreMixin:
+    """云 PO 引擎的 LWD 接缝集合(调度器注入/PRE_OUT 接收/c2e 通告/
+    前缀协调),不含基座;具体类按部署形态选基座:单引擎用
+    EngineCoreProc,云内 MoE DP>1 用 DPEngineCoreProc(wave/dummy-run/
+    stats 上报语义必须保留)。"""
 
     def __init__(self, *args, **kwargs) -> None:
         # 调度器自注入须赶在 super() 之前(与边侧 LwdEdgeEngineCore 同款):
@@ -320,6 +324,8 @@ class LwdCloudEngineCore(EngineCoreProc):
                     "type": "usage",
                     "request_id": request_id,
                     "usage": usage,
+                    # 云内 DP:共享 event_queue 上行,引擎维供 Bridge 对账日志
+                    "engine_index": getattr(self, "_lwd_engine_index", 0),
                 })
         return usages
 
@@ -339,6 +345,10 @@ class LwdCloudEngineCore(EngineCoreProc):
         self._lwd_cloud_id = getattr(
             self.vllm_config.parallel_config.lwd_config, "cloud_id", 0
         )
+        # 云内 DP 身份(= 云内 dp_rank;EngineCoreProc 构造时按 dp_rank
+        # 回填):多引擎下每引擎独立 PRE_OUT 端点,HELLO 携带供边侧建
+        # per-(cloud,engine) 端点表与路由账
+        self._lwd_engine_index = int(getattr(self, "engine_index", 0))
         # HELLO 两种模式都要建(1E1C 经 POST_OUT 首拍;云侧复用经 ROUTER
         # 定向送达),调度语义(MTP/对齐网格)以云侧公告为准——边侧本地
         # 取不到合法来源。三元组取调度器生效值,派生/缺省差异只有生效值可信。
@@ -380,9 +390,25 @@ class LwdCloudEngineCore(EngineCoreProc):
         )
         self.scheduler._lwd_prefix_alignment = prefix_alignment_tokens
         self.scheduler._lwd_prefix_alignment_required = prefix_alignment_required
+        # 云内 DP:每引擎 PRE_OUT 端口——registry 模式取 engine_ports
+        # 声明;legacy 按 dp_rank 派生(base + engine_index),避免同机
+        # bind 冲突;HELLO 通告派生后的真值,边侧据此建 per-engine 端点表。
+        _lwd_registry = None
+        if config.is_cloud_reuse:
+            _lwd_registry = get_role_registry()
+            if _lwd_registry is None:
+                _lwd_registry = init_role_registry(config.registry_path)
+            _cloud_info = _lwd_registry.clouds[config.self_cloud_id]
+            _eng_port = (
+                _cloud_info.engine_ports[self._lwd_engine_index]
+                if _cloud_info.engine_ports
+                else _cloud_info.zmq_port
+            )
+        else:
+            _eng_port = config.pre_out_port + self._lwd_engine_index
         self._lwd_hello = LwdHelloNotify(
             pre_out_host=config.pre_out_host,
-            pre_out_port=config.pre_out_port,
+            pre_out_port=_eng_port,
             cloud_id=self._lwd_cloud_id,
             max_num_batched_tokens=self.scheduler.max_num_scheduled_tokens,
             max_num_seqs=self.scheduler.max_num_running_reqs,
@@ -392,17 +418,28 @@ class LwdCloudEngineCore(EngineCoreProc):
             prefix_use_eagle=bool(getattr(self.scheduler, "use_eagle", False)),
             prefix_alignment_tokens=prefix_alignment_tokens,
             prefix_alignment_required=prefix_alignment_required,
-            # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
+            # 控制面协议版本互校(mrope 控制面直传/云内 DP 身份;边侧
+            # 构造期 fail-fast)与云内 DP 身份、coordinator stats 地址
+            # (边侧建唤醒通道用);单引擎时 engine_index=0、无
+            # coordinator 为空。
             wire_version=LWD_WIRE_VERSION,
+            engine_index=self._lwd_engine_index,
+            coord_stats_addr=self._lwd_coord_stats_addr(
+                config, self.frontend_stats_publish_address
+            ),
         )
         if config.is_cloud_reuse:
-            registry = get_role_registry()
-            if registry is None:
-                registry = init_role_registry(config.registry_path)
+            registry = _lwd_registry
             self._lwd_channel = LwdControlRouterChannel(
-                registry.bind_endpoint(config.self_cloud_id),
+                registry.engine_bind_endpoint(
+                    config.self_cloud_id, self._lwd_engine_index
+                ),
                 bind=True,
-                identity=f"cloud{config.self_cloud_id}",
+                # identity 与边侧寻址公式同源(engine 0 不带后缀,
+                # 与单引擎线上格式逐值一致;>0 带 e{i} 后缀)
+                identity=_instance_identity(
+                    "cloud", config.self_cloud_id, self._lwd_engine_index
+                ).decode(),
                 decoder=lwd_decode_wire_notify,
                 expected_instances=len(registry.edge_ids),
             )
@@ -417,7 +454,7 @@ class LwdCloudEngineCore(EngineCoreProc):
             )
             return
         self._lwd_subscriber = LwdControlSubscriber(
-            config.lwd_pre_out_endpoint(), bind=True
+            f"tcp://{config.pre_out_host}:{_eng_port}", bind=True
         )
         master_addr = self.vllm_config.parallel_config.master_addr
         self._lwd_post_out = LwdControlPublisher(
@@ -431,11 +468,23 @@ class LwdCloudEngineCore(EngineCoreProc):
         logger.info(
             "[Lwd] cloud engine assembled: PRE_OUT bind %s, POST_OUT announce -> "
             "%s:%s via master %s",
-            config.lwd_pre_out_endpoint(),
+            f"tcp://{config.pre_out_host}:{_eng_port}",
             config.pre_out_host,
-            config.pre_out_port,
+            _eng_port,
             master_addr,
         )
+
+    @staticmethod
+    def _lwd_coord_stats_addr(config, frontend_stats_publish_address) -> str:
+        """HELLO 通告的 coordinator stats 地址:host 改写为本机可路由 IP
+        (pre_out_host)——coordinator 与云 engine 同机,其 front XPUB 在
+        LWD 下绑 0.0.0.0,通告值必须是边可路由地址;无 coordinator
+        (单引擎)时为空。"""
+        addr = frontend_stats_publish_address
+        if not addr or not str(addr).startswith("tcp://"):
+            return ""
+        _, _, port = str(addr).rpartition(":")
+        return f"tcp://{config.pre_out_host}:{port}"
 
     def _lwd_init_dispatch_state(self) -> None:
         """两种模式共用的分派状态(门池/seqno 登记表)。"""
@@ -1163,6 +1212,8 @@ class LwdCloudEngineCore(EngineCoreProc):
             finish_reasons=finish_reasons,
             down_seqno=meta.down_seqno,
             cloud_id=self._lwd_cloud_id,
+            # 云内 DP 身份:fan-in 下供边侧归账到本引擎的 seqno 流/路由账
+            engine_index=self._lwd_engine_index,
             usages=[
                 (u.to_openai_dict() if (u := usage_by_req.get(rid)) else {})
                 for rid in meta.req_ids
@@ -1232,3 +1283,17 @@ class LwdCloudEngineCore(EngineCoreProc):
                 "(edge consumption stalled?)",
                 edge_id, len(pending),
             )
+
+
+class LwdCloudEngineCore(LwdCloudEngineCoreMixin, EngineCoreProc):
+    """云 PO 引擎(单引擎):EngineCoreProc 基座,行为与 mixin 拆分前一致。"""
+
+
+class LwdCloudDPEngineCore(LwdCloudEngineCoreMixin, DPEngineCoreProc):
+    """云 PO 引擎(云内 MoE DP>1):DPEngineCoreProc 基座。
+
+    MRO 上 mixin 在前:LWD 接缝(调度器注入/PRE_OUT 线程/c2e 通告/
+    前缀协调)覆写原生同名方法;wave 状态机、dummy batch、
+    `_maybe_publish_request_counts`、START_DP_WAVE 处理等 DP 语义不经
+    mixin,原样取自 DPEngineCoreProc。由 `lwd_resolve_engine_cls` 在
+    cloud 角色且 data_parallel_size>1 时选中(core.py 的 MoE DP 分支)。"""

@@ -205,8 +205,9 @@ class LwdEdgePrefixClient:
         )
 
         logger.info(
-            "[Lwd][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s",
-            request_id, probe.hit_tokens, probe.cloud_id,
+            "[Lwd][edge-client] negotiate req=%s hit_tokens=%d cloud_id=%s "
+            "engine_index=%d",
+            request_id, probe.hit_tokens, probe.cloud_id, probe.engine_index,
         )
         return probe
 

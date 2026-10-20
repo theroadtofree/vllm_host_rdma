@@ -44,7 +44,14 @@ def lwd_resolve_engine_cls(vllm_config):
     _lwd_init_registry_and_validate(vllm_config, config)
     from vllm.logger import init_logger
 
+    dp_size = vllm_config.parallel_config.data_parallel_size
     if config.is_edge_node:
+        if dp_size > 1:
+            raise ValueError(
+                "[Lwd] prefill_only edge must be single-card "
+                f"(data_parallel_size={dp_size}); multi-card/multi-DP edge "
+                "is not supported"
+            )
         from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
             LwdEdgeEngineCore,
         )
@@ -53,6 +60,19 @@ def lwd_resolve_engine_cls(vllm_config):
             "[Lwd] prefill_only edge: engine class selected (LwdEdgeEngineCore)"
         )
         return LwdEdgeEngineCore
+    if dp_size > 1:
+        # 云内 DP(GLM MoE):DPEngineCoreProc 基座,wave/dummy-run 语义
+        # 原样继承;LWD 接缝经 mixin 覆写
+        from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+            LwdCloudDPEngineCore,
+        )
+
+        init_logger(__name__).info(
+            "[Lwd] prefill_only cloud: engine class selected "
+            "(LwdCloudDPEngineCore, dp=%d)",
+            dp_size,
+        )
+        return LwdCloudDPEngineCore
     from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
         LwdCloudEngineCore,
     )

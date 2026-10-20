@@ -687,6 +687,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         必须等于边侧实际发送的逐请求 token 数(HCCL P2P 要求两端
         numel 严格相等)。prompt_offsets/has_mrope 逐 item 透传。"""
         ghost_ids = [i.request_id for i in self._lwd_cur_ghost_items]
+        for item in all_items:
+            if item.has_mrope and not item.mrope_positions:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] mrope payload missing "
+                    f"req={item.request_id} seqno={notify.seqno}: "
+                    f"has_mrope=True 但控制面未携带 positions 字节——边侧"
+                    f"仍按数据面 aux 帧协议运行(wire_version<"
+                    f"{LWD_WIRE_VERSION}),两侧必须同版本部署"
+                )
         return LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=notify.seqno,
@@ -699,9 +708,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 edge_id=parse_edge_id(all_items[0].request_id)[0],
                 prompt_offsets=[item.offset for item in all_items],
                 has_mrope=[item.has_mrope for item in all_items],
-                # 逐 item 透传 positions 字节(含幽灵行:行在载荷里,
-                # runner 跳过注入即可;wire_version=2 起数据面 aux 帧
-                # 退役,positions 全走控制面)
+                # mrope positions 逐 item 透传(wire_version>=2 控制面
+                # 字节):runner 对 MM 请求 frombuffer 直写 req_state,
+                # 文本请求空 bytes、零路径变化;数据面 aux 帧已退役
+                # (含幽灵行:行在载荷里,runner 跳过注入即可)。
                 mrope_positions=[item.mrope_positions for item in all_items],
                 ghost_req_ids=ghost_ids,
             ),
