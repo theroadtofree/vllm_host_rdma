@@ -214,10 +214,12 @@ class LwdCloudEngineCoreMixin:
         # 冲突;DEALER identity / HELLO 通告都用派生后的真值。
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
         pre_out_port = config.pre_out_port + dp_rank
+        # 工厂内部按 pre_out_port + dp_rank 派生连接端口,这里必须传基址,
+        # 否则 engine j 会连到 base + 2*j,与边侧 ROUTER 的 base + j 错位。
         channel = create_cloud_zmq_channel(
             master_addr=master_addr,
             dp_rank=dp_rank,
-            pre_out_port=pre_out_port,
+            pre_out_port=config.pre_out_port,
             name=f"lwd-cloud-inst{config.instance_id}",
             instance_id=config.instance_id,
         )
@@ -238,6 +240,12 @@ class LwdCloudEngineCoreMixin:
             ),
             # 控制面协议版本互校(mrope 直传;边侧构造期 fail-fast)
             wire_version=LWD_WIRE_VERSION,
+            # 多 DP 身份与 coordinator stats 地址(边侧建端点表/路由账/
+            # 唤醒通道用);dp=1 时 engine_index=0、无 coordinator 为空
+            engine_index=dp_rank,
+            coord_stats_addr=self._lwd_coord_stats_addr(
+                config, self.frontend_stats_publish_address
+            ),
         )
         # 业务层就绪通告:通道 HELLO/WELCOME 只证明 TCP 连通,本通告
         # 证明云全量初始化(权重/KV/图编译)完成,边侧以此放行
@@ -279,7 +287,7 @@ class LwdCloudEngineCoreMixin:
             "[Lwd] cloud engine assembled (full_duplex): DEALER connect -> "
             "%s:%s (identity=%d)",
             master_addr,
-            config.pre_out_port,
+            pre_out_port,
             config.instance_id,
         )
 
