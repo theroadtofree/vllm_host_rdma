@@ -1397,6 +1397,30 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 completed += 1
                 continue
             result, chain = outcome
+            # placement_only:probe 只取引擎放置回执(engine_index),不建链
+            # 不续算,故 chain=None。学习放置回执后按未命中直通(与
+            # fail-open 同径);chain=None 不能进 len()/finalize,否则崩。
+            if chain is None:
+                engine_index = getattr(result, "engine_index", None)
+                if engine_index is not None:
+                    self._lwd_probe_engine_by_req[request_id] = int(
+                        engine_index
+                    )
+                dep_chain = self._lwd_try_build_dep_chain(request)
+                self._lwd_finalize_add_request(
+                    request,
+                    list(request.block_hashes),
+                    0,
+                    dep_chain=dep_chain,
+                )
+                logger.info(
+                    "[Lwd][edge] prefix probe req=%s placement_only "
+                    "(engine=%d, no chain)",
+                    request_id,
+                    self._lwd_probe_engine_by_req.get(request_id, 0),
+                )
+                completed += 1
+                continue
             # 学习云侧 hash 粒度;与本次建链粒度不一致时按其重建链。
             # notify 在 probe 之后才发,故首请求(首次学习)即生效:非
             # 整除 prompt 的链覆盖到云 hash 粒度,采纳条件恒成立。
