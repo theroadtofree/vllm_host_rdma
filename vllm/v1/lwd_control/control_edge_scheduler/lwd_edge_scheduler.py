@@ -285,9 +285,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_first_token_seen: set[str] = set()
         # (cloud_id, seqno) -> 批内 request_id 列表(chunk 粒度 pending
         # 跟踪,按 cloud_id 分域——seqno 本就按 cloud_id 分域分配,裸
-        # seqno 多云互撞):批内全部请求收到首 token 即整条移除;abort
-        # 时按请求摘除,摘空即移除。云侧 pending 的边侧本地镜像,免协议
-        # 改动;与云侧提前收在飞池同源(每边每云领先量封顶)。
+        # seqno 多云互撞):批内全部请求收到首 token 即整条移除;abort/
+        # finish 时按请求摘除,摘空即移除(finish 摘除是死锁修复:
+        # _lwd_first_token_seen 完结即移出,不摘除会让"短请求先完结"的
+        # 批条目永不清除,该云 pending 攒满上限即永卡闸门)。云侧 pending
+        # 的边侧本地镜像,免协议改动;与云侧提前收在飞池同源(每边每云
+        # 领先量封顶)。
         self._lwd_batch_requests: dict[tuple[int, int], list[str]] = {}
         # pending 闸门状态(仅作开/关转换日志用)
         self._lwd_prefill_gate_held: bool = False
@@ -1889,8 +1892,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_finish_gen_ids.setdefault(request_id, []).extend(token_ids)
             self._lwd_announce_gen_chain(request_id)
         # 首个 c2e token 到达即标记:批内全部请求都见过首 token 即该 chunk
-        # 已被云侧消费,pending 台账整条移除(闸门名额归还)。**完结请求也
-        # 必须先走本清理**(331734f512 修复:否则台账残留,闸门永 HOLD)
+        # 已被云侧消费,pending 台账整条移除(闸门名额归还)。
         self._lwd_first_token_seen.add(request_id)
         seen = self._lwd_first_token_seen
         for key, rids in list(self._lwd_batch_requests.items()):
@@ -1901,6 +1903,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.lwd_edge_finish(request_id)
             del self._lwd_awaiting[request_id]
             self._lwd_first_token_seen.discard(request_id)
+            # 完结请求必须像 abort 一样从 pending 台账摘除(主干
+            # 331734f512 死锁修复):上一行 discard 之后,同批"短请求
+            # 先完结、长请求首 token 后到"的条目靠上面的 all(seen)
+            # 判据永远等不到清除;泄漏条目按云攒到 _LWD_MAX_PENDING_
+            # CHUNKS 即该云闸门永卡 HOLD——边侧停发新 chunk、云侧
+            # mid-prefill 空转。台账按 (cloud_id,seqno) 分域,摘除按
+            # 请求全表扫描,多边多云下天然覆盖该请求所在全部云域。
+            self._lwd_purge_pending_ledger(request_id)
             # finish 即解绑:请求与云实例的生命周期绑定结束
             # (迟到结果不再认领,绑定表出表)
             self._lwd_binding.unbind(request_id)
