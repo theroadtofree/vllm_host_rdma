@@ -1094,18 +1094,52 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
-        # LWD: sample_tokens 的采集在主流末尾异步物化 pinned meta,
-        # 发送响应前必须等其落地(此处是输出线程/同步路径的入队点,
-        # 非计算关键路径),保证控制面读到的 meta 是完整的。
-        # 事件由 runner 每步覆写;到期事件 synchronize 为 no-op,无需清理。
-        ready_event = getattr(self.worker, "_lwd_meta_ready_event", None)
+        # LWD: 步 meta 收割(此处是输出线程/同步路径的入队点,非计算
+        # 关键路径)。就绪事件随输出对象逐步传递(采集时 record 的当步
+        # 独立对象;worker 共享属性存在"已赋值未 record"的窗口,sync
+        # 未 record 的事件会立即放行);Event 不可序列化,摘除不出进程。
+        # 跨流依赖必须建在设备侧:本平台 host 侧事件同步不足以给另一条
+        # 流上的后续拷贝排序——拷贝流 wait_event 就绪事件,完成事件
+        # record 在拷贝流上(与原生异步输出拷贝同模式)。carrier 由
+        # 未收割 5 元组重写为成品 4 元组(cpu 张量, req_ids, numel,
+        # seqno),线布局 [meta|seg_lens] 不变,引擎零改动。
+        inner = getattr(output, "_model_runner_output", output)
+        ready_event = getattr(inner, "lwd_meta_ready_event", None)
         if ready_event is not None:
+            delattr(inner, "lwd_meta_ready_event")
+        carrier = getattr(inner, "lwd_down_carrier", None)
+        if carrier is not None and len(carrier) == 5:
+            # 不变量:carrier 与就绪事件在 worker 侧成对挂接;缺失即
+            # 挂接被破坏,fail-fast 而不是读未围栏的设备内存
+            assert ready_event is not None, "lwd carrier without ready event"
+            (meta_dev, seg_lens_host,
+             req_ids, hidden_numel, seqno) = carrier
+            stream = getattr(self, "_lwd_harvest_stream", None)
+            if stream is None:
+                stream = self._lwd_harvest_stream = torch.npu.Stream()
+            n_dev = meta_dev.numel()
+            n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
+            n_meta = n_dev + n_seg
+            buf = getattr(self, "_lwd_harvest_pinned", None)
+            if buf is None or buf.numel() < n_meta:
+                buf = torch.empty(max(n_meta, 4096), dtype=torch.int32,
+                                  pin_memory=True)
+                self._lwd_harvest_pinned = buf
             _t_sync = time.monotonic()
-            ready_event.synchronize()
-            # 探针④:输出线程被 pinned-meta 同步占住的时长(响应腿
-            # 延迟的主要来源嫌疑;~0 即到期事件,大则输出线程被拖)。
+            with torch.npu.stream(stream):
+                stream.wait_event(ready_event)
+                buf[:n_dev].copy_(meta_dev, non_blocking=True)
+                done = torch.npu.Event()
+                done.record()
+            done.synchronize()
+            if n_seg:
+                buf.numpy()[n_dev : n_dev + n_seg] = seg_lens_host
+            inner.lwd_down_carrier = (buf[:n_meta], req_ids, hidden_numel,
+                                      seqno)
+            # 输出线程收割耗时(含等主流计算排空):~0 即设备已空闲,
+            # 大则响应腿被拖
             logger.info(
-                "[Lwd][perf] ready-event-sync dur=%.2fms ts=%.3f",
+                "[Lwd][perf] meta-harvest dur=%.2fms ts=%.3f",
                 (time.monotonic() - _t_sync) * 1000, time.monotonic(),
             )
 
