@@ -40,6 +40,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.lwd_control.control_communication.lwd_notify import (
+    LWD_WIRE_VERSION,
     LwdRangeItem,
     LwdRangeNotify,
 )
@@ -65,6 +66,8 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # [Lwd][sched] 调度批日志步计数(饿死分析:RangeNotify 到达 ->
         # 混排步消费的间隔与中间插入的 decode-only 步数)
         self._lwd_sched_step = 0
+        # 并发观测日志的限频水位(见 schedule())
+        self._lwd_conc_last_log = time.monotonic()
         # MTP 预算系数:decode 每请求每步消耗 1+k 个 token(草稿 token
         # 占预算与 KV);k = num_speculative_tokens(配置解析期已求值,
         # 缺省 None 按 0),无 spec 配置即 1
@@ -298,6 +301,44 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         if len(self._lwd_recent_finished) > self._LWD_RECENT_FINISHED_CAP:
             self._lwd_recent_finished.popitem(last=False)
 
+    def _lwd_pre_recv_ready(
+        self, notify: LwdRangeNotify, items: list[LwdRangeItem]
+    ) -> bool:
+        """提前收闸门:该批(本 chunk 批)的 UP 数据收完了没。
+
+        收完才允许下发这个 prefill 批 —— 此时 embeds 主帧已在云 worker 的
+        接收 buffer 里,注入侧 future.wait() 立刻返回;没收完就本步只下
+        decode(notify 留队首,下步再判),不把等待塞进 worker 前向。
+
+        判据是引擎维护的按边水位(worker 通信线程上报收完的 seqno):
+        每 (edge, channel) 完成序 = seqno 序(通道 FIFO),所以
+        seqno <= 水位 即精确判据。edge_id 从批内首条目的包装 req_id 反解
+        (一批一通知单 seqno,批内条目恒同边——边侧一批一云一通知)。
+
+        幽灵批不过本闸门:全失效分支在到达本判据之前已被弹队消费
+        (照收不注入要尽快排空,幽灵 recv 由消费点兜底补挂)。
+        """
+        from vllm_ascend.distributed.lwd_comm.pre_recv import (
+            is_irecv_complete,
+            watermark,
+        )
+        from vllm_ascend.distributed.lwd_comm.types import LwdChannelType
+
+        edge_id = parse_edge_id(items[0].request_id)[0]
+        ready = is_irecv_complete(edge_id, LwdChannelType.UP, notify.seqno)
+        # 闸门读数:与 HINT/SUBMIT/DONE/REPORT 同一单调钟(DEBUG 级,
+        # 默认静默;排查时可把"预告到达->挂recv->收完上报->放行"四段相减)
+        logger.debug(
+            "[Lwd][pre-recv] gate edge=%d seqno=%d watermark=%d ready=%s "
+            "ts=%.3f",
+            edge_id,
+            notify.seqno,
+            watermark(edge_id, LwdChannelType.UP),
+            ready,
+            time.monotonic(),
+        )
+        return ready
+
     def _lwd_preflight_ok(
         self, items: list[LwdRangeItem], num_decode: int
     ) -> bool:
@@ -425,6 +466,11 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                     notify.seqno,
                 )
                 notify = None
+            elif not self._lwd_pre_recv_ready(notify, items):
+                # 提前收闸门:UP 张量还没收完 -> 本步不下发这个 prefill 批
+                # (notify 留队首,下步再判),本步只下 decode。收完的批优先,
+                # 没收完的批一直让 decode 自转,不把等待塞进 worker 前向。
+                notify = None
             elif not self._lwd_preflight_ok(items, len(decode_ids)):
                 # 预算/名额/KV 不足:预告留队首,decode 泄压后重试
                 notify = None
@@ -460,6 +506,14 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
             sum(item.num_tokens for item in items),
         )
         for item in items:
+            if item.has_mrope and not item.mrope_positions:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] mrope payload missing "
+                    f"req={item.request_id} seqno={notify.seqno}: "
+                    f"has_mrope=True 但控制面未携带 positions 字节——边侧"
+                    f"仍按数据面 aux 帧协议运行(wire_version<"
+                    f"{LWD_WIRE_VERSION}),两侧必须同版本部署"
+                )
             request = self.requests[item.request_id]
             computed = request.num_computed_tokens
             if computed != item.offset and computed == 0 and item.offset > 0:
@@ -608,9 +662,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         # 尺寸与注入切行信息:req_ids 取批内逐请求,token_ids 为占位
         # 列表——长度必须等于边侧实际发送的逐请求 token 数,recv numel
         # 才能与边侧 isend 严格相等(HCCL P2P 要求两端 numel 匹配)。
-        # prompt_offsets/has_mrope 逐 item 透传:worker 据此求 aux 帧
-        # 尺寸(Σ 有 mrope 条目的 n_i×3),runner 据此对 MM 请求注入
-        # mrope 行(文本请求零 aux 流量、零路径变化)。
+        # prompt_offsets/has_mrope/mrope_positions 逐 item 透传:
+        # runner 对 MM 请求把 positions 字节 frombuffer 直写 req_state
+        # (文本请求空 bytes、零路径变化);数据面 aux 帧已退役
+        # (wire_version=2)。
         out.lwd_batch = self._lwd_build_embed_batch(
             notify, self._lwd_notify_items(notify)
         )
@@ -644,6 +699,10 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
                 edge_id=parse_edge_id(all_items[0].request_id)[0],
                 prompt_offsets=[item.offset for item in all_items],
                 has_mrope=[item.has_mrope for item in all_items],
+                # 逐 item 透传 positions 字节(含幽灵行:行在载荷里,
+                # runner 跳过注入即可;wire_version=2 起数据面 aux 帧
+                # 退役,positions 全走控制面)
+                mrope_positions=[item.mrope_positions for item in all_items],
                 ghost_req_ids=ghost_ids,
             ),
         )
@@ -672,6 +731,15 @@ class LwdCloudMixedScheduler(LwdBaseScheduler):
         logger.debug(
             "[Lwd][perf] cloud-sched dur=%.2fms", (time.monotonic() - _t) * 1000
         )
+        # 云侧实际并发观测:running 数即在飞请求数,限频 10s 一条,
+        # 供容量/并发评估(不携带请求信息)
+        now = time.monotonic()
+        if now - self._lwd_conc_last_log >= 10.0:
+            self._lwd_conc_last_log = now
+            logger.info(
+                "[Lwd][sched] cloud concurrency: running=%d",
+                len(self.running),
+            )
         return out
 
     def _lwd_log_sched_batch(self, out: SchedulerOutput) -> None:

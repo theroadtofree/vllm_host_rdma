@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import queue
 import threading
 import time
@@ -80,6 +81,14 @@ logger = init_logger(__name__)
 # 死亡(引擎步内抛出,与旧版 add 路径重试耗尽即错的语义同级,但不再
 # 用 sleep 阻塞主循环)
 _LWD_PENDING_FAIL_AFTER_S = 30.0
+
+# 云侧 pending 上限,按未消费 chunk(seqno)计、按 cloud_id 分域:一条
+# seqno = 一个云步消费单位。边侧记录 (cloud_id, seqno) -> 批内请求列表,
+# 批内全部请求收到首 token 即该 chunk 已消费;对某云的未消费 chunk 数达到
+# 上限即停止向该云新开 prefill——请求在边侧 waiting 攒批(picker FCFS 前缀
+# 天然组多请求批),云侧 pending 排空后闸门自开。与云侧提前收在飞池同源:
+# 每边每云最多 cap 条"已挂未消费",云的接收池压力因此有界。
+_LWD_MAX_PENDING_CHUNKS = int(os.environ.get("VLLM_LWD_MAX_PENDING_CHUNKS", "2"))
 
 # probe 看门狗时限:远大于钳制后的 connect_timeout(3s)+云侧处理余量,
 # 只兜「probe 线程静默死亡」的底,正常 RTT 不会触发
@@ -270,6 +279,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # awaiting:嵌入完待云结果的 request_id -> 登记时刻(单调钟)。
         # 请求本体已清出调度器,此表是结果路径的唯一生命周期台账。
         self._lwd_awaiting: dict[str, float] = {}
+        # 已收到首个 token 的请求集合:awaiting 中不在此集合的请求 =
+        # 云侧尚未消费到其 prefill(pending 的边侧本地估计,免新增协议
+        # 字段);首个 c2e 到达即标记,完结/abort 时清除。
+        self._lwd_first_token_seen: set[str] = set()
+        # (cloud_id, seqno) -> 批内 request_id 列表(chunk 粒度 pending
+        # 跟踪,按 cloud_id 分域——seqno 本就按 cloud_id 分域分配,裸
+        # seqno 多云互撞):批内全部请求收到首 token 即整条移除;abort
+        # 时按请求摘除,摘空即移除。云侧 pending 的边侧本地镜像,免协议
+        # 改动;与云侧提前收在飞池同源(每边每云领先量封顶)。
+        self._lwd_batch_requests: dict[tuple[int, int], list[str]] = {}
+        # pending 闸门状态(仅作开/关转换日志用)
+        self._lwd_prefill_gate_held: bool = False
         # 多模态请求的整 prompt mrope positions([3,N] CPU 张量,准入时
         # 一次性算好,按 chunk 切片随 LwdEmbedBatch 下发 worker);嵌入
         # 完结/abort 时摘除。key 在 = 该请求各 chunk 的 has_mrope 恒真。
@@ -438,6 +459,41 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             and not self._lwd_has_prefill_chunk_inflight()
         ):
             return SchedulerOutput.make_empty()
+        # 云侧 pending 闸门(组批的产生机制,按 cloud_id 分域):发往某云的
+        # 未消费 chunk 数达 cap 即停止向该云新开 prefill,请求在边侧
+        # waiting 攒批(picker FCFS 前缀天然组多请求批),云侧 pending
+        # 排空后闸门自开。续传豁免(先收尾再开新)。判定哪个云:取
+        # waiting 队首请求的绑定云——picker FCFS,下一批的云由队首决定;
+        # waiting 空(纯续传步)不查闸。多云取舍:队首的云饱和即整体
+        # 停开新(简单、无误挂),按云独立放行的精细化留给 DRR 分桶。
+        if self._lwd_mixed and not self._lwd_has_prefill_chunk_inflight():
+            head = (
+                self.waiting.peek_request() if self.waiting else None
+            )
+            if head is not None:
+                cloud_id = self._lwd_binding.cloud_of(
+                    head.request_id, default=self._lwd_default_cloud_id()
+                )
+                pending_chunks = sum(
+                    1 for (c, _seqno) in self._lwd_batch_requests
+                    if c == cloud_id
+                )
+                if pending_chunks >= _LWD_MAX_PENDING_CHUNKS:
+                    if not self._lwd_prefill_gate_held:
+                        self._lwd_prefill_gate_held = True
+                        logger.info(
+                            "[Lwd][edge-sched] prefill gate HOLD: cloud=%d "
+                            "pending_chunks=%d >= %d",
+                            cloud_id, pending_chunks, _LWD_MAX_PENDING_CHUNKS,
+                        )
+                    return SchedulerOutput.make_empty()
+                if self._lwd_prefill_gate_held:
+                    self._lwd_prefill_gate_held = False
+                    logger.info(
+                        "[Lwd][edge-sched] prefill gate OPEN: cloud=%d "
+                        "pending_chunks=%d",
+                        cloud_id, pending_chunks,
+                    )
         return self._lwd_schedule_batch()
 
     def _lwd_try_build_dep_chain(self, request: Request) -> list[bytes] | None:
@@ -624,12 +680,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             candidates = list(self.skipped_waiting) + list(self.waiting)
             picked = [candidates[0].request_id] if candidates else []
             return picked, {}, self.max_num_scheduled_tokens
-        # cap 语义:批 Σchunk ≤ 预算 − 在途数 × spec 系数(云混排步里
-        # decode 每请求占 1+k token,MTP 下 k = num_spec_tokens;在途数
-        # 是 decode 人口的恒成立上界,设计 §2.2)。边云预算部署对齐,
-        # 本地 max_num_scheduled_tokens 即云侧预算
+        # cap 语义:批 Σchunk ≤ 预算 − 满员 × spec 系数(**静态最坏口径**,
+        # 与构造期活性校验同源)。云混排步里 decode 每请求占 1+k token;
+        # chunk 在边侧当下切、在云侧未来执行——切时点的在途数预测不了
+        # 执行时点的 decode 人口(实测:首 chunk 在途=0 切出满预算
+        # 8192 的块,到云侧恰逢 decode 活动,8192+8 顶爆 runner 按
+        # 8192 开死的输入缓冲)。静态预留后 chunk + decode ≤ 预算恒成立,
+        # 云侧 preflight 预算闸门永不误响、缓冲永不溢出。
+        # 边云预算部署对齐,本地 max_num_scheduled_tokens 即云侧预算。
         inflight = len(self.running) + len(self._lwd_awaiting)
-        cap = self.max_num_scheduled_tokens - inflight * self._lwd_spec_factor
+        cap = (
+            self.max_num_scheduled_tokens
+            - self.max_num_running_reqs * self._lwd_spec_factor
+        )
         free_seq = self.max_num_running_reqs - inflight
         picked: list[str] = []
         expected: dict[str, int] = {}
@@ -1333,7 +1396,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         token_slices: list[list[int]] = []
         prompt_offsets: list[int] = []
         has_mrope: list[bool] = []
-        mrope_slices: list[list[list[int]]] = []
         cloud_id: int | None = None
         for request_id, num_tokens in scheduled.items():
             request = self.requests.get(request_id)
@@ -1374,16 +1436,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # _update_after_schedule 已乐观推进 num_computed,起点需回退本步量
             offset = request.num_computed_tokens - num_tokens
             # 多模态:准入时预算了整 prompt positions 的请求,各 chunk
-            # 恒携带 mrope 行(key 在即恒真);[3,N] 切本 chunk 列 ->
-            # [n,3] 行序与 token 轴对齐,随批下发 worker 组 aux 帧
+            # 恒携带 mrope(key 在即恒真);[3,N] 切本 chunk 列并序列化
+            # 为原始字节随 item 走控制面(wire_version>=2,数据面 aux
+            # 帧已退役)
             positions = self._lwd_mrope_positions_dict.get(request_id)
             req_has_mrope = positions is not None
+            mrope_bytes = b""
+            if req_has_mrope:
+                assert positions is not None
+                mrope_bytes = (
+                    positions[:, offset : offset + num_tokens]
+                    .contiguous()
+                    .numpy()
+                    .tobytes()
+                )
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
+                    mrope_positions=mrope_bytes,
                 )
             )
             req_ids.append(request_id)
@@ -1392,13 +1465,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             prompt_offsets.append(offset)
             has_mrope.append(req_has_mrope)
-            if req_has_mrope:
-                assert positions is not None
-                mrope_slices.append(
-                    positions[:, offset : offset + num_tokens].t().tolist()
-                )
-            else:
-                mrope_slices.append([])
         if not items:
             return True
         assert cloud_id is not None
@@ -1428,6 +1494,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"tokens={sum(i.num_tokens for i in items)}"
             )
         self._lwd_seqno[cloud_id] = seqno + 1
+        # chunk 粒度 pending 台账:批内全部请求收到首 token 才移除
+        # (deliver 路径);键带 cloud_id(seqno 按 cloud_id 分域,裸 seqno
+        # 多云互撞)
+        self._lwd_batch_requests[(cloud_id, seqno)] = list(req_ids)
         logger.debug(
             "[Lwd][edge-notify] batch reqs=%d tokens=%d seqno=%d cloud=%d "
             "mrope=%d",
@@ -1437,7 +1507,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # 发布成功即组 EMBED 批挂 SO:seqno 是数据面发云张量的
         # 配对键(与云侧 RangeNotify 登记同值),embed 载荷为本
         # 批逐请求的 token 片段(边 worker 按 req_ids 序扁平化);
-        # mrope 行同序携带(仅 MM 请求非空),worker 据此组 aux 帧
+        # mrope positions 已随 RangeNotify 走控制面,边 worker 不再
+        # 组 aux 帧
         scheduler_output.lwd_batch = LwdBatch(
             batch_type=LwdBatchType.LWD_EMBED,
             seqno=seqno,
@@ -1448,7 +1519,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 cloud_id=cloud_id,
                 prompt_offsets=prompt_offsets,
                 has_mrope=has_mrope,
-                mrope_positions=mrope_slices,
             ),
         )
         return True
@@ -1519,6 +1589,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request_id, num_prompt_tokens, cloud_id,
             )
 
+    def _lwd_purge_pending_ledger(self, request_id: str) -> None:
+        """从 pending 台账摘除该请求(摘空即删条目)。
+
+        abort/finish 路径用:批内全部请求离开(首 token 全见或被摘除),
+        该 chunk 的闸门名额才归还。漏摘 = 台账残留 → 闸门永 HOLD
+        (331734f512 修复的就是这个死锁)。"""
+        seen = self._lwd_first_token_seen
+        for key, rids in list(self._lwd_batch_requests.items()):
+            rids = [rid for rid in rids if rid != request_id]
+            if not rids or all(rid in seen for rid in rids):
+                del self._lwd_batch_requests[key]
+            else:
+                self._lwd_batch_requests[key] = rids
+
     def lwd_edge_abort(self, request_ids: list[str]) -> None:
         """发 LwdAbortNotify + 摘除 awaiting/绑定;调度器内清理走原生路径。
 
@@ -1528,6 +1612,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (发布前 abort)仅本地清台账。"""
         for request_id in request_ids:
             self._lwd_awaiting.pop(request_id, None)
+            # pending 台账随 abort 摘除(摘空即删条目,闸门名额归还)
+            self._lwd_first_token_seen.discard(request_id)
+            self._lwd_purge_pending_ledger(request_id)
             # 收尾备料随 abort 一并清理(不再上报 finish)
             self._lwd_finish_prompt_ids.pop(request_id, None)
             self._lwd_finish_gen_ids.pop(request_id, None)
@@ -1801,10 +1888,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if token_ids:
             self._lwd_finish_gen_ids.setdefault(request_id, []).extend(token_ids)
             self._lwd_announce_gen_chain(request_id)
+        # 首个 c2e token 到达即标记:批内全部请求都见过首 token 即该 chunk
+        # 已被云侧消费,pending 台账整条移除(闸门名额归还)。**完结请求也
+        # 必须先走本清理**(331734f512 修复:否则台账残留,闸门永 HOLD)
+        self._lwd_first_token_seen.add(request_id)
+        seen = self._lwd_first_token_seen
+        for key, rids in list(self._lwd_batch_requests.items()):
+            if all(rid in seen for rid in rids):
+                del self._lwd_batch_requests[key]
         if finished:
             # 收尾记账先于解绑(上报按绑定表定向选云)
             self.lwd_edge_finish(request_id)
             del self._lwd_awaiting[request_id]
+            self._lwd_first_token_seen.discard(request_id)
             # finish 即解绑:请求与云实例的生命周期绑定结束
             # (迟到结果不再认领,绑定表出表)
             self._lwd_binding.unbind(request_id)
