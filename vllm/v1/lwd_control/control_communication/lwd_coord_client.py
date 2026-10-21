@@ -47,31 +47,28 @@ class LwdCoordClient:
         (coordinator.py 的 wave < current_wave 分支)。"""
         if self._closed:
             return
-        # 锁等待上界:stats 线程持锁 poll(50ms),主循环每请求经本方法
-        # 上行一次;带超时拿锁,拿不到即丢(唤醒是幂等优化,丢一条由
-        # 引擎 add_request 的自醒路径兜底),主循环不吃满一个 poll 周期。
-        if not self._lock.acquire(timeout=0.02):
-            logger.warning(
-                "[Lwd] FIRST_REQ to coordinator skipped (lock contention), "
-                "engine=%d (engine-side self-wake covers)", engine_index
-            )
-            return
+        # 阻塞拿锁(与 1E1C legacy 分支一致):FIRST_REQ 是 LWD 云内 DP
+        # 的唯一唤醒路径——LWD 请求以 request_wave=0 注入,引擎
+        # add_request 的「request_wave != current_wave」自醒分支不触发,
+        # 没有「引擎自醒兜底」可丢。带超时拿锁一旦在 stats 线程持锁
+        # poll(50ms) 期间竞争失败,即静默丢唤醒 → 对侧引擎不醒 →
+        # DP 锁步死锁。阻塞 acquire 最多等一个 poll 周期(50ms),可接受。
         try:
-            self._socket.send(
-                msgspec.msgpack.encode((engine_index, 0)), flags=zmq.NOBLOCK
-            )
-            # 唤醒链排障锚点:引擎入睡后无此日志 = FIRST_REQ 未发出
-            # (hook 未接线);有日志但云侧无 wave 动静 = coordinator
-            # 地址/端口错(coord_port 不一致)
-            logger.info(
-                "[Lwd] FIRST_REQ sent to coordinator: engine=%d", engine_index
-            )
+            with self._lock:
+                self._socket.send(
+                    msgspec.msgpack.encode((engine_index, 0)), flags=zmq.NOBLOCK
+                )
         except zmq.ZMQError:
             logger.warning(
                 "[Lwd] FIRST_REQ to coordinator dropped", exc_info=True
             )
-        finally:
-            self._lock.release()
+            return
+        # 唤醒链排障锚点:引擎入睡后无此日志 = FIRST_REQ 未发出
+        # (hook 未接线);有日志但云侧无 wave 动静 = coordinator
+        # 地址/端口错(coord_port 不一致)
+        logger.info(
+            "[Lwd] FIRST_REQ sent to coordinator: engine=%d", engine_index
+        )
 
     def _stats_loop(self) -> None:
         """stats 下行(仅对账日志):counts 是各 engine 的 [waiting, running],
