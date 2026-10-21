@@ -1588,6 +1588,16 @@ class EngineArgs:
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+        # ``create_engine_config`` mutates ``additional_config`` in place (e.g.
+        # injecting ``gdn_prefill_backend`` and the platform-expanded
+        # ``ascend_compilation_config``). argparse hands the caller and this
+        # dataclass the *same* dict object, so without a copy those engine-side
+        # mutations leak back into the CLI namespace. The namespace is later
+        # reused for the frontend attach config-diff, so decouple it here.
+        if isinstance(engine_args.additional_config, dict):
+            engine_args.additional_config = copy.deepcopy(
+                engine_args.additional_config
+            )
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
