@@ -278,7 +278,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
                     try:
                         # 复用模式没有 1E1C 的 hello_event 同步点,
                         # 语义只能从这里采纳
-                        self._lwd_adopt_cloud_semantics(notify)
+                        self._lwd_adopt_cloud_semantics(notify, cloud_id)
                         self._lwd_cross_check_hello(cloud_id)
                     except Exception:
                         # 接收线程内异常不能静默死线程(配置错位必须
@@ -390,13 +390,21 @@ class LwdEdgeEngineCore(EngineCoreProc):
             cloud_id, local,
         )
 
-    def _lwd_adopt_cloud_semantics(self, hello: LwdHelloNotify) -> None:
+    def _lwd_adopt_cloud_semantics(
+        self, hello: LwdHelloNotify, cloud_id: int | None = None
+    ) -> None:
         """采纳云侧调度语义(HELLO 首拍,先于任何调度步):
         ① spec_factor/EAGLE 尾块回退口径——MTP 只在云侧配置,边侧本地
         取不到合法来源,一律以云侧公告为准;② 调度三元组互校,不一致
         fail-fast(否则 preflight 恒 hold、prefill 被 decode 静默串行);
         ③ 前缀对齐网格写入边侧并按网格重切 chunk。"""
         scheduler = self.scheduler
+        # 记账键以信封 cloud_id 为准(接收线程已声明"信封覆盖载荷字段,
+        # 防错配"),缺省回退载荷字段;1E1C 两者同为 0。
+        cid = (
+            cloud_id if cloud_id is not None
+            else int(getattr(hello, "cloud_id", 0) or 0)
+        )
         count = int(getattr(hello, "num_speculative_tokens", 0) or 0)
         adopted_factor = count + 1
         old_factor = int(getattr(scheduler, "_lwd_spec_factor", 1))
@@ -432,14 +440,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
         alignment = int(getattr(hello, "prefix_alignment_tokens", 0) or 0)
         required = bool(getattr(hello, "prefix_alignment_required", False))
         if alignment > 0:
-            cloud_id = scheduler._lwd_default_cloud_id()
-            scheduler._lwd_align_grid_by_cloud[cloud_id] = alignment
+            # 键取公告云 id:全互联下每云都发 HELLO,统一写默认云会被后到者覆盖。
+            scheduler._lwd_align_grid_by_cloud[cid] = alignment
             if not scheduler.need_mamba_block_aligned_split:
                 scheduler.need_mamba_block_aligned_split = True
             logger.info(
                 "[Lwd][edge] adopt cloud prefix alignment: cloud=%d "
                 "alignment=%d required=%s (chunk auto-alignment enabled)",
-                cloud_id, alignment, required,
+                cid, alignment, required,
             )
             # required 时须留出一个对齐块 + 满员 decode 预算,否则续传
             # chunk 永无可调度预算。
@@ -458,6 +466,36 @@ class LwdEdgeEngineCore(EngineCoreProc):
                         f"{adopted_factor} 后只剩 {usable} < 对齐块 "
                         f"{alignment});请增大 max_num_batched_tokens"
                     )
+        # ④ 前缀摘要粒度采纳:首笔 probe 建链就要用到——云侧 GCD 与边侧
+        # LCM 不等时,首笔落在错域,那笔的块对后续请求永久不可命中。
+        hash_bs = int(getattr(hello, "prefix_hash_block_size", 0) or 0)
+        if hash_bs > 0:
+            bs_by_cloud = scheduler._lwd_hash_bs_by_cloud
+            known = set(bs_by_cloud.values())
+            bs_by_cloud[cid] = hash_bs
+            if known and hash_bs not in known:
+                # 只在"这次采纳引入了分歧"时告警,重复 HELLO 不刷屏。
+                # 异构粒度是硬缺口:入口建链早于选云,只能按默认云的粒度建,
+                # 落到本云的 probe 要么过不了云侧整除检查(fail-open,且回执
+                # 不带粒度⇒永远学不到),要么被复制扩展成永不命中的占位键。
+                logger.warning(
+                    "[Lwd][edge] cloud%d prefix hash block size %d disagrees "
+                    "with already adopted %s: pre-probe chains are built at the "
+                    "default cloud's granularity, so requests routed here lose "
+                    "reuse until route-before-chain lands",
+                    cid, hash_bs, sorted(known),
+                )
+            logger.info(
+                "[Lwd][edge] adopt cloud prefix hash block size: "
+                "cloud=%d hash_block_size=%d",
+                cid, hash_bs,
+            )
+        else:
+            logger.warning(
+                "[Lwd][edge] peer HELLO carries no prefix hash block size "
+                "(legacy peer; the first probe builds its chain at the "
+                "local granularity and those blocks stay unreachable)"
+            )
         # 采纳后复核活性下界(边侧 __init__ 的死锁检查用的是本地 factor)
         if scheduler._lwd_mixed and (
             scheduler.max_num_scheduled_tokens

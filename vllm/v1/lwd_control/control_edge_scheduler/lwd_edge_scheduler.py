@@ -55,6 +55,9 @@ from vllm.v1.lwd_control.control_communication.lwd_notify import (
     LwdRangeNotify,
     LwdRequestNotify,
 )
+from vllm.v1.lwd_control.control_communication.lwd_role_registry import (
+    get_role_registry,
+)
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_binding import (
     LwdEdgeBindingTable,
 )
@@ -90,9 +93,11 @@ _LWD_PENDING_FAIL_AFTER_S = 30.0
 # 每边每云最多 cap 条"已挂未消费",云的接收池压力因此有界。
 _LWD_MAX_PENDING_CHUNKS = int(os.environ.get("VLLM_LWD_MAX_PENDING_CHUNKS", "2"))
 
-# probe 看门狗时限:远大于钳制后的 connect_timeout(3s)+云侧处理余量,
-# 只兜「probe 线程静默死亡」的底,正常 RTT 不会触发
-_LWD_PROBE_WATCHDOG_S = 15.0
+# probe 看门狗余量(秒):整段探针已由客户端按 ``lwd_coordination.probe_timeout``
+# 钳住,看门狗只兜「probe 线程/事件循环静默死亡、future 永不完成」的底,所以
+# 必须**大于**客户端上限。原先硬编码 15s 而云侧上限 60s,慢探针必然由边侧先
+# 放弃(倒挂),这才是 fail-open 白付协商成本的根因。
+_LWD_PROBE_WATCHDOG_HEADROOM_S = 5.0
 
 # 探针会话连接上限:usage 排空会常驻占住一条连接直到请求完结(≈推理时长),
 # 与探测同池共享会话若用 aiohttp 默认 100,高并发下新 probe 会排队等连接、
@@ -244,8 +249,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_probe_inflight: dict[str, tuple[Request, int, float]] = {}
         self._lwd_probe_nonce = 0
         # probe 完成队列(线程安全,单生产者 probe 线程/单消费者主循环):
-        # 元素 (request_id, nonce, build_bs, (result, chain) | None)
+        # 元素 (request_id, nonce, build_bs,
+        #       (result, chain, timings) | None, t_done)
+        # t_done = 结果入队时刻([Lwd][perf] I1 用:与 drain 时刻之差即
+        # 结果在队列里等下一次引擎步的时长)
         self._lwd_probe_done: queue.Queue = queue.Queue()
+        # [Lwd][perf] I2:水位节流空排计数(只在主循环线程读写)
+        self._lwd_perf_empty_steps = 0
+        # 准入门跳过 probe 的计数(短于一个 hash 块的请求)
+        self._lwd_perf_probe_skips = 0
+        # 云名额摊薄分母:注册表是静态表,取到即缓存(None=尚未装配,下步重试)
+        self._lwd_n_edges: int | None = None
         # 引擎注入的唤醒钩(probe 完成时敲 input_queue WAKEUP;未注入=单测)
         self.lwd_probe_wakeup = None
         self._lwd_probe_runtime: _LwdProbeRuntime | None = None
@@ -461,6 +475,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             not self.lwd_edge_max_num_seqs_check()
             and not self._lwd_has_prefill_chunk_inflight()
         ):
+            # [Lwd][perf] I2:水位节流导致的整步空排。probe 在飞计入水位
+            # (见 lwd_edge_max_num_seqs_check),故 probe RTT 一被拉长,
+            # probe_inflight = QPS × RTT 就吃满 max_num_seqs 名额——短序列
+            # 高 QPS 下最先到顶。节流打印:前 20 次逐条,此后每 200 次一条
+            # (防日志本身变成被测开销)。
+            self._lwd_perf_empty_steps += 1
+            n_empty = self._lwd_perf_empty_steps
+            if n_empty <= 20 or n_empty % 200 == 0:
+                logger.info(
+                    "[Lwd][perf][gate] empty step #%d running=%d awaiting=%d "
+                    "probe_inflight=%d quota=%d",
+                    n_empty,
+                    len(self.running),
+                    len(self._lwd_awaiting),
+                    len(self._lwd_probe_inflight),
+                    self._lwd_seq_quota(),
+                )
             return SchedulerOutput.make_empty()
         # 云侧 pending 闸门(组批的产生机制,按 cloud_id 分域):发往某云的
         # 未消费 chunk 数达 cap 即停止向该云新开 prefill,请求在边侧
@@ -696,7 +727,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.max_num_scheduled_tokens
             - self.max_num_running_reqs * self._lwd_spec_factor
         )
-        free_seq = self.max_num_running_reqs - inflight
+        free_seq = self._lwd_seq_quota() - inflight
         picked: list[str] = []
         expected: dict[str, int] = {}
         used = 0
@@ -886,6 +917,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         预告先于本地登记:云侧视图领先本地工作,云只能准备不能提前
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。
+
+        准入门:prompt 短于一个云 hash 块的请求链必为空、hit 恒 0,直接走
+        与"协调未启用"同一条同步直通,不付 probe RTT、不占在飞名额。
         """
         self._lwd_validate_request(request)
         # 收尾记账备料:prompt ids 留档(终结时 Request 已不在调度器)
@@ -902,6 +936,31 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # 的孤儿预留:直接本地终结(与 finalize 后再 abort 同终态)
             self._lwd_abort_immediate(request)
             return
+        # 准入门:prompt 不足一个 hash 块时链必为空、hit 恒 0(结构性,与内容
+        # 无关),probe 纯属白付一次跨节点往返(满负荷实测 p50≈0.4s)并占一个
+        # 在飞名额。粒度用**与 _lwd_probe_submit_async 建链同一表达式**,保证
+        # 判定域=建链域;学习未就位时退到本地块粒度,结果偏保守(仍照 probe)。
+        # 跳过的请求走与"协调未启用"完全相同的同步直通路径(零新语义)。
+        coord_pair = self._lwd_probe_coord_cfg()
+        if coord_pair is not None:
+            probe_bs = (
+                self._lwd_hash_bs_by_cloud.get(self._lwd_default_cloud_id())
+                or coord_pair[1].cache_config.block_size
+            )
+            if request.num_prompt_tokens < probe_bs:
+                self._lwd_perf_probe_skips += 1
+                n_skip = self._lwd_perf_probe_skips
+                if n_skip <= 20 or n_skip % 200 == 0:
+                    logger.info(
+                        "[Lwd][perf][gate] skip_probe req=%s prompt=%d "
+                        "hash_bs=%d skips=%d",
+                        request.request_id, request.num_prompt_tokens,
+                        probe_bs, n_skip,
+                    )
+                self._lwd_finalize_add_request(
+                    request, list(request.block_hashes), 0
+                )
+                return
         if self._lwd_probe_submit_async(request):
             return
         # 协调未启用:不续算,链取 request 自身原生块哈希(与旧行为一致)
@@ -988,18 +1047,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         ]
 
     def _lwd_processor_fingerprint(self) -> bytes:
-        """处理器指纹(32B):模型 + mm_processor_kwargs 的 sha256。
-        掺入媒体覆盖块 HMAC,换模型/换 processor 配置即链分叉。"""
+        """处理器指纹(32B):掺入媒体覆盖块 HMAC,换模型/换 processor 配置
+        即链分叉。算法在 lwd_mm_identity 单点实现——云侧 MM-ABI 仲裁用同一
+        函数,且材料刻意不含模型本地路径(边云常挂不同路径)。"""
         if self._lwd_processor_fp is None:
-            model_cfg = self.vllm_config.model_config
-            material = "|".join((
-                str(model_cfg.model),
-                # InitVar 可能不在实例属性上,缺省 None 参与摘要
-                repr(getattr(model_cfg, "mm_processor_kwargs", None)),
-            ))
-            self._lwd_processor_fp = hashlib.sha256(
-                material.encode("utf-8")
-            ).digest()
+            from vllm.v1.lwd_control.control_communication.lwd_mm_identity import (
+                compute_processor_fingerprint,
+            )
+
+            self._lwd_processor_fp = compute_processor_fingerprint(
+                self.vllm_config.model_config
+            )
         return self._lwd_processor_fp
 
     def _lwd_probe_coord_cfg(self):
@@ -1034,6 +1092,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 connect_timeout=min(coord_cfg.connect_timeout, 3.0),
                 # 指纹与 _lwd_prefix_hasher 同源(缺此参数 mm 建链必抛)
                 processor_fingerprint=self._lwd_processor_fingerprint(),
+                # 探针端到端上限(配置单点):云侧 handler 用
+                # probe_timeout-5 先作答,看门狗再用 probe_timeout+5 兜底
+                probe_timeout=coord_cfg.probe_timeout,
             )
             self._lwd_probe_client_cache = client
         return client
@@ -1071,15 +1132,24 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         async def _job():
             session = await runtime.ensure_session()
+            # [Lwd][perf] I1:hmac=建链成本(O(prompt));http=negotiate 全程
+            # (网关 + 云父进程 + mp 队列 + 云引擎步头 poll + 回传)
+            t_hmac0 = time.monotonic()
             manifest = client.build_manifest(
                 request_id, prompt_ids, media_items=media_items
             )
+            t_hmac1 = time.monotonic()
             result = await client.negotiate(
                 session, request_id, prompt_ids, manifest=manifest,
                 media_items=media_items,
                 model=model_name,
             )
-            return result, list(manifest.full_block_hashes)
+            t_http1 = time.monotonic()
+            return (
+                result,
+                list(manifest.full_block_hashes),
+                (t_hmac0, t_hmac1, t_http1),
+            )
 
         try:
             future = runtime.submit(_job())
@@ -1107,13 +1177,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[Lwd][edge] prefix probe watchdog timeout (fail-open): "
                 "req=%s", request_id,
             )
-            self._lwd_probe_done.put((request_id, nonce, build_bs, None))
+            self._lwd_probe_done.put(
+                (request_id, nonce, build_bs, None, time.monotonic())
+            )
             wakeup = self.lwd_probe_wakeup
             if wakeup is not None:
                 wakeup()
 
-        timer = threading.Timer(_LWD_PROBE_WATCHDOG_S, _watchdog)
-        timer.daemon = True  # 不拖累进程退出(残留计时器最多 15s 自灭)
+        # 看门狗必须晚于客户端自己的 probe_timeout 触发:否则又变回
+        # "边侧先放弃、云侧还在等 usage" 的倒挂。
+        timer = threading.Timer(
+            coord_cfg.probe_timeout + _LWD_PROBE_WATCHDOG_HEADROOM_S, _watchdog
+        )
+        timer.daemon = True  # 不拖累进程退出(残留计时器自灭,不等它)
 
         def _done(fut) -> None:
             timer.cancel()  # 正常完成即取消看门狗:否则 Timer(线程子类)
@@ -1125,7 +1201,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     "[Lwd][edge] prefix probe failed (fail-open)", exc_info=True
                 )
                 outcome = None
-            self._lwd_probe_done.put((request_id, nonce, build_bs, outcome))
+            self._lwd_probe_done.put(
+                (request_id, nonce, build_bs, outcome, time.monotonic())
+            )
             wakeup = self.lwd_probe_wakeup
             if wakeup is not None:
                 wakeup()
@@ -1145,7 +1223,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         completed = 0
         while True:
             try:
-                request_id, nonce, build_bs, outcome = (
+                request_id, nonce, build_bs, outcome, t_done = (
                     self._lwd_probe_done.get_nowait()
                 )
             except queue.Empty:
@@ -1155,7 +1233,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # 已 abort/已终结(条目摘除)或同 id 重发的旧提交结果:
                 # 丢弃,不影响在飞的新提交
                 continue
-            request, _, _ = entry
+            request, _, t_submit = entry
             self._lwd_probe_inflight.pop(request_id, None)
             if outcome is None:
                 # fail-open:探测失败不阻断请求,不续算。但本请求仍可能
@@ -1163,12 +1241,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 # 补建 HMAC 链供 picker 冲突预检(建不出则缺链按冲突
                 # 处理,安全方向)
                 dep_chain = self._lwd_try_build_dep_chain(request)
+                # notify 的链同样用这条 HMAC 链:云侧无预留时走
+                # wire.block_hashes 兜底登记,门条件是
+                # len(链)==prompt//云 hash 粒度(lwd_cloud_engine.py:807-810)。
+                # 传边侧原生链(边粒度)必不过门 → 云按占位 token 键登记,
+                # 这笔算完的块永不成为可命中项 → 超时越多池子越建不起来。
                 self._lwd_finalize_add_request(
-                    request, list(request.block_hashes), 0, dep_chain=dep_chain
+                    request,
+                    dep_chain or list(request.block_hashes),
+                    0,
+                    dep_chain=dep_chain,
                 )
                 completed += 1
                 continue
-            result, chain = outcome
+            result, chain, timings = outcome
             # 学习云侧 hash 粒度;与本次建链粒度不一致时按其重建链。
             # notify 在 probe 之后才发,故首请求(首次学习)即生效:非
             # 整除 prompt 的链覆盖到云 hash 粒度,采纳条件恒成立。
@@ -1225,6 +1311,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "hash_bs=%d",
                 request_id, result.hit_tokens, len(chain), learned,
             )
+            # [Lwd][perf] I1:协商链四段分解(全在同进程单调钟上,跨线程
+            # 可比)。inflight = 提交→结果入队;drain_wait = 结果入队→
+            # 主循环回灌(等下一次引擎步)。判据见验证方案 §6。
+            t_hmac0, t_hmac1, t_http1 = timings
+            t_drain = time.monotonic()
+            logger.info(
+                "[Lwd][perf][probe] req=%s hmac_ms=%.1f http_ms=%.1f "
+                "inflight_ms=%.1f drain_wait_ms=%.1f hit_tokens=%d "
+                "prompt_tokens=%d",
+                request_id,
+                (t_hmac1 - t_hmac0) * 1000.0,
+                (t_http1 - t_hmac1) * 1000.0,
+                (t_done - t_submit) * 1000.0,
+                (t_drain - t_done) * 1000.0,
+                result.hit_tokens,
+                request.num_prompt_tokens,
+            )
             # 多模态命中与文本同权:mm 链已掺图像内容身份,不同图在图像
             # 首个覆盖块即分叉必不命中;同图任意边界(含半图)复用的 KV
             # 与锚点请求逐位一致,无需位置截断。
@@ -1237,6 +1340,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_probe_results_pending(self) -> bool:
         """probe 完成队列非空(引擎 has_work 计入:WAKEUP 后须进步回灌)。"""
         return not self._lwd_probe_done.empty()
+
+    def _lwd_seq_quota(self) -> int:
+        """本边可用的云 running 名额 = 云名额 ÷ 边数(多边时均分)。
+
+        边云的 `(max_num_batched_tokens, max_num_seqs)` 被 HELLO 互校强制同值
+        (不一致直接拉不起来,见 `lwd_edge_engine._lwd_adopt_cloud_semantics`),
+        而多边共享同一台云 ⇒ 每边各放行 `max_num_seqs` 会让云侧需求 = 边数 ×
+        名额(真机 2 边 × 230 vs 云 230 ⇒ 结构性超订 2×)。云侧 preflight hold
+        (`seqs`) 是正确性兜底,但被它挡住意味着请求已在云侧排队并占着队头
+        ⇒ 把分摊前移到边侧准入。单边(registry 只一条边)时等于本地名额,
+        行为不变;按云**实时**余量动态分配仍待云侧反馈机制。"""
+        if self._lwd_n_edges is None:
+            registry = get_role_registry()
+            if registry is not None:
+                self._lwd_n_edges = len(registry.edge_ids)
+        quota = self.max_num_running_reqs
+        if (self._lwd_n_edges or 0) > 1:
+            quota = max(1, quota // self._lwd_n_edges)
+        return quota
 
     def _try_schedule_encoder_inputs(
         self,
@@ -1272,20 +1394,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         awaiting 请求已清出调度器,原生准入只数 running(边侧恒在飞批
         深度以内)永远拦不住;以 running+awaiting 对账云侧在途数,达到
-        max_num_running_reqs(边云部署对齐,即云侧名额)即满员。续传
+        本边名额(_lwd_seq_quota(),多边时为云名额÷边数)即满员。续传
         豁免不在本判断(schedule 闸门经 _lwd_has_prefill_chunk_inflight
         放行收尾);请求到达时的 announce 亦不受约束(云只登记不计算)。
 
         probe 在飞请求计入水位:它们即将成为 awaiting,突发并发下
         不计入会瞬时超订云侧在途配额。
 
-        注:云侧复用下一台云收多边的请求,边侧按云聚合水位并不准确,
-        维持本判据(本地在途对账),按云配额留待云侧反馈机制接入。"""
+        名额取 _lwd_seq_quota():多边共享同一台云时按边数均分云名额,
+        否则每边各放行 max_num_seqs 会让云侧需求 = 边数 × 名额(真机
+        2×230 vs 云 230),只能靠云侧 preflight hold 兜底,代价是请求在
+        云排队并占着队头。按云实时余量动态分配仍待云侧反馈机制接入。"""
         return (
             len(self.running)
             + len(self._lwd_awaiting)
             + len(self._lwd_probe_inflight)
-            < self.max_num_running_reqs
+            < self._lwd_seq_quota()
         )
 
     def _lwd_has_prefill_chunk_inflight(self) -> bool:
@@ -1724,10 +1848,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not coord_cfg.tenant_key_file:
             return
         try:
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
+            )
             # finish 链粒度取本请求 probe 时的建链粒度(而非全局学习值):
             # 云侧存储的 manifest 即 probe 粒度,两处一致校验才能对账。
             # 学习换挡只发生在重启后首个请求,故需按请求记账。
             probe_bs = self._lwd_probe_bs_by_req.pop(request_id, None)
+            if probe_bs is None:
+                # fail-open 请求(probe 超时/失败)没有记账值。按**已学到的云
+                # hash 粒度**建链(与 _lwd_try_build_dep_chain 同源;HELLO 已
+                # 预置,稳态恒有值),而非 None→边本地 block_size:云侧无该请求
+                # 的 prompt 链,expected 按 hash_block_size 判,按边粒度建链必
+                # length mismatch(实测 got=3/expected=6,block=768)→ 生成段
+                # 摘要不发布 + 每条一告警。
+                probe_bs = self._lwd_hash_bs_by_cloud.get(cloud_id, 0) or None
             hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config, probe_bs)
             completion_ids = gen_ids or []
             manifest = hasher.build_manifest(
@@ -1741,9 +1876,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 completion_tokens=len(completion_ids),
                 full_block_hashes=list(manifest.full_block_hashes),
                 edge_id=self._lwd_edge_id,
-            )
-            cloud_id = self._lwd_binding.cloud_of(
-                request_id, default=self._lwd_default_cloud_id()
             )
             if not self._lwd_publish_ordered(message, cloud_id):
                 logger.info(
@@ -1782,7 +1914,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not coord_cfg.tenant_key_file:
             return
         try:
-            hasher = self._lwd_prefix_hasher(coord_cfg, vllm_config)
+            cloud_id = self._lwd_binding.cloud_of(
+                request_id, default=self._lwd_default_cloud_id()
+            )
+            # 生成段链必须与 probe/收尾同粒度(云 hash 粒度):云侧采纳
+            # 条件是 gen_entry[0] == hash_block_size,按边本地 LCM 建链
+            # 则永假,生成段块永远登记不上(多轮续写零命中)。
+            hasher = self._lwd_prefix_hasher(
+                coord_cfg,
+                vllm_config,
+                self._lwd_hash_bs_by_cloud.get(cloud_id, 0) or None,
+            )
             gen_ids = self._lwd_finish_gen_ids.get(request_id) or []
             tokens = list(prompt_ids) + gen_ids
             # 廉价预判:满块数没增加直接返回(任何哈希之前)
@@ -1803,9 +1945,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 ).full_block_hashes)
             state.extend(hasher.chain_extend(state, tokens))
             blocks = list(state)
-            cloud_id = self._lwd_binding.cloud_of(
-                request_id, default=self._lwd_default_cloud_id()
-            )
             message = LwdGenChainNotify(
                 request_id=request_id,
                 block_hashes=blocks,
