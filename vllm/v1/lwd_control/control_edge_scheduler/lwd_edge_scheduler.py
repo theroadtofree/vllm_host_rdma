@@ -256,8 +256,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_probe_done: queue.Queue = queue.Queue()
         # [Lwd][perf] I2:水位节流空排计数(只在主循环线程读写)
         self._lwd_perf_empty_steps = 0
-        # 准入门跳过 probe 的计数(短于一个 hash 块的请求)
-        self._lwd_perf_probe_skips = 0
         # 云名额摊薄分母:注册表是静态表,取到即缓存(None=尚未装配,下步重试)
         self._lwd_n_edges: int | None = None
         # 引擎注入的唤醒钩(probe 完成时敲 input_queue WAKEUP;未注入=单测)
@@ -917,9 +915,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         预告先于本地登记:云侧视图领先本地工作,云只能准备不能提前
         计算(没有 chunk 预告就不会开算)。abort_immediately 请求走
         finish + abort 出口,与原生语义一致。
-
-        准入门:prompt 短于一个云 hash 块的请求链必为空、hit 恒 0,直接走
-        与"协调未启用"同一条同步直通,不付 probe RTT、不占在飞名额。
         """
         self._lwd_validate_request(request)
         # 收尾记账备料:prompt ids 留档(终结时 Request 已不在调度器)
@@ -936,31 +931,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # 的孤儿预留:直接本地终结(与 finalize 后再 abort 同终态)
             self._lwd_abort_immediate(request)
             return
-        # 准入门:prompt 不足一个 hash 块时链必为空、hit 恒 0(结构性,与内容
-        # 无关),probe 纯属白付一次跨节点往返(满负荷实测 p50≈0.4s)并占一个
-        # 在飞名额。粒度用**与 _lwd_probe_submit_async 建链同一表达式**,保证
-        # 判定域=建链域;学习未就位时退到本地块粒度,结果偏保守(仍照 probe)。
-        # 跳过的请求走与"协调未启用"完全相同的同步直通路径(零新语义)。
-        coord_pair = self._lwd_probe_coord_cfg()
-        if coord_pair is not None:
-            probe_bs = (
-                self._lwd_hash_bs_by_cloud.get(self._lwd_default_cloud_id())
-                or coord_pair[1].cache_config.block_size
-            )
-            if request.num_prompt_tokens < probe_bs:
-                self._lwd_perf_probe_skips += 1
-                n_skip = self._lwd_perf_probe_skips
-                if n_skip <= 20 or n_skip % 200 == 0:
-                    logger.info(
-                        "[Lwd][perf][gate] skip_probe req=%s prompt=%d "
-                        "hash_bs=%d skips=%d",
-                        request.request_id, request.num_prompt_tokens,
-                        probe_bs, n_skip,
-                    )
-                self._lwd_finalize_add_request(
-                    request, list(request.block_hashes), 0
-                )
-                return
         if self._lwd_probe_submit_async(request):
             return
         # 协调未启用:不续算,链取 request 自身原生块哈希(与旧行为一致)
