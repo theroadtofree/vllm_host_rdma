@@ -1192,7 +1192,22 @@ class EngineCoreProc(EngineCore):
             if data_parallel and vllm_config.model_config.is_moe:
                 # Set data parallel rank for this engine process.
                 parallel_config.data_parallel_rank = dp_rank
-                engine_core = DPEngineCoreProc(*args, **kwargs)
+                # Lwd prefill-only cloud engines must stay DP-aware (wave
+                # coordination); the resolver returns a DPEngineCoreProc
+                # subclass for the cloud role, None for non-LWD configs.
+                from vllm.v1.lwd_control import lwd_resolve_engine_cls
+
+                engine_cls = lwd_resolve_engine_cls(vllm_config)
+                if engine_cls is not None and not issubclass(
+                    engine_cls, DPEngineCoreProc
+                ):
+                    logger.warning(
+                        "Lwd engine class %s is not DP-capable; falling back "
+                        "to DPEngineCoreProc for MoE data_parallel.",
+                        engine_cls.__name__,
+                    )
+                    engine_cls = None
+                engine_core = (engine_cls or DPEngineCoreProc)(*args, **kwargs)
             else:
                 # Non-MoE DP ranks are completely independent, so treat like DP=1.
                 # Note that parallel_config.data_parallel_index will still reflect
@@ -1762,6 +1777,9 @@ class DPEngineCoreProc(EngineCoreProc):
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        *,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
     ):
         assert vllm_config.model_config.is_moe, (
             "DPEngineCoreProc should only be used for MoE models"
@@ -1796,6 +1814,8 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
+            cloud_control_command_queue=cloud_control_command_queue,
+            cloud_control_event_queue=cloud_control_event_queue,
         )
 
     def _init_data_parallel(self, vllm_config: VllmConfig):

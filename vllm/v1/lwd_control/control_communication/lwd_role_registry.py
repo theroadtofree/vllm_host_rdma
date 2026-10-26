@@ -20,6 +20,18 @@ registry YAML 示例(2 边 2 云,全场共享同一份)::
     clouds:
       - { id: 0, addr: 10.1.0.1, ranks: [4, 5, 6, 7], zmq_port: 5700 }
       - { id: 1, addr: 10.1.0.2, ranks: [8, 9, 10, 11], zmq_port: 5700 }
+
+云内 DP(GLM MoE)示例(1 云 dp=2,每引擎 TP=2,共 4 卡)::
+
+    clouds:
+      - id: 0
+        addr: 10.1.0.1
+        ranks: [4, 5, 6, 7]        # engine0=[4,5], engine1=[6,7]
+        zmq_port: 5700
+        tp_size: 2
+        dp_size: 2
+        engine_ports: [5710, 5711] # 每引擎 PRE_OUT
+        coord_port: 5720           # DPCoordinator front 发布口
 """
 
 from __future__ import annotations
@@ -47,6 +59,24 @@ class LwdPeerInfo:
     addr: str
     ranks: list[int]
     zmq_port: int = 0
+    # ---- 云内 DP(GLM MoE 云侧 data_parallel)----
+    # 仅云条目有意义;边条目忽略。云 c 的 ranks 约定为连续段布局:
+    # engine i 占 ranks[i*tp_size : (i+1)*tp_size],len(ranks) ==
+    # tp_size * dp_size。dp_size=1 时全部退化为现状(单引擎)。
+    tp_size: int = 0
+    """每引擎 TP 卡数;0 = 未声明,取 len(ranks)//dp_size 推出。"""
+    dp_size: int = 1
+    """云内 DP 引擎数(= 该云进程的 --data-parallel-size)。"""
+    engine_ports: list[int] = None  # type: ignore[assignment]
+    """每引擎 PRE_OUT 端口(边→该引擎的定向控制通道),长度 ==
+    dp_size;dp_size=1 时可为空(沿用 zmq_port 的 ROUTER 通道)。"""
+    coord_port: int = 0
+    """该云 DPCoordinator 的 front 发布端口(边侧 FIRST_REQ 唤醒 /
+    stats 对账用);dp_size>1 时必填,dp_size=1 无 coordinator 留 0。"""
+
+    def __post_init__(self) -> None:
+        if self.engine_ports is None:
+            object.__setattr__(self, "engine_ports", [])
 
 
 class LwdRoleRegistry:
@@ -156,6 +186,82 @@ class LwdRoleRegistry:
         return [(e, c) for e in self.edge_ids for c in self.cloud_ids]
 
     # ------------------------------------------------------------------ #
+    # 云内 DP(engine 维,pair 的第三维)                                  #
+    # ------------------------------------------------------------------ #
+    def cloud_tp_size(self, cloud_id: int) -> int:
+        """云 c 的每引擎 TP 卡数 C;未声明 tp_size 时按 ranks/dp 推出。"""
+        cloud = self._clouds[cloud_id]
+        if cloud.tp_size > 0:
+            return cloud.tp_size
+        return len(cloud.ranks) // cloud.dp_size
+
+    def cloud_dp_size(self, cloud_id: int) -> int:
+        return self._clouds[cloud_id].dp_size
+
+    def engine_ids(self, cloud_id: int) -> list[int]:
+        return list(range(self._clouds[cloud_id].dp_size))
+
+    def cloud_engine_ranks(self, cloud_id: int, engine_idx: int) -> list[int]:
+        """云 c 引擎 i 的全局 rank 段:ranks[i*C : (i+1)*C]。"""
+        cloud = self._clouds[cloud_id]
+        if not 0 <= engine_idx < cloud.dp_size:
+            raise ValueError(
+                f"[lwd] engine_idx={engine_idx} out of range for cloud "
+                f"{cloud_id} (dp_size={cloud.dp_size})"
+            )
+        c = self.cloud_tp_size(cloud_id)
+        return list(cloud.ranks[engine_idx * c:(engine_idx + 1) * c])
+
+    def engine_endpoint_rank(self, edge_id: int, cloud_id: int,
+                             engine_idx: int) -> int:
+        """(edge, cloud, engine) 通信域的云端点 rank:随 edge_id 在该
+        引擎的 C 个 rank 内轮转(端点必须属于目标引擎的 TP 组,否则
+        UP 端点不在组内)。单引擎单卡退化与 cloud_endpoint_rank 一致。"""
+        ranks = self.cloud_engine_ranks(cloud_id, engine_idx)
+        return ranks[edge_id % len(ranks)]
+
+    def engine_index_of_rank(self, cloud_id: int, global_rank: int) -> int:
+        """云 c 内某全局 rank 所属的引擎下标;不在该云则 fail-fast。"""
+        ranks = self._clouds[cloud_id].ranks
+        if global_rank not in ranks:
+            raise ValueError(
+                f"[lwd] rank {global_rank} not in cloud {cloud_id} "
+                f"ranks={ranks}"
+            )
+        return ranks.index(global_rank) // self.cloud_tp_size(cloud_id)
+
+    def triples(self) -> list[tuple[int, int, int]]:
+        """全部 (edge_id, cloud_id, engine_idx) 通信域,字典序。"""
+        return [
+            (e, c, i) for e in self.edge_ids for c in self.cloud_ids
+            for i in self.engine_ids(c)
+        ]
+
+    def coord_endpoint(self, cloud_id: int) -> str | None:
+        """云 c 的 DPCoordinator front 发布端点(边侧 FIRST_REQ/stats);
+        dp_size==1 无 coordinator 进程,恒返回 None(即使误配
+        coord_port——dp=1 下该端口无人 bind,建客户端只会误导排障)。"""
+        cloud = self._clouds[cloud_id]
+        if cloud.dp_size <= 1 or cloud.coord_port <= 0:
+            return None
+        return f"tcp://{cloud.addr}:{cloud.coord_port}"
+
+    def engine_endpoint(self, cloud_id: int, engine_idx: int) -> str:
+        """云 c 引擎 i 的 PRE_OUT 端点(边侧定向发布):engine_ports
+        声明时按表;未声明(dp_size==1 旧式部署)回落 ROUTER 通道端点。"""
+        cloud = self._clouds[cloud_id]
+        if cloud.engine_ports:
+            return f"tcp://{cloud.addr}:{cloud.engine_ports[engine_idx]}"
+        return self.endpoint(cloud_id)
+
+    def engine_bind_endpoint(self, cloud_id: int, engine_idx: int) -> str:
+        """云 c 引擎 i 的 PRE_OUT bind 端点(* 形式)。"""
+        cloud = self._clouds[cloud_id]
+        if cloud.engine_ports:
+            return f"tcp://*:{cloud.engine_ports[engine_idx]}"
+        return self.bind_endpoint(cloud_id)
+
+    # ------------------------------------------------------------------ #
     # 控制面端点(唯一事实源)                                             #
     # ------------------------------------------------------------------ #
     def endpoint(self, cloud_id: int) -> str:
@@ -187,6 +293,10 @@ class LwdRoleRegistry:
                 ranks=[int(r) for r in c.get("ranks", [])],
                 # ROUTER-ROUTER:每云单端口;兼容旧 zmq_base_port 字段名
                 zmq_port=int(c.get("zmq_port", c.get("zmq_base_port", 0))),
+                tp_size=int(c.get("tp_size", 0)),
+                dp_size=int(c.get("dp_size", 1)),
+                engine_ports=[int(p) for p in c.get("engine_ports", [])],
+                coord_port=int(c.get("coord_port", 0)),
             )
             for c in raw.get("clouds", [])
         }
@@ -211,6 +321,66 @@ class LwdRoleRegistry:
                     f"[lwd] cloud {cloud_id} requires a positive zmq_port "
                     f"in the role registry (ROUTER bind)"
                 )
+            # 云内 DP 拓扑校验:ranks 必须恰好切成 dp_size 段;dp>1 时
+            # 每引擎 PRE_OUT 端口与 coordinator 端口必须显式声明。
+            if cloud.dp_size < 1:
+                raise ValueError(
+                    f"[lwd] cloud {cloud_id} dp_size must be >= 1, got "
+                    f"{cloud.dp_size}"
+                )
+            c_size = cloud.tp_size or (len(cloud.ranks) // cloud.dp_size)
+            if c_size <= 0 or c_size * cloud.dp_size != len(cloud.ranks):
+                raise ValueError(
+                    f"[lwd] cloud {cloud_id} ranks({len(cloud.ranks)}) cannot "
+                    f"be evenly split into dp_size={cloud.dp_size} engines "
+                    f"of tp_size={c_size}; ranks must be the contiguous "
+                    f"[engine0 | engine1 | ...] layout"
+                )
+            if cloud.dp_size > 1:
+                if len(cloud.engine_ports) != cloud.dp_size:
+                    raise ValueError(
+                        f"[lwd] cloud {cloud_id} dp_size={cloud.dp_size} "
+                        f"requires engine_ports with exactly dp_size entries, "
+                        f"got {cloud.engine_ports}"
+                    )
+                if cloud.coord_port <= 0:
+                    raise ValueError(
+                        f"[lwd] cloud {cloud_id} dp_size={cloud.dp_size} "
+                        f"requires a positive coord_port (DPCoordinator "
+                        f"front publish, for edge FIRST_REQ/stats)"
+                    )
+        # 全场 ranks 重叠检查(跨实例撞 rank 要到 HCCL 建组才爆,
+        # 提前到装载期 fail-fast)
+        seen_ranks: dict[int, str] = {}
+        for role, peers in (("edge", edges), ("cloud", clouds)):
+            for peer_id, peer in peers.items():
+                for r in peer.ranks:
+                    if r in seen_ranks:
+                        raise ValueError(
+                            f"[lwd] registry rank {r} claimed by both "
+                            f"{seen_ranks[r]} and {role}.{peer_id}"
+                        )
+                    seen_ranks[r] = f"{role}.{peer_id}"
+        # 同机端口冲突检查:同 addr 的云的 zmq_port/engine_ports/
+        # coord_port 不得互撞(撞了要运行期 zmq bind 才报错)
+        port_owner: dict[tuple[str, int], str] = {}
+        for cloud_id, cloud in clouds.items():
+            ports = [("zmq_port", cloud.zmq_port)]
+            ports += [
+                (f"engine_ports[{i}]", p)
+                for i, p in enumerate(cloud.engine_ports)
+            ]
+            if cloud.coord_port > 0:
+                ports.append(("coord_port", cloud.coord_port))
+            for name, port in ports:
+                key = (cloud.addr, port)
+                if key in port_owner:
+                    raise ValueError(
+                        f"[lwd] registry port conflict on {cloud.addr}:"
+                        f"{port}: cloud {cloud_id} {name} vs "
+                        f"{port_owner[key]}"
+                    )
+                port_owner[key] = f"cloud {cloud_id} {name}"
         digest = hashlib.sha256(
             json.dumps(raw, sort_keys=True, default=str).encode()
         ).hexdigest()[:16]

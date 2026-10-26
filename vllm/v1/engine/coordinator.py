@@ -93,6 +93,26 @@ class DPCoordinator:
             local_only_eng = False
 
         front_publish_address = get_engine_client_zmq_addr(local_only, host=host)
+        if parallel_config.lwd_config.enable_lwd:
+            # LWD 边云:stats 订阅方在边侧(跨机),front 发布口强制 TCP
+            # 并绑全网卡。registry 模式必须用声明的 coord_port 固定端口
+            # (边侧 coord client 从静态 registry 读地址;随机端口谁也连
+            # 不上,FIRST_REQ 唤醒链断裂 → wave 锁步挂死);legacy 模式
+            # 随机端口,真值由 HELLO 的 coord_stats_addr 通告。
+            from vllm.utils.network_utils import get_tcp_uri
+
+            lwd_cfg = parallel_config.lwd_config
+            _coord_port = 0
+            if lwd_cfg.role_registry:
+                import yaml as _yaml
+
+                with open(lwd_cfg.role_registry, encoding="utf-8") as _f:
+                    _reg = _yaml.safe_load(_f) or {}
+                for _c in _reg.get("clouds", []):
+                    if int(_c["id"]) == lwd_cfg.cloud_id:
+                        _coord_port = int(_c.get("coord_port", 0))
+                        break
+            front_publish_address = get_tcp_uri("0.0.0.0", _coord_port)
         back_publish_address = get_engine_client_zmq_addr(local_only_eng, host=host)
         back_output_address = get_engine_client_zmq_addr(local_only_eng, host=host)
 
@@ -355,6 +375,15 @@ class DPCoordinatorProc:
 
                             engines_running = True
                             wave_state_changed = True
+                            # 唤醒链排障锚点(LWD 边侧 FIRST_REQ 上行在此
+                            # 落地):边侧有 FIRST_REQ 发送日志而此处无 =
+                            # 地址/端口错配;有此处日志而引擎不动 = 引擎
+                            # 侧 START_DP_WAVE 处理问题
+                            logger.info(
+                                "[DP] FIRST_REQ received: start wave %d "
+                                "(exclude=%s)",
+                                current_wave, engine_to_exclude,
+                            )
                             self._send_start_wave(
                                 publish_back, current_wave, engine_to_exclude
                             )

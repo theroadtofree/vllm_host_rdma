@@ -149,6 +149,15 @@ class CoreEngineProcManager:
             cloud_control_command_queue, cloud_control_event_queue = (
                 start_lwd_cloud_control_server(vllm_config)
             )
+        # 云内 DP 每引擎命令队列:helper 返回 list(dp>1 时长度=dp_size,
+        # 按全局 dp_rank 分发);显式注入兼容单队列与列表两种形态。
+        command_queues: list[Any] | None
+        if cloud_control_command_queue is None:
+            command_queues = None
+        elif isinstance(cloud_control_command_queue, (list, tuple)):
+            command_queues = list(cloud_control_command_queue)
+        else:
+            command_queues = [cloud_control_command_queue]
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -156,7 +165,9 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
-            "cloud_control_command_queue": cloud_control_command_queue,
+            "cloud_control_command_queue": (
+                command_queues[0] if command_queues else None
+            ),
             "cloud_control_event_queue": cloud_control_event_queue,
         }
 
@@ -175,12 +186,32 @@ class CoreEngineProcManager:
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            # 云内 DP 每引擎命令队列:队列数==dp_size 时按全局 dp_rank 取本
+            # 引擎队列(probe 扇出按引擎寻址);单队列(dp=1/未分桶)全部引擎
+            # 共享,行为与旧版逐值不变。
+            per_engine_kwargs: dict[str, Any] = {
+                "dp_rank": global_index,
+                "local_dp_rank": local_index,
+            }
+            if command_queues is not None and len(command_queues) > 1:
+                if global_index >= len(command_queues):
+                    # 跨机云 DP:命令队列只在云前端进程按本机 dp_size 建,
+                    # 远端引擎的全局 dp_rank 越界——LWD 云内 DP 当前只
+                    # 支持单机多引擎,显式拒绝而非 IndexError
+                    raise RuntimeError(
+                        f"[Lwd] cloud control command queues "
+                        f"({len(command_queues)}) do not cover global dp_rank "
+                        f"{global_index}: multi-node cloud DP is not "
+                        f"supported (single-node engines only)"
+                    )
+                per_engine_kwargs["cloud_control_command_queue"] = (
+                    command_queues[global_index]
+                )
             self.processes.append(
                 context.Process(
                     target=EngineCoreProc.run_engine_core,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
-                    kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    kwargs=common_kwargs | per_engine_kwargs,
                 )
             )
 
@@ -305,6 +336,15 @@ def set_device_control_env_var(
     world_size = vllm_config.parallel_config.world_size
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
+
+    # LWD edge-cloud: world_size spans the shared edge plus ALL cloud
+    # engines (E + Σ C×dp), so the native per-DP device slicing
+    # (dp_rank * world_size) overshoots the physical card count. Each
+    # cloud engine owns exactly local_world_size cards (registry 模式
+    # local_world_size 已是每引擎卡数);slice by
+    # dp_rank * local_world_size instead.
+    if vllm_config.parallel_config.lwd_config.enable_lwd:
+        world_size = local_world_size
 
     value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
     with patch.dict(os.environ, values=((evar, value),)):

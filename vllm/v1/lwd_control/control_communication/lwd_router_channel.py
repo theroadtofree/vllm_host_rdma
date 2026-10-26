@@ -84,26 +84,52 @@ _CLOUD_PREFIX = "cloud"
 _UNROUTABLE_ERRNOS = {110, errno.EHOSTUNREACH}
 
 
-def _instance_identity(prefix: str, instance_id: int) -> bytes:
+def _instance_identity(prefix: str, instance_id: int, engine: int = 0) -> bytes:
     """对端线上 identity:带前缀 ``edge{e}``/``cloud{c}``;前缀为空时
-    退化为原 pp 类的纯十进制 ``str(instance_id)``。"""
+    退化为原 pp 类的纯十进制 ``str(instance_id)``。
+
+    云内 DP:云引擎 identity 为 ``cloud{c}e{i}``(engine=0 时不带后缀,
+    与单引擎线上格式逐值一致)——同一边 socket 上同云两引擎必须用不同
+    identity,否则 libzmq 重复 identity 静默饿死后连者。"""
+    if prefix == _CLOUD_PREFIX and engine > 0:
+        return f"{prefix}{instance_id}e{engine}".encode()
     return f"{prefix}{instance_id}".encode()
 
 
-def _parse_identity(identity: bytes) -> tuple[str, int] | None:
-    """解析信封 identity -> (前缀, id);不认识的格式返回 None。
+def _parse_identity_ex(identity: bytes) -> tuple[str, int, int] | None:
+    """解析信封 identity -> (前缀, id, engine);不认识的格式返回 None。
 
-    兼容两套方案:``edge{n}``/``cloud{n}`` 前缀与纯十进制(前缀 "")。"""
+    兼容两套方案:``edge{n}``/``cloud{c}`` 前缀与纯十进制(前缀 "");
+    云内 DP 的云引擎后缀 ``cloud{c}e{i}``(engine 缺省 0)。"""
     try:
         text = identity.decode()
     except UnicodeDecodeError:
         return None
     for prefix in (_EDGE_PREFIX, _CLOUD_PREFIX):
-        if text.startswith(prefix) and text[len(prefix):].isdigit():
-            return prefix, int(text[len(prefix):])
+        if text.startswith(prefix):
+            rest = text[len(prefix):]
+            engine = 0
+            if prefix == _CLOUD_PREFIX and "e" in rest:
+                head, _, tail = rest.partition("e")
+                if head.isdigit() and tail.isdigit():
+                    return prefix, int(head), int(tail)
+            if rest.isdigit():
+                return prefix, int(rest), engine
     if text.isdigit():
-        return "", int(text)
+        return "", int(text), 0
     return None
+
+
+def _parse_identity(identity: bytes) -> tuple[str, int] | None:
+    """解析信封 identity -> (前缀, id);不认识的格式返回 None。
+
+    兼容两套方案:``edge{n}``/``cloud{n}`` 前缀与纯十进制(前缀 "")。
+    云内 DP 的 ``cloud{c}e{i}`` 后缀在此剥除(engine 维由载荷的
+    engine_index 字段承载,信封归账到云 id)。"""
+    parsed = _parse_identity_ex(identity)
+    if parsed is None:
+        return None
+    return parsed[0], parsed[1]
 
 
 def _peer_prefix_of(self_prefix: str) -> str:
@@ -255,18 +281,19 @@ class LwdControlRouterChannel:
             "[Lwd][router-channel] %s connected -> %s", self._name, endpoint
         )
 
-    def announce(self, instance_id: int) -> None:
+    def announce(self, instance_id: int, engine: int = 0) -> None:
         """connect 侧(ROUTER 形态)向对端发起 HELLO(定向首帧,幂等;
         start 前调用)。
 
         TCP 未建连时 HELLO 发送失败(EHOSTUNREACH),由 IO 线程每 tick
-        重试到成功;成功后挂 WELCOME 看门狗。"""
+        重试到成功;成功后挂 WELCOME 看门狗。engine: 云内 DP 的引擎
+        下标(仅云对端有意义,缺省 0 与单引擎逐值一致)。"""
         if self._started or not self._is_router:
             raise RuntimeError(
                 "[lwd] router channel announce() is only allowed before "
                 "start() on the ROUTER connect form"
             )
-        identity = _instance_identity(self._peer_prefix, instance_id)
+        identity = _instance_identity(self._peer_prefix, instance_id, engine)
         self._hello_pending.add(identity)
         self._welcome_deadlines.pop(identity, None)
 
@@ -282,17 +309,17 @@ class LwdControlRouterChannel:
         )
         self._thread.start()
 
-    def publish(self, notify: Any, instance_id: int = 0) -> bool:
+    def publish(self, notify: Any, instance_id: int = 0, engine: int = 0) -> bool:
         """把消息放入待发队列(DEALER 形态单对端,忽略 instance_id)。
 
-        ROUTER 形态按 instance_id 寻址 per-identity FIFO;FIFO 未满返回
-        True,达 ``PER_INSTANCE_PENDING_LIMIT``(或发送桥满)返回 False,
-        由调用方退避重试——控制面消息不可丢,通道内不丢弃。
+        ROUTER 形态按 (instance_id, engine) 寻址 per-identity FIFO;FIFO
+        未满返回 True,达 ``PER_INSTANCE_PENDING_LIMIT``(或发送桥满)
+        返回 False,由调用方退避重试——控制面消息不可丢,通道内不丢弃。
         """
         if not self._running:
             return False
         if self._is_router:
-            identity = _instance_identity(self._peer_prefix, instance_id)
+            identity = _instance_identity(self._peer_prefix, instance_id, engine)
             pending = self._identity_pending.get(identity)
             if (
                 pending is not None
@@ -309,7 +336,7 @@ class LwdControlRouterChannel:
         try:
             seq = self._seq
             self._seq += 1
-            self._send_queue.put_nowait((instance_id, seq, notify))
+            self._send_queue.put_nowait(((instance_id, engine), seq, notify))
         except queue.Full:
             logger.warning(
                 "[Lwd][router-channel] %s send bridge queue full; publish "
@@ -516,7 +543,7 @@ class LwdControlRouterChannel:
                 # must drain before the next message is serialized.
                 break
             try:
-                instance_id, seq, notify = self._send_queue.get_nowait()
+                (instance_id, engine), seq, notify = self._send_queue.get_nowait()
             except queue.Empty:
                 break
             try:
@@ -528,7 +555,9 @@ class LwdControlRouterChannel:
                 )
                 continue
             if self._is_router:
-                identity = _instance_identity(self._peer_prefix, instance_id)
+                identity = _instance_identity(
+                    self._peer_prefix, instance_id, engine
+                )
                 pending = self._identity_pending.setdefault(identity, deque())
                 pending.append((seq.to_bytes(_SEQ_BYTES, "big"), data))
             else:

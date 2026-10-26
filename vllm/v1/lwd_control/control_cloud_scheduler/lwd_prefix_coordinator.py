@@ -198,6 +198,27 @@ class LwdPrefixCoordinator:
             )
         return [d for d in manifest.full_block_hashes for _ in range(ratio)]
 
+    def peek(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
+        """只读求命中(不种预留、不 touch 块池):云内 DP 扇出 probe 的
+        逐引擎命中采集用。
+
+        每引擎 KV 池/前缀缓存独立,命中值只能由本引擎自报;选定赢家后由
+        Bridge 再向赢家发正式 probe(reserve)落预留——跨引擎预留是虚假
+        命中,预留必须与后续数据面同引擎。_pool_hit 本身即只读
+        (get_cached_block 不改 ref_cnt),此处跳过 touch/预留/链台账。"""
+        chain = self._coordination_block_hashes(manifest)
+        _, _, hit_blocks, hit_tokens = self._pool_hit(
+            chain, max_cache_hit_length=manifest.prompt_tokens - 1
+        )
+        return LwdProbeResult(
+            request_id=manifest.request_id,
+            instance_id=self._instance_id,
+            block_size=self._hash_block_size,
+            hit_blocks=hit_blocks,
+            hit_tokens=hit_tokens,
+            alignment_tokens=self._resolve_alignment_tokens(),
+        )
+
     def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         """对原生块池求最长命中(单真源)并落预留(等待数据面请求认领)。
 

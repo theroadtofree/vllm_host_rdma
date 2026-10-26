@@ -43,18 +43,22 @@ class LwdEmbedBatch:
     # 单边一云缺省 0,行为与原实现一致。
     edge_id: int = 0
     cloud_id: int = 0
+    # 目标云引擎(= 云内 dp_rank):云内多 DP 下数据面按 (edge, cloud,
+    # engine) 选 UP 通道;单引擎恒 0。
+    engine_index: int = 0
     # 多模态(逐请求,与 req_ids 对齐;pdmix 混批可含文本+图像混合,
     # 批级标记不够,必须逐请求):
     # - prompt_offsets[i]:请求 i 本 chunk 在 prompt 中的起点(边侧
     #   mm 行切片窗口;与调度 offset 同源);
     # - has_mrope[i]:请求 i 是否携带 mrope 行(边侧准入时只对 MM
     #   请求算过 positions);
-    # - mrope_positions[i]:请求 i 本 chunk 的 mrope positions 原始
-    #   字节([3,n] int64,云调度器从 RangeNotify item 透传;无
-    #   mrope 为空 bytes)。仅云侧填充/消费:runner frombuffer 直写
-    #   req_state;边侧不再填充(positions 随控制面 notify 上行,
-    #   数据面 aux 帧退役)。bytes 是 msgspec 原生类型,随 SO 序列
-    #   化到云各 worker 无额外开销。
+    # - mrope_positions[i]:wire_version>=2 起为请求 i 本 chunk 的
+    #   positions 原始字节([3,n] int64,控制面 RangeItem 透传,云侧
+    #   runner frombuffer 直写 req_state);无 mrope 为空 bytes。仅云侧
+    #   填充/消费:边侧不再填充(positions 随控制面 notify 上行,数据面
+    #   aux 帧退役)。bytes 是 msgspec 原生类型,随 SO 序列化到云各
+    #   worker 无额外开销。(wire v1 时代曾携带 [[t,h,w],...] 行供
+    #   aux 帧组帧,已退役。)
     prompt_offsets: list[int] = field(default_factory=list)
     has_mrope: list[bool] = field(default_factory=list)
     mrope_positions: list[bytes] = field(default_factory=list)
@@ -75,6 +79,9 @@ class LwdUnembedBatch:
     top_id_ths: list[list[int]] = field(default_factory=list)  # per request: received Nth most probable token index (position in descending logits)
     # 边侧 DOWN recv 选路维度(该批来自哪朵云);单云缺省 0。
     cloud_id: int = 0
+    # 来源云引擎(= 云内 dp_rank):云内多 DP 下数据面按 (edge, cloud,
+    # engine) 选 DOWN 通道挂 recv;单引擎恒 0。
+    engine_index: int = 0
     token_ids: list[list[int]] = field(default_factory=list)  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
 
 

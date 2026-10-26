@@ -487,6 +487,7 @@ class EngineArgs:
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
     edge_npu_count: int = 0
     cloud_npu_count: int = 0
+    cloud_dp_size: int = 1
     role_registry: str = ""
     edge_id: int = 0
     cloud_id: int = 0
@@ -1091,6 +1092,13 @@ class EngineArgs:
         parallel_group.add_argument(
             "--cloud-npu-count", type=int, default=0,
             help="Total number of cloud NPUs across all DP instances (LWD mode).",
+        )
+        parallel_group.add_argument(
+            "--cloud-dp-size", type=int, default=1,
+            help="Number of cloud data-parallel engines (LWD legacy mode). "
+            "Must match --data-parallel-size on the cloud side; on the "
+            "edge it is the only source of the cloud topology. "
+            "Registry deployments declare dp_size per cloud instead.",
         )
         parallel_group.add_argument(
             "--role-registry", type=str, default="",
@@ -1980,8 +1988,19 @@ class EngineArgs:
                     "data_parallel_backend can only be ray or mp, got %s",
                     self.data_parallel_backend,
                 )
+                # LWD 边云:master_addr 是边侧地址(共享世界 rendezvous
+                # 用),不能回退为云侧 DP master——否则 engine 级 DP 组把
+                # store 建到边侧 IP,云 engine 间 gloo store 永连不通。
+                _lwd_enabled = bool(
+                    ((self.additional_config or {}).get("lwd_config") or {})
+                    .get("enabled"))
                 data_parallel_address = (
-                    self.master_addr or ParallelConfig.data_parallel_master_ip
+                    ParallelConfig.data_parallel_master_ip
+                    if _lwd_enabled
+                    else (
+                        self.master_addr
+                        or ParallelConfig.data_parallel_master_ip
+                    )
                 )
         else:
             data_parallel_address = self.data_parallel_address
@@ -2024,6 +2043,7 @@ class EngineArgs:
             lwd_config=LwdParallelConfig(
                 edge_npu_count=self.edge_npu_count,
                 cloud_npu_count=self.cloud_npu_count,
+                cloud_dp_size=self.cloud_dp_size,
                 role_registry=self.role_registry,
                 edge_id=self.edge_id,
                 cloud_id=self.cloud_id,
