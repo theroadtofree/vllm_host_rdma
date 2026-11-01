@@ -77,6 +77,10 @@ class ReasoningConfig:
             return  # Already initialized
 
         tokenizer = cached_tokenizer_from_config(model_config=model_config)
+        if tokenizer is None:
+            # The LWD cloud consumes edge-produced embeddings and deliberately
+            # starts without a tokenizer.
+            return
         reasoning_start_str = self.reasoning_start_str
         reasoning_end_str = self.reasoning_end_str
         natural_reasoning_end_str = ""

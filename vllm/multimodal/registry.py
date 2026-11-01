@@ -116,6 +116,8 @@ class MultiModalRegistry:
             return False
 
         mm_config = model_config.get_multimodal_config()
+        if mm_config.mm_encoder_remote:
+            return False
         try:
             info = self._create_processing_info(model_config, tokenizer=None)
         except ValueError:

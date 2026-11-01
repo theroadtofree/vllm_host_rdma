@@ -112,6 +112,24 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     """Generation to abort; zero is the legacy form."""
 
 
+class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Full prompt+generated hash chain; replaces prior chains."""
+
+    request_id: str
+    block_hashes: list[bytes] = []
+    block_size: int = 0
+
+
+class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Edge -> cloud. Final full chain, usage counters and publish decision."""
+
+    request_id: str
+    prompt_tokens: int
+    completion_tokens: int
+    full_block_hashes: list[bytes] = []
+    publish_cache: bool = True
+
+
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
     """Cloud -> edge. Scheduling limits both sides must agree on.
 
@@ -132,6 +150,7 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_tokens: int = 0
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
+    prefix_hash_block_size: int = 0
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -177,7 +196,13 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     """Generation of each request row, aligned with req_ids."""
 
 
-LwdEdgeToCloudMessage: TypeAlias = LwdRequestNotify | LwdRangeNotify | LwdAbortNotify
+LwdEdgeToCloudMessage: TypeAlias = (
+    LwdRequestNotify
+    | LwdRangeNotify
+    | LwdAbortNotify
+    | LwdGenChainNotify
+    | LwdFinishNotify
+)
 LwdCloudToEdgeMessage: TypeAlias = (
     LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
 )

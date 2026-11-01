@@ -21,6 +21,7 @@ import time
 from collections import deque
 from typing import Any
 
+from vllm.config.lwd import LwdConnectionId
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
@@ -31,6 +32,10 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_executor_proxy import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_prefix_control import (
     LwdEdgePrefixControl,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
+    LwdEdgeProbeManager,
+    LwdProbeCompletion,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
@@ -46,6 +51,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
+    LwdFinishNotify,
+    LwdGenChainNotify,
     LwdMessage,
     LwdPrefixReadyNotify,
     LwdRefillNotify,
@@ -79,16 +86,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         self._lwd_prefix_control = (
             LwdEdgePrefixControl(self, LWD_PREFIX_READY_TIMEOUT_S)
-            if self._lwd_prefix_enabled
+            if self._lwd_prefix_enabled and self.lwd_config.coordination is None
             else None
         )
-        self._lwd_cloud_params: dict[int, LwdCloudParamsNotify] = {}
+        self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
+        self._lwd_probe_manager = LwdEdgeProbeManager(
+            self.vllm_config,
+            lambda: self.input_queue.put_nowait(
+                (EngineCoreRequestType.WAKEUP, None)
+            ),
+        )
+        self._lwd_probe_chains: dict[str, list[bytes]] = {}
+        self._lwd_probe_block_sizes: dict[str, int] = {}
+        self._lwd_gen_chain_sent: dict[str, int] = {}
+        self.scheduler.lwd_on_finish = self._lwd_finish_request
+        self.scheduler.lwd_on_tokens = self._lwd_announce_gen_chain
+        self.scheduler.lwd_has_pending = lambda: self._lwd_probe_manager.pending
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
-        self._lwd_clouds: dict[int, LwdPeer] = plane.wait_until_ready(
+        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
             handshake_timeout_s
         )
         expected = len(self._lwd_clouds)
@@ -107,11 +126,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         for dp_idx, params in self._lwd_cloud_params.items():
             self._lwd_check_cloud_params(dp_idx, params)
         self._lwd_configure_prefix_cache()
-        self._lwd_coord_clients: dict[int, LwdCoordClient] = {
-            dp_idx: LwdCoordClient(dp_idx, params.dp_coordinator_addr)
+        self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {
+            dp_idx: LwdCoordClient(dp_idx.dp_idx, params.dp_coordinator_addr)
             for dp_idx, params in self._lwd_cloud_params.items()
             if params.dp_coordinator_addr
         }
+        for dp_idx, params in self._lwd_cloud_params.items():
+            if params.prefix_hash_block_size > 0:
+                self._lwd_probe_manager._hash_sizes[dp_idx.cloud_id] = (
+                    params.prefix_hash_block_size
+                )
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
@@ -159,6 +183,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.shutdown()
+        # Reached after a failed assembly too, before the clients exist.
+        self._lwd_probe_manager.close()
         for client in getattr(self, "_lwd_coord_clients", {}).values():
             client.shutdown()
         super().shutdown()
@@ -166,30 +192,38 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_decode(self, payload: bytes) -> LwdMessage:
         return lwd_decode_cloud_to_edge(payload)
 
+    def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        return LwdConnectionId(
+            self.lwd_config.instance_id, peer.instance_id, peer.dp_rank
+        )
+
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
         """Cloud limits -> record and wake the startup wait; c2e -> scheduler
         notify queue + WAKEUP; anything else is unknown."""
         if isinstance(msg, LwdCloudParamsNotify):
-            self._lwd_cloud_params[peer.dp_rank] = msg
+            connection = self._lwd_connection_of(peer)
+            self._lwd_cloud_params[connection] = msg
+            self.scheduler.lwd_update_cloud_params(connection, msg)
             self._lwd_cloud_params_received.set()
             return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
         if isinstance(msg, LwdC2eNotify):
+            connection_id = self._lwd_connection_of(peer)
             lwd_logger.info(
-                "[edge] c2e received from dp%d reqs=%d hidden_numel=%d",
-                peer.dp_rank,
+                "[edge] c2e received from %s reqs=%d hidden_numel=%d",
+                connection_id,
                 len(msg.req_ids),
                 msg.hidden_num_elements,
             )
-            self.scheduler.unembed_notify_queue.append((peer.dp_rank, msg))
+            self.scheduler.unembed_notify_queue.append((connection_id, msg))
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
         return False
 
     def _lwd_check_cloud_params(
-        self, dp_idx: int, params: LwdCloudParamsNotify
+        self, dp_idx: LwdConnectionId, params: LwdCloudParamsNotify
     ) -> None:
         """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
         rank: a mismatch makes the cloud hold prefills behind decodes forever
@@ -199,14 +233,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         remote = (params.max_num_batched_tokens, params.max_num_seqs)
         if local != remote:
             raise RuntimeError(
-                f"[LWD] edge/cloud scheduling config mismatch on dp{dp_idx}: "
+                f"[LWD] edge/cloud scheduling config mismatch on {dp_idx}: "
                 f"(max_num_batched_tokens, max_num_seqs) edge={local} != "
                 f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
-        lwd_logger.info("[cloud-params] dp%d limits verified: %s", dp_idx, local)
+        lwd_logger.info("[cloud-params] %s limits verified: %s", dp_idx, local)
 
-    def _lwd_send_to_cloud(self, dp_idx: int, message: LwdEdgeToCloudMessage) -> None:
+    def _lwd_send_to_cloud(
+        self, dp_idx: LwdConnectionId, message: LwdEdgeToCloudMessage
+    ) -> None:
         """Send to one cloud DP rank, retrying a full outbound queue; raises
         once the retries run out instead of losing the message."""
         cloud = self._lwd_clouds[dp_idx]
@@ -215,7 +251,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 return
             time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
         raise RuntimeError(
-            f"[LWD] {type(message).__name__} to cloud dp{dp_idx} {cloud} not "
+            f"[LWD] {type(message).__name__} to cloud {dp_idx} {cloud} not "
             f"sent: outbound queue still full after {_LWD_SEND_RETRY_STEPS} "
             "retries (cloud stalled or gone?)"
         )
@@ -238,8 +274,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if control is not None and not request.abort_immediately:
             control.add_request(request)
             return
-        self._lwd_admit_and_notify(request)
-        self._lwd_enqueue_request(request)
+        if request.abort_immediately:
+            self._lwd_add_request_after_probe(request)
+            return
+        if self._lwd_probe_manager.submit(request):
+            return
+        self._lwd_add_request_after_probe(request)
 
     def _lwd_admit_and_notify(self, request: Request) -> None:
         dp_idx = self.scheduler.lwd_admit_request(request)
@@ -287,10 +327,88 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.abort_requests([request.request_id])
         self._send_abort_outputs_to_client([request.request_id], request.client_index)
 
+    def _lwd_add_request_after_probe(
+        self,
+        request: Request,
+        completion: LwdProbeCompletion | None = None,
+    ) -> None:
+        preferred = self._lwd_preferred_connection(completion)
+        if completion is not None and completion.result is not None:
+            coordination = self.lwd_config.coordination
+            hit = 0 if coordination.placement_only else completion.result.hit_tokens
+            hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
+            alignment = completion.result.alignment_tokens
+            if alignment > 0:
+                hit -= hit % alignment
+            request.num_computed_tokens = hit
+            if completion.chain is not None:
+                self._lwd_probe_chains[request.request_id] = completion.chain
+                self._lwd_probe_block_sizes[request.request_id] = (
+                    completion.result.block_size
+                )
+        dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+        client = self._lwd_coord_clients.get(dp_idx)
+        if client is not None:
+            client.send_first_req()
+        self._lwd_notify_request(dp_idx, request)
+        chain = self._lwd_probe_chains.get(request.request_id)
+        if chain is not None:
+            block_size = self._lwd_probe_block_sizes[request.request_id]
+            self._lwd_send_to_cloud(
+                dp_idx,
+                LwdGenChainNotify(
+                    request_id=request.request_id,
+                    block_hashes=list(chain),
+                    block_size=block_size,
+                ),
+            )
+            self._lwd_gen_chain_sent[request.request_id] = len(chain)
+        super().add_request(request)
+
+    def _lwd_preferred_connection(
+        self, completion: LwdProbeCompletion | None
+    ) -> LwdConnectionId | None:
+        if completion is None or completion.result is None:
+            return None
+        cloud_id = completion.cloud_id
+        engine = completion.engine_index
+        if engine is not None:
+            candidate = LwdConnectionId(
+                self.lwd_config.instance_id, cloud_id, engine
+            )
+            if candidate in self._lwd_clouds:
+                return candidate
+        return next(
+            (
+                connection_id
+                for connection_id in sorted(self._lwd_clouds)
+                if connection_id.cloud_id == cloud_id
+            ),
+            None,
+        )
+
+    def _lwd_drain_probe_completions(self) -> None:
+        for completion in self._lwd_probe_manager.drain():
+            self._lwd_add_request_after_probe(completion.request, completion)
+
+    def step(self):
+        self._lwd_drain_probe_completions()
+        return super().step()
+
+    def step_with_batch_queue(self):
+        self._lwd_drain_probe_completions()
+        return super().step_with_batch_queue()
+
     def abort_requests(self, request_ids: list[str]) -> None:
+        """Notify each request's original cloud DP, then finish natively."""
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.prepare_abort(request_ids)
+        for request_id in request_ids:
+            self._lwd_probe_manager.abort(request_id)
+            self._lwd_probe_chains.pop(request_id, None)
+            self._lwd_probe_block_sizes.pop(request_id, None)
+            self._lwd_gen_chain_sent.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
         for dp_idx, request_id in routed_aborts:
             request = getattr(self.scheduler, "requests", {}).get(request_id)
@@ -300,7 +418,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
         super().abort_requests(request_ids)
 
-    def _lwd_notify_request(self, dp_idx: int, request: Request) -> None:
+    def _lwd_notify_request(
+        self, dp_idx: LwdConnectionId, request: Request
+    ) -> None:
         """Announce the request to one cloud DP rank, packing the sampling
         fields from the shared table."""
         sampling_params = request.sampling_params
@@ -316,7 +436,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             LwdRequestNotify(
                 request_id=request.request_id,
                 num_prompt_tokens=request.num_prompt_tokens,
-                block_hashes=list(request.block_hashes),
+                block_hashes=list(
+                    self._lwd_probe_chains.get(
+                        request.request_id, request.block_hashes
+                    )
+                ),
                 prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
                 skip_reading_prefix_cache=bool(
                     getattr(sampling_params, "skip_reading_prefix_cache", False)
@@ -326,3 +450,111 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 **values,
             ),
         )
+
+    def _lwd_announce_gen_chain(self, request: Request) -> None:
+        """Publish each newly completed block with full-chain replacement."""
+        request_id = request.request_id
+        route = self.scheduler._lwd_dp_of_settling(request_id)
+        block_size = self._lwd_probe_block_sizes.get(request_id)
+        coordination = self.lwd_config.coordination
+        if (
+            route is None
+            or block_size is None
+            or coordination is None
+            or not coordination.enabled
+            or coordination.placement_only
+        ):
+            return
+        prompt_ids = list(request.prompt_token_ids or ())
+        token_ids = prompt_ids + list(request.output_token_ids)
+        if len(token_ids) // block_size <= self._lwd_gen_chain_sent.get(
+            request_id, 0
+        ):
+            return
+        try:
+            from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdPrefixHasher
+
+            hasher = LwdPrefixHasher(
+                tenant_key=self._lwd_probe_manager._key(),
+                block_size=block_size,
+                processor_fingerprint=self._lwd_probe_manager._fingerprint(),
+            )
+            state = self._lwd_probe_chains.setdefault(request_id, [])
+            if request.mm_features:
+                state[:] = hasher.build_manifest(
+                    request_id,
+                    token_ids,
+                    media_items=self._lwd_probe_manager._media_items(request),
+                ).full_block_hashes
+            else:
+                state.extend(hasher.chain_extend(state, token_ids))
+            self._lwd_send_to_cloud(
+                route,
+                LwdGenChainNotify(
+                    request_id=request_id,
+                    block_hashes=list(state),
+                    block_size=block_size,
+                ),
+            )
+            self._lwd_gen_chain_sent[request_id] = len(state)
+        except Exception:
+            lwd_logger.warning(
+                "[edge] generation chain announce failed for req=%s (fail-open)",
+                request_id,
+                exc_info=True,
+            )
+
+    def _lwd_finish_request(self, request: Request) -> None:
+        """Best-effort final hash-chain publication; never blocks termination."""
+        request_id = request.request_id
+        route = self.scheduler._lwd_dp_of_settling(request_id)
+        block_size = self._lwd_probe_block_sizes.pop(request_id, None)
+        self._lwd_probe_chains.pop(request_id, None)
+        self._lwd_gen_chain_sent.pop(request_id, None)
+        coordination = self.lwd_config.coordination
+        if (
+            route is None
+            or coordination is None
+            or not coordination.enabled
+            or coordination.placement_only
+        ):
+            return
+        try:
+            from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdPrefixHasher
+
+            if block_size is None:
+                block_size = next(
+                    (
+                        params.prefix_hash_block_size
+                        for connection, params in self._lwd_cloud_params.items()
+                        if connection == route and params.prefix_hash_block_size > 0
+                    ),
+                    self.vllm_config.cache_config.block_size,
+                )
+            hasher = LwdPrefixHasher(
+                tenant_key=self._lwd_probe_manager._key(),
+                block_size=block_size,
+                processor_fingerprint=self._lwd_probe_manager._fingerprint(),
+            )
+            prompt_ids = list(request.prompt_token_ids or ())
+            completion_ids = list(request.output_token_ids)
+            manifest = hasher.build_manifest(
+                request_id,
+                prompt_ids + completion_ids,
+                media_items=self._lwd_probe_manager._media_items(request),
+            )
+            self._lwd_send_to_cloud(
+                route,
+                LwdFinishNotify(
+                    request_id=request_id,
+                    prompt_tokens=len(prompt_ids),
+                    completion_tokens=len(completion_ids),
+                    full_block_hashes=list(manifest.full_block_hashes),
+                ),
+            )
+        except Exception:
+            lwd_logger.warning(
+                "[edge] finish chain announce failed for req=%s (fail-open)",
+                request_id,
+                exc_info=True,
+            )

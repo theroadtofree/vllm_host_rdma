@@ -55,6 +55,14 @@ class LwdConfig:
                 cloud_id=identity if role == "cloud" else None,
             )
             coordination.validate_role(role)
+            unknown_clouds = set(coordination.control_url_map) - {
+                cloud.id for cloud in topology.clouds
+            }
+            if unknown_clouds:
+                raise ValueError(
+                    f"[LWD] control_url_map references unknown clouds "
+                    f"{sorted(unknown_clouds)}"
+                )
         return cls(
             path,
             role,
@@ -63,6 +71,14 @@ class LwdConfig:
             coordination,
             api=api if api is not None else LwdAPIConfig(),
         )
+
+    def skips_module(self, path: str) -> bool:
+        """Whether this role replaces a model component with a placeholder."""
+        if self.role == "edge":
+            return path == "model.norm" or path.endswith(".model.norm")
+        if self.role == "cloud":
+            return path == "visual" or path.endswith(".visual")
+        return False
 
     @property
     def instance(self) -> LwdInstance:

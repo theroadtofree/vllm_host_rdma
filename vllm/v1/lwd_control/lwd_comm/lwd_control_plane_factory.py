@@ -81,6 +81,11 @@ def _lwd_cloud_spec(
         dp_size=dp_size,
         bind_endpoint=make_zmq_path("tcp", bind_host, local.ctrl_port),
         config=lwd_config.topology.control_plane,
+        expected_edge_ids=tuple(
+            sorted(
+                c.edge_id for c in lwd_config.connections if c.dp_idx == dp_rank
+            )
+        ),
     )
 
 
@@ -92,14 +97,10 @@ def _lwd_edge_spec(
     One edge process serves every DP connection of its instance: link i
     connects to the cloud DP rank of DP index i.
     """
-    connections = sorted(lwd_config.connections, key=lambda c: c.dp_idx)
-    if [c.dp_idx for c in connections] != list(range(len(connections))):
-        raise NotImplementedError(
-            f"[LWD] edge instance {lwd_config.instance_id} needs one "
-            f"connection per DP index; got dp indices "
-            f"{[c.dp_idx for c in connections]} (scene="
-            f"{lwd_config.topology.deployment.scene})"
-        )
+    connections = sorted(lwd_config.connections, key=lambda c: c.connection_id)
+    cloud_dp_sizes = {
+        cloud.id: len(cloud.dp) for cloud in lwd_config.topology.clouds
+    }
     return LwdEdgeControlPlaneSpec(
         instance_id=lwd_config.instance_id,
         dp_rank=dp_rank,
@@ -109,5 +110,7 @@ def _lwd_edge_spec(
             for c in connections
             if c.cloud.ctrl_port is not None
         ),
+        connection_ids=tuple(c.connection_id for c in connections),
+        cloud_dp_sizes=tuple(cloud_dp_sizes[c.cloud_id] for c in connections),
         config=lwd_config.topology.control_plane,
     )

@@ -19,6 +19,10 @@ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
 )
+from vllm.model_executor.model_loader.lwd_weight_filter import (
+    name_is_skipped,
+    parse_skip_keys,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -330,14 +334,50 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._skip_unbuilt_weights(
+            model, self._get_weights_iterator(primary_weights)
+        )
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._skip_unbuilt_weights(
+                model, self._get_weights_iterator(source)
+            )
+
+    def _skip_unbuilt_weights(
+        self,
+        model: nn.Module,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Skip tensors for placeholders in a trimmed LWD model."""
+        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
+        if not skip_keys:
+            yield from weights
+            return
+        num_skipped = 0
+        for name, tensor in weights:
+            if name_is_skipped(name, skip_keys):
+                num_skipped += 1
+                continue
+            yield name, tensor
+        if num_skipped:
+            logger.debug(
+                "LWD weight filter skipped %d placeholder tensor(s)", num_skipped
+            )
+
+    @staticmethod
+    def _placeholder_module_names(model: nn.Module) -> list[str]:
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.model_executor.models.utils import get_pp_missing_layer_names
+
+        config = get_current_vllm_config_or_none()
+        lwd_config = getattr(config, "lwd_config", None) if config else None
+        if lwd_config is None:
+            return []
+        return get_pp_missing_layer_names(model)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

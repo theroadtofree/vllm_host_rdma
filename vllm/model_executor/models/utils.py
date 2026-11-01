@@ -852,6 +852,12 @@ def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
     return pp.world_size > 1 and pp.is_last_rank
 
 
+def lwd_skips_module(vllm_config: VllmConfig, path: str) -> bool:
+    """Return whether the active LWD role omits this model component."""
+    lwd_config = getattr(vllm_config, "lwd_config", None)
+    return lwd_config is not None and lwd_config.skips_module(path)
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Configuration-only API attachment; no service or routing implementation."""
+"""CLI and topology validation for multi-frontend API attachment."""
 
 import argparse
 from dataclasses import dataclass
@@ -12,8 +12,12 @@ if TYPE_CHECKING:
 
 
 def _endpoint(value: str | None, flag: str) -> None:
-    if value is None:
-        return
+    if value is not None:
+        parse_endpoint(value, flag)
+
+
+def parse_endpoint(value: str, flag: str) -> tuple[str, int]:
+    """Return the concrete IP and port from an LWD API endpoint."""
     if not isinstance(value, str):
         raise ValueError(f"[LWD] {flag} requires IP:port")
     host, sep, port = value.rpartition(":")
@@ -31,11 +35,12 @@ def _endpoint(value: str | None, flag: str) -> None:
         raise ValueError(f"[LWD] {flag}: invalid IP {host!r}") from exc
     if addr.is_unspecified or addr.is_multicast:
         raise ValueError(f"[LWD] {flag}: use a concrete unicast IP")
+    return host, int(port)
 
 
 @dataclass(frozen=True)
 class LwdAPIConfig:
-    """PR #42 API endpoint metadata forwarded with the topology snapshot."""
+    """LWD primary/attach frontend endpoint configuration."""
 
     api_server_rpc_port: str | None = None
     """Primary endpoint as IP:port, despite the historical option name."""
@@ -52,13 +57,13 @@ class LwdAPIConfig:
     def add_cli_args(parser: argparse.ArgumentParser) -> None:
         group = parser.add_argument_group("LWD API configuration")
         for flag, action in (
-            ("rpc-port", "start an RPC listener"),
-            ("attach", "attach an existing engine"),
+            ("rpc-port", "accept non-primary frontends on the primary edge"),
+            ("attach", "attach this non-primary frontend to the primary edge"),
         ):
             group.add_argument(
                 f"--api-server-{flag}",
                 metavar="IP:port",
-                help=f"Primary edge endpoint metadata; does not {action}.",
+                help=f"LWD multi-frontend mode: {action}.",
             )
 
     @staticmethod
@@ -71,6 +76,14 @@ class LwdAPIConfig:
             headless or getattr(args, "headless", False) or getattr(args, "grpc", False)
         ):
             raise ValueError("[LWD] API options require the HTTP frontend")
+        if requested and getattr(args, "data_parallel_multi_port_external_lb", False):
+            raise ValueError(
+                "[LWD] API attachment cannot be combined with "
+                "--data-parallel-multi-port-external-lb"
+            )
+        if requested and (count := getattr(args, "api_server_count", None)) is not None:
+            if count < 1:
+                raise ValueError("[LWD] --api-server-count must be positive")
 
     @classmethod
     def from_namespace(cls, args: Any, *, headless: bool = False) -> "LwdAPIConfig":
@@ -99,4 +112,4 @@ class LwdAPIConfig:
         if self.api_server_attach is not None and lwd.instance_id == 0:
             raise ValueError("[LWD] --api-server-attach requires a non-primary edge")
         if lwd.topology.deployment.scene != "edge_share":
-            raise ValueError("[LWD] API attachment metadata requires scene=edge_share")
+            raise ValueError("[LWD] API attachment requires scene=edge_share")

@@ -8,11 +8,12 @@ from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .logging import log_lwd_config
-from .topology import LwdTopology
+from .topology import LwdConnectionId, LwdTopology
 
 __all__ = [
     "LwdAPIConfig",
     "LwdConfig",
+    "LwdConnectionId",
     "LwdCoordinationConfig",
     "LwdTopology",
     "log_lwd_config",

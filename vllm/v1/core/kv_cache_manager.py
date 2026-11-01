@@ -280,6 +280,23 @@ class KVCacheManager:
                   Pinned so sparse prefix-cache retention does not drop
                   the junction and defeat cross-request reuse.
         """
+        # LWD cross-edge probes freeze both zero hits and the exact positive-hit
+        # block layout. Reusing that snapshot prevents EAGLE/MTP alignment from
+        # being applied a second time during native admission.
+        lwd_prefix_coordinator = getattr(self, "lwd_prefix_coordinator", None)
+        if lwd_prefix_coordinator is not None and lwd_prefix_coordinator.has_reservation(
+            request.request_id
+        ):
+            pinned = lwd_prefix_coordinator.pinned_computed_blocks(request.request_id)
+            if pinned is None:
+                return self.empty_kv_cache_blocks, 0, 0
+            blocks_by_group, num_computed_tokens = pinned
+            return (
+                self.create_kv_cache_blocks(blocks_by_group),
+                num_computed_tokens,
+                0,
+            )
+
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs

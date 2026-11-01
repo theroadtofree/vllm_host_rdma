@@ -205,6 +205,9 @@ class MultiModalConfig:
     interleave_mm_strings: bool = False
     """Enable fully interleaved support for multimodal prompts, while using
     --chat-template-content-format=string."""
+    mm_encoder_remote: bool = False
+    """The multimodal encoder runs on a remote LWD edge; do not construct a
+    local processor or advertise locally processed multimodal inputs."""
     skip_mm_profiling: bool = False
     """When enabled, skips multimodal memory profiling and only profiles with
     language backbone model during engine initialization.

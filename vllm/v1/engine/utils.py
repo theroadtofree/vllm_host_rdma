@@ -159,9 +159,34 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
     ):
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
         context = get_mp_context()
+        coordination = getattr(
+            getattr(vllm_config, "lwd_config", None), "coordination", None
+        )
+        if (
+            cloud_control_command_queue is None
+            and cloud_control_event_queue is None
+            and coordination is not None
+            and coordination.enabled
+            and vllm_config.lwd_config.role == "cloud"
+        ):
+            from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
+                start_lwd_cloud_control_server,
+            )
+
+            cloud_control_command_queue, cloud_control_event_queue = (
+                start_lwd_cloud_control_server(vllm_config)
+            )
+        if cloud_control_command_queue is None:
+            command_queues = None
+        elif isinstance(cloud_control_command_queue, (list, tuple)):
+            command_queues = list(cloud_control_command_queue)
+        else:
+            command_queues = [cloud_control_command_queue]
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -169,6 +194,10 @@ class CoreEngineProcManager:
             "executor_class": executor_class,
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
+            "cloud_control_command_queue": (
+                command_queues[0] if command_queues else None
+            ),
+            "cloud_control_event_queue": cloud_control_event_queue,
         }
 
         if client_handshake_address:
@@ -186,12 +215,24 @@ class CoreEngineProcManager:
 
             # Start EngineCore in background process.
             local_dp_ranks.append(local_index)
+            per_engine_kwargs: dict[str, Any] = {
+                "dp_rank": global_index,
+                "local_dp_rank": local_index,
+            }
+            if command_queues is not None and len(command_queues) > 1:
+                if global_index >= len(command_queues):
+                    raise RuntimeError(
+                        f"[LWD] cloud control queues ({len(command_queues)}) "
+                        f"do not cover global dp_rank {global_index}"
+                    )
+                per_engine_kwargs["cloud_control_command_queue"] = command_queues[
+                    global_index
+                ]
             self.processes.append(
                 context.Process(
                     target=EngineCoreProc.run_engine_core,
                     name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
-                    kwargs=common_kwargs
-                    | {"dp_rank": global_index, "local_dp_rank": local_index},
+                    kwargs=common_kwargs | per_engine_kwargs,
                 )
             )
 

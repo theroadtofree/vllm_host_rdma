@@ -1273,6 +1273,10 @@ class VllmConfig:
             self.lwd_config = resolve_lwd_config(self.additional_config)
         if self.lwd_config is not None:
             log_lwd_config(logger, self.lwd_config)
+            if self.lwd_config.role == "cloud":
+                self.model_config.skip_tokenizer_init = True
+                self.multimodal_config.skip_mm_profiling = True
+                self.multimodal_config.mm_encoder_remote = True
 
         self._resolve_mm_encoder_only()
 

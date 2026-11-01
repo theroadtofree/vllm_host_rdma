@@ -182,6 +182,8 @@ class APIServerProcessManager:
         target_server_fn: Callable | None = None,
         stats_update_address: str | None = None,
         tensor_queue: Queue | None = None,
+        client_count: int | None = None,
+        client_indices: list[int] | None = None,
     ):
         """Initialize and start API server worker processes.
 
@@ -205,6 +207,18 @@ class APIServerProcessManager:
         self.listen_address = listen_address
         self.sock = sock
         self.args = args
+        self.client_count = num_servers if client_count is None else client_count
+        self.client_indices = (
+            list(range(num_servers)) if client_indices is None else client_indices
+        )
+        if len(self.client_indices) != num_servers:
+            raise ValueError("client_indices must contain one index per API server")
+        if self.client_count < num_servers or any(
+            not 0 <= index < self.client_count for index in self.client_indices
+        ):
+            raise ValueError("API server client indices are outside client_count")
+        if len(set(self.client_indices)) != num_servers:
+            raise ValueError("API server client indices must be unique")
 
         spawn_context = multiprocessing.get_context("spawn")
         self.processes: list[BaseProcess] = []
@@ -216,7 +230,7 @@ class APIServerProcessManager:
 
             admission_counters = spawn_context.RawArray(
                 "q",
-                SharedAdmissionStats.num_counters(num_servers),
+                SharedAdmissionStats.num_counters(self.client_count),
             )
 
         for i, in_addr, out_addr in zip(
@@ -225,8 +239,8 @@ class APIServerProcessManager:
             client_config: dict[str, Any] = {
                 "input_address": in_addr,
                 "output_address": out_addr,
-                "client_count": num_servers,
-                "client_index": i,
+                "client_count": self.client_count,
+                "client_index": self.client_indices[i],
             }
             if admission_counters is not None:
                 client_config["mp_admission_counters"] = admission_counters

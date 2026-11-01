@@ -1032,6 +1032,8 @@ class EngineCoreProc(EngineCore):
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
         *,
         engine_index: int = 0,
     ):
@@ -1042,6 +1044,8 @@ class EngineCoreProc(EngineCore):
         )
 
         self.engine_index = engine_index
+        self.cloud_control_command_queue = cloud_control_command_queue
+        self.cloud_control_event_queue = cloud_control_event_queue
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
         self.shutdown_state = EngineShutdownState.RUNNING
@@ -2050,6 +2054,8 @@ class DPEngineCoreProc(EngineCoreProc):
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        cloud_control_command_queue: Any | None = None,
+        cloud_control_event_queue: Any | None = None,
     ):
         assert vllm_config.model_config.is_moe, (
             "DPEngineCoreProc should only be used for MoE models"
@@ -2087,6 +2093,8 @@ class DPEngineCoreProc(EngineCoreProc):
             client_handshake_address,
             engine_index=dp_rank,
             tensor_queue=tensor_queue,
+            cloud_control_command_queue=cloud_control_command_queue,
+            cloud_control_event_queue=cloud_control_event_queue,
         )
 
     def _init_data_parallel(self, vllm_config: VllmConfig):

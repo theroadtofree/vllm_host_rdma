@@ -7,13 +7,12 @@ Design: docs/design/lwd_data_plane.md.
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
-    from vllm.config.lwd import LwdTopology
+    from vllm.config.lwd import LwdConnectionId, LwdTopology
 
 LwdRankGroup = tuple[int, ...]
 
@@ -22,7 +21,7 @@ LwdRankGroup = tuple[int, ...]
 class LwdChannelEndpoints:
     """Global ranks that hold the data-plane channels of one DP connection."""
 
-    dp_idx: int
+    connection_id: LwdConnectionId
     edge_rank: int
     cloud_rank: int
 
@@ -101,30 +100,16 @@ class LwdParallelGroupsSpec:
         channel_endpoints = sorted(
             (
                 LwdChannelEndpoints(
-                    connection.dp_idx,
+                    connection.connection_id,
                     connection.edge.ranks[0],
-                    connection.cloud_leader_rank,
+                    connection.cloud.ranks[
+                        connection.edge_id % len(connection.cloud.ranks)
+                    ],
                 )
                 for connection in connections
             ),
             key=lambda endpoints: (endpoints.edge_rank, endpoints.cloud_rank),
         )
-        if scene != "single_instance":
-            endpoint_uses = Counter(
-                rank
-                for endpoints in channel_endpoints
-                for rank in (endpoints.edge_rank, endpoints.cloud_rank)
-            )
-            overloaded = sorted(
-                rank for rank, uses in endpoint_uses.items() if uses > 1
-            )
-            if overloaded:
-                # TODO(lwd): key the data-plane channels by DP connection.
-                raise NotImplementedError(
-                    f"[LWD] ranks {overloaded} hold the channels of several DP "
-                    "connections; the data plane supports one per rank "
-                    f"(scene={scene})"
-                )
         # 3. Co-located DP groups: one per cloud-instance position, holding
         # that position's rank of every DP of the instance (all DPs split
         # the instance ranks equally); edge ranks are singletons.
