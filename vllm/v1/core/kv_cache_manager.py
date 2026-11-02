@@ -284,6 +284,8 @@ class KVCacheManager:
         # block layout. Reusing that snapshot prevents EAGLE/MTP alignment from
         # being applied a second time during native admission.
         lwd_prefix_coordinator = getattr(self, "lwd_prefix_coordinator", None)
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0
         if lwd_prefix_coordinator is not None and lwd_prefix_coordinator.has_reservation(
             request.request_id
         ):
@@ -297,13 +299,8 @@ class KVCacheManager:
                 0,
             )
 
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
-        if not self.prefix_cache_lookup_enabled(request):
-            return self.empty_kv_cache_blocks, 0, 0
-
+        # Cache lookup was already rejected above for disabled caching and
+        # skip_reading_prefix_cache requests.
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
         # This can trigger recomputation of an entire block, rather than just

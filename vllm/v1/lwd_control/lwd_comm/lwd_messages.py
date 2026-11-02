@@ -82,6 +82,9 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
+    prefix_nonce: int = 0
+    """Nonzero while the edge waits for a matching LwdPrefixReadyNotify."""
+    skip_reading_prefix_cache: bool = False
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -128,6 +131,24 @@ class LwdFinishNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-
     completion_tokens: int
     full_block_hashes: list[bytes] = []
     publish_cache: bool = True
+
+
+class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Result of native single-instance prefix negotiation."""
+
+    request_id: str
+    hit_tokens: int
+    nonce: int
+    error: str = ""
+
+
+class LwdRefillNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Absolute prompt hole to refill after preemption."""
+
+    request_id: str
+    start_row: int
+    end_row: int
+    prefix_nonce: int
 
 
 class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]

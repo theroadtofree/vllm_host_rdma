@@ -115,6 +115,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self.lwd_on_finish: Callable[[Request], None] | None = None
         self.lwd_on_tokens: Callable[[Request], None] | None = None
         self.lwd_has_pending: Callable[[], bool] | None = None
+        self.lwd_refill_abort: Callable[[str], None] | None = None
+        self._lwd_pending_refills: deque[SchedulerOutput] = deque()
         # One account per full connection: dp_idx alone is not unique when
         # this edge connects to several clouds.
         lwd_config = self.vllm_config.lwd_config
@@ -771,12 +773,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return None
         start, end = notify.start_row, notify.end_row
         if not 0 <= start < end <= request.num_prompt_tokens:
-            lwd_logger.error(
-                "[edge-refill] req=%s invalid range [%d, %d)",
-                request_id,
-                start,
-                end,
-            )
             return None
         chunk_size = min(
             self._lwd_chunk_unit, self.scheduler_config.max_num_batched_tokens
@@ -807,7 +803,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 token_ids=[list(request.prompt_token_ids[chunk_start:chunk_end])],
                 prompt_offsets=[chunk_start],
                 has_mrope=[False],
-                dp_idx=dp_idx,
+                connection_id=dp_idx,
             )
             batch_meta.is_refill = True
             batch_meta.lwd_prefix_nonce = prefix_nonce
@@ -829,13 +825,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         assert batch is not None and batch.batch_meta is not None
         meta = batch.batch_meta
         request_id = meta.req_ids[0]
-        dp_idx = meta.dp_idx
+        connection = meta.connection_id
         request = self.requests.get(request_id)
         prefix_nonce = getattr(meta, "lwd_prefix_nonce", 0)
         if (
             request is None
             or getattr(request, "lwd_prefix_nonce", 0) != prefix_nonce
-            or self._lwd_dp_of_settling(request_id) != dp_idx
+            or self._lwd_dp_of_settling(request_id) != connection
         ):
             lwd_logger.warning(
                 "[edge-refill] drop stale queued chunk req=%s nonce=%d",
@@ -852,11 +848,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             is_refill=True,
             prefix_nonce=prefix_nonce,
         )
-        account = self._lwd_accounts[dp_idx]
+        account = self._lwd_accounts[connection]
         seqno = account.seqno
         assert self.lwd_send_to_cloud is not None, "cloud not connected"
         try:
-            self.lwd_send_to_cloud(dp_idx, LwdRangeNotify(seqno=seqno, items=[item]))
+            self.lwd_send_to_cloud(
+                connection, LwdRangeNotify(seqno=seqno, items=[item])
+            )
         except Exception:
             lwd_logger.exception("[edge-refill] send failed req=%s", request_id)
             if self.lwd_refill_abort is None:
@@ -865,17 +863,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         account.take_seqno()
         account.register_batch(seqno, {request_id})
-        self._lwd_announced_refills.add((dp_idx, seqno))
+        self._lwd_announced_refills.add((connection, seqno))
         batch.seqno = seqno
-        lwd_logger.info(
-            "[edge-refill] req=%s dp%d rows=[%d, %d) seqno=%d nonce=%d",
-            request_id,
-            dp_idx,
-            start,
-            start + item.num_tokens,
-            seqno,
-            prefix_nonce,
-        )
         return scheduler_output
 
     def _lwd_build_range_items(

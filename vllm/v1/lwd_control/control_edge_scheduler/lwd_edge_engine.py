@@ -101,7 +101,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_gen_chain_sent: dict[str, int] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
         self.scheduler.lwd_on_tokens = self._lwd_announce_gen_chain
-        self.scheduler.lwd_has_pending = lambda: self._lwd_probe_manager.pending
+        self.scheduler.lwd_has_pending = lambda: (
+            self._lwd_probe_manager.pending
+            or bool(
+                self._lwd_prefix_control and self._lwd_prefix_control.pending
+            )
+        )
         self._lwd_cloud_params_received = threading.Event()
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
@@ -193,9 +198,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return lwd_decode_cloud_to_edge(payload)
 
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
-        return LwdConnectionId(
-            self.lwd_config.instance_id, peer.instance_id, peer.dp_rank
-        )
+        return next(
+            connection
+            for connection in self.lwd_config.connections
+            if (connection.cloud_id, connection.dp_idx)
+            == (peer.instance_id, peer.dp_rank)
+        ).connection_id
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
         """Cloud limits -> record and wake the startup wait; c2e -> scheduler
@@ -266,16 +274,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request.num_prompt_tokens,
         )
         if self.scheduler.lwd_edge_request_active(request.request_id):
-            lwd_logger.error(
-                "[edge] reject duplicate active request req=%s", request.request_id
-            )
             raise AssertionError(f"duplicate active request id: {request.request_id}")
-        control = getattr(self, "_lwd_prefix_control", None)
-        if control is not None and not request.abort_immediately:
-            control.add_request(request)
-            return
         if request.abort_immediately:
             self._lwd_add_request_after_probe(request)
+            return
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is not None:
+            control.add_request(request)
             return
         if self._lwd_probe_manager.submit(request):
             return
@@ -411,10 +416,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_gen_chain_sent.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
         for dp_idx, request_id in routed_aborts:
-            request = getattr(self.scheduler, "requests", {}).get(request_id)
+            request = self.scheduler.requests.get(request_id)
             self._lwd_send_to_cloud(
                 dp_idx,
-                LwdAbortNotify(request_id, getattr(request, "lwd_prefix_nonce", 0)),
+                LwdAbortNotify(
+                    request_id, getattr(request, "lwd_prefix_nonce", 0)
+                ),
             )
         super().abort_requests(request_ids)
 
@@ -441,11 +448,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                         request.request_id, request.block_hashes
                     )
                 ),
-                prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
-                skip_reading_prefix_cache=bool(
-                    getattr(sampling_params, "skip_reading_prefix_cache", False)
-                ),
                 eos_token_id=sampling_params.eos_token_id,
+                prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
+                skip_reading_prefix_cache=request.skip_reading_prefix_cache,
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 **values,
             ),

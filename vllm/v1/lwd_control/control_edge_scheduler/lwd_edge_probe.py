@@ -153,7 +153,11 @@ class LwdEdgeProbeManager:
         )
 
     def submit(self, request: Any) -> bool:
-        if not self.enabled or request.request_id in self._inflight:
+        if (
+            not self.enabled
+            or request.skip_reading_prefix_cache
+            or request.request_id in self._inflight
+        ):
             return False
         coordination = self._vllm_config.lwd_config.coordination
         target_cloud = self._health.next() if coordination.control_url_map else None

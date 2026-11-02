@@ -112,6 +112,52 @@ class LwdPrefixCoordinator:
         """Return whether this request has a frozen probe decision."""
         return request_id in self._reservations
 
+    def has_pending_snapshot(self, request_id: str) -> bool:
+        reservation = self._reservations.get(request_id)
+        return reservation is not None and reservation.pool_blocks is not None
+
+    def hit_of(self, request_id: str) -> int:
+        reservation = self._reservations.get(request_id)
+        return reservation.hit_tokens if reservation is not None else 0
+
+    def discard(self, request_id: str) -> None:
+        """Release an unused reservation without publishing usage or hashes."""
+        reservation = self._reservations.pop(request_id, None)
+        if (
+            reservation is not None
+            and reservation.touched_blocks
+            and self._kv_cache_manager is not None
+        ):
+            self._kv_cache_manager.block_pool.free_blocks(reservation.touched_blocks)
+        self._prompt_chains.pop(request_id, None)
+
+    def reserve_hit(self, request, groups, hit_tokens: int) -> None:
+        """Install one fresh readmission snapshot after native preemption."""
+        old = self._reservations.get(request.request_id)
+        if old is None:
+            raise RuntimeError(f"missing initial LWD reservation: {request.request_id}")
+        manifest = old.manifest
+        self.discard(request.request_id)
+        hit_kv_blocks = [block for group in groups for block in group]
+        if hit_kv_blocks and self._kv_cache_manager is not None:
+            self._kv_cache_manager.block_pool.touch(hit_kv_blocks)
+        self._reservations[request.request_id] = LwdReservation(
+            manifest=manifest,
+            hit_tokens=hit_tokens,
+            touched_blocks=hit_kv_blocks or None,
+            chain=list(request.block_hashes),
+            pool_blocks=tuple(tuple(group) for group in groups),
+            created_at=time.monotonic(),
+            claimed=True,
+        )
+
+    def truncate(self, groups, hit_tokens: int):
+        managers = self._kv_cache_manager.coordinator.single_type_managers
+        return tuple(
+            list(group[: hit_tokens // manager.block_size])
+            for group, manager in zip(groups, managers, strict=True)
+        )
+
     def pinned_computed_blocks(
         self, request_id: str
     ) -> tuple[tuple[tuple, ...], int] | None:
@@ -128,7 +174,12 @@ class LwdPrefixCoordinator:
         reservation = self._reservations.get(request_id)
         if reservation is None or reservation.pool_blocks is None:
             return None
-        return reservation.pool_blocks, reservation.hit_tokens
+        # Frozen exactly once: native admission takes ownership of these
+        # blocks. A preempted request must explicitly reserve a fresh hit;
+        # its old snapshot is never valid for a second allocation.
+        snapshot = reservation.pool_blocks
+        reservation.pool_blocks = None
+        return snapshot, reservation.hit_tokens
 
     def _digest_hit(self, chain: list[bytes]) -> int:
         """摘要域最长命中块数(``complete_request`` 回填的集合)。

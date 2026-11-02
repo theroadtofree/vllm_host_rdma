@@ -86,4 +86,13 @@ class LwdConfig:
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:
+        if self.role == "edge" and self.topology.deployment.scene == "edge_share":
+            # All logical frontends share this one physical engine. It owns
+            # every logical edge -> cloud connection, while attach-only API
+            # processes never create a second engine or HCCL world.
+            return tuple(
+                connection
+                for edge in self.topology.edges
+                for connection in self.topology.connections("edge", edge.id)
+            )
         return self.topology.connections(self.role, self.instance_id)

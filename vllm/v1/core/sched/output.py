@@ -65,6 +65,7 @@ class LwdEmbedBatch:
     """Full edge -> cloud DP connection; the worker selects its UP channel."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
+    lwd_prefix_nonce: int = 0
 
 
 @dataclass

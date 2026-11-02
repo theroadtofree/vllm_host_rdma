@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -265,10 +266,11 @@ class LwdControlPlane(ABC):
         self._thread: threading.Thread | None = None
         self._sender: LwdControlSender | None = None
         self._is_shut_down = False
-        # IO thread only. One held payload per peer, so a full link holds
-        # only its own payloads and the other links keep flowing.
+        # IO thread only. Each peer has an independent bounded FIFO: a full
+        # link holds back only that peer, and never stops accepting or
+        # draining payloads for the other peers.
         self._num_dropped: dict[LwdPeer, int] = {}
-        self._held: dict[LwdPeer, bytes] = {}
+        self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
         self._heartbeat_timeout_s = max(3.0 * spec.config.hello_retry_interval_s, 1.0)
 
@@ -375,21 +377,12 @@ class LwdControlPlane(ABC):
         poller = zmq.Poller()
         for socket in transport.sockets:
             poller.register(socket, zmq.POLLIN)
-        outbound_polled = False
+        poller.register(outbound, zmq.POLLIN)
         while not self._stop.is_set():
-            # While every readable peer's payload is held the outbound queue
-            # is not read, so polling it would spin; held payloads are
-            # retried on a tick.
-            should_poll_outbound = not self._held
-            if should_poll_outbound != outbound_polled:
-                if should_poll_outbound:
-                    poller.register(outbound, zmq.POLLIN)
-                else:
-                    poller.unregister(outbound)
-                outbound_polled = should_poll_outbound
-            poller.poll(
-                _LWD_IO_POLL_TICK_MS if outbound_polled else _LWD_HOLD_RETRY_TICK_MS
-            )
+            # Always drain the inproc queue. Blocked peers retain their own
+            # FIFOs; they must not prevent unrelated outbound messages from
+            # being consumed or inbound traffic from being processed.
+            poller.poll(_LWD_IO_POLL_TICK_MS)
             self._drain_inbound(transport)
             if self._stop.is_set():
                 return
@@ -440,21 +433,34 @@ class LwdControlPlane(ABC):
         self, transport: LwdControlTransport, outbound: zmq.Socket
     ) -> None:
         while True:
-            if not self._held:
-                try:
-                    peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
-                except zmq.Again:
-                    return
-                peer = lwd_decode_peer(peer_frame)
-                self._held[peer] = payload
-            # Retry every held payload; one full link holds only its own.
-            for peer, payload in list(self._held.items()):
-                if self._deliver(transport, peer, payload):
+            try:
+                peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            peer = lwd_decode_peer(peer_frame)
+            queue = self._held.setdefault(peer, deque())
+            if len(queue) >= self.spec.config.send_queue_max:
+                logger.warning(
+                    "control plane %s: per-peer FIFO for %s is full; dropping "
+                    "the newest outbound payload",
+                    self._label,
+                    peer,
+                )
+                continue
+            queue.append(payload)
+
+        # Retry only each FIFO's head, preserving per-peer ordering while
+        # allowing every other peer to make progress.
+        for peer, queue in list(self._held.items()):
+            if not queue:
+                self._release_held(peer)
+                continue
+            if self._deliver(transport, peer, queue[0]):
+                queue.popleft()
+                if not queue:
                     self._release_held(peer)
-                else:
-                    self._note_held(peer)
-            if self._held:
-                return  # At least one link is full; retry on the next tick.
+            else:
+                self._note_held(peer)
 
     def _note_held(self, peer: LwdPeer) -> None:
         if peer not in self._held_since:
@@ -467,7 +473,7 @@ class LwdControlPlane(ABC):
             )
 
     def _release_held(self, peer: LwdPeer) -> None:
-        del self._held[peer]
+        self._held.pop(peer, None)
         held_since = self._held_since.pop(peer, None)
         if held_since is not None:
             logger.info(
@@ -583,7 +589,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 LwdLinkHello(
                     link_version=LWD_LINK_PROTOCOL_VERSION,
                     message_version=LWD_MESSAGE_VERSION,
-                    instance_id=spec.instance_id,
+                    instance_id=connection_id.edge_id,
                     dp_rank=connection_id.dp_idx,
                     dp_size=cloud_dp_size,
                     session_id=session_id,
@@ -601,7 +607,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
     def _create_transport(self) -> LwdControlTransport:
         identities = tuple(
             lwd_edge_identity(
-                self.spec.instance_id,
+                connection_id.edge_id,
                 connection_id.dp_idx,
                 self._handshakes[connection_id].hello.session_id,
             )
@@ -730,8 +736,14 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         """The link index of the DEALER that reaches `peer`."""
-        connection_id = LwdConnectionId(
-            self.spec.instance_id, peer.instance_id, peer.dp_rank
+        connection_id = next(
+            (
+                candidate
+                for candidate in self._connection_ids
+                if (candidate.cloud_id, candidate.dp_idx)
+                == (peer.instance_id, peer.dp_rank)
+            ),
+            None,
         )
         index = self._link_indices.get(connection_id)
         return None if index is None else str(index).encode()
