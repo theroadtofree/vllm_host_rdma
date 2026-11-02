@@ -105,7 +105,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
-        self._lwd_attach_mrope_positions(out)
+        self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
 
@@ -320,12 +320,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 requested,
             )
 
-    def _lwd_attach_mrope_positions(self, out: SchedulerOutput) -> None:
+    def _lwd_attach_request_metadata(self, out: SchedulerOutput) -> None:
+        """Hand the whole-request values the edge announced to the runner."""
         for data in out.scheduled_new_reqs:
             request = self.requests.get(data.req_id)
-            if request is not None:
-                positions = getattr(request, "lwd_mrope_positions", b"")
-                data.lwd_mrope_positions = b"" if positions is None else positions
+            if request is None:
+                continue
+            positions = getattr(request, "lwd_mrope_positions", b"")
+            data.lwd_mrope_positions = b"" if positions is None else positions
+            spans = getattr(request, "lwd_image_placeholder_spans", None)
+            data.lwd_image_placeholder_spans = list(spans) if spans else []
 
     def finish_requests(
         self,

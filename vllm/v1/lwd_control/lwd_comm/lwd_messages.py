@@ -79,6 +79,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     eos_token_id: int | None = None
     """Resolved by the edge tokenizer; the cloud cannot derive it. None leaves
     `max_tokens` as the only stop condition on the cloud."""
+    image_placeholder_spans: list[int] = []
+    """Flattened `(start, length, token_id)` runs of image placeholder ids in
+    the whole prompt, for the cloud to rebuild the ids its image routing
+    reads. Empty for text-only prompts and models without them."""
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
@@ -132,6 +136,13 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_tokens: int = 0
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
+    num_draft_slots: int = 0
+    """Extra input slots per scheduled request for parallel drafting
+    (`max_num_new_slots_for_drafting`); the edge picker budgets them so the
+    cloud reproduces its chunk boundaries."""
+    engram_fingerprint: str = ""
+    """Digest of the cloud's Engram hash parameters; empty without Engram.
+    A mismatch makes the edge's bucket indices land on wrong table rows."""
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]

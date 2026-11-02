@@ -39,6 +39,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    lwd_draft_slots,
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
@@ -56,6 +57,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_decode_edge_to_cloud,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
+    LwdRequestMetadataLayout,
+    lwd_cloud_engram_fingerprint,
+)
 from vllm.v1.request import Request
 
 # Sleep between retries of a full outbound queue: step metadata must not be
@@ -158,6 +163,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_alignment_tokens=self._lwd_prefix_state.alignment_tokens,
             prefix_alignment_required=self._lwd_prefix_state.alignment_required,
             prefix_use_eagle=self._lwd_prefix_state.use_eagle,
+            num_draft_slots=lwd_draft_slots(self.vllm_config),
+            engram_fingerprint=lwd_cloud_engram_fingerprint(
+                self.vllm_config.model_config
+            ),
+        )
+        # Layout of the whole-request metadata the edge announces; checked
+        # at ingest so values that do not fit this cloud's model never reach
+        # the runner as wrong rows.
+        self._lwd_metadata_layout = LwdRequestMetadataLayout.from_model_config(
+            self.vllm_config.model_config
         )
         self._lwd_register_recv_hint()
         # Edge messages are handled off the IO thread: building a request
@@ -460,6 +475,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 notify.prefix_nonce,
             )
             return
+        # Before the request is built: metadata that does not fit this
+        # cloud's model would otherwise reach the runner as wrong rows.
+        self._lwd_metadata_layout.validate(notify)
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
@@ -599,6 +617,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             block_hasher=block_hasher if local_hasher is not None else None,
         )
         request.lwd_mrope_positions = req_notify.mrope_positions
+        request.lwd_image_placeholder_spans = req_notify.image_placeholder_spans
         request.lwd_prefix_nonce = req_notify.prefix_nonce
         request.lwd_wire_hashes_adopted = (
             local_hasher is not None and len(req_notify.block_hashes) == expected

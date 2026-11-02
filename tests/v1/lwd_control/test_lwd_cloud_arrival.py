@@ -321,7 +321,7 @@ def test_full_prompt_mrope_reaches_scheduled_new_request():
     data = SimpleNamespace(req_id="p", lwd_mrope_positions=None)
     out = SimpleNamespace(scheduled_new_reqs=[data])
 
-    scheduler._lwd_attach_mrope_positions(out)
+    scheduler._lwd_attach_request_metadata(out)
     assert data.lwd_mrope_positions == b"positions"
 
 

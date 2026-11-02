@@ -129,6 +129,9 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.network_utils import get_ip
 from vllm.utils.torch_utils import resolve_kv_cache_dtype_string
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.lwd_control.lwd_model.lwd_edge_projection import (
+    lwd_create_edge_model_config,
+)
 from vllm.v1.sample.logits_processor import LogitsProcessor
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -2083,7 +2086,10 @@ class EngineArgs:
                 )
             )
 
-        model_config = self.create_model_config()
+        if lwd_config is not None and lwd_config.role == "edge":
+            model_config = lwd_create_edge_model_config(self)
+        else:
+            model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
         self.tokenizer = model_config.tokenizer

@@ -106,6 +106,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.clear()
         for dp_idx, params in self._lwd_cloud_params.items():
             self._lwd_check_cloud_params(dp_idx, params)
+        self._lwd_adopt_cloud_draft_slots()
         self._lwd_configure_prefix_cache()
         self._lwd_coord_clients: dict[int, LwdCoordClient] = {
             dp_idx: LwdCoordClient(dp_idx, params.dp_coordinator_addr)
@@ -193,7 +194,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> None:
         """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
         rank: a mismatch makes the cloud hold prefills behind decodes forever
-        without any error."""
+        without any error. The Engram hash parameters must match too."""
         sched = self.vllm_config.scheduler_config
         local = (sched.max_num_batched_tokens, sched.max_num_seqs)
         remote = (params.max_num_batched_tokens, params.max_num_seqs)
@@ -204,7 +205,43 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
+        self._lwd_check_engram_fingerprint(dp_idx, params.engram_fingerprint)
         lwd_logger.info("[cloud-params] dp%d limits verified: %s", dp_idx, local)
+
+    def _lwd_check_engram_fingerprint(self, dp_idx: int, remote: str) -> None:
+        """The edge's Engram bucket indices must address the cloud's tables:
+        both sides derive the hash parameters from their own tokenizer and
+        config, and a mismatch would hash every prompt into wrong rows
+        without any error."""
+        local = self.scheduler.lwd_model_family.engram_fingerprint()
+        if local != remote:
+            raise RuntimeError(
+                f"[LWD] Engram fingerprint mismatch on dp{dp_idx}: "
+                f"edge={local!r} != cloud={remote!r}; the edge's bucket "
+                "indices would address wrong table rows, so serve both sides "
+                "the same model and tokenizer"
+            )
+
+    def _lwd_adopt_cloud_draft_slots(self) -> None:
+        """Adopt the cloud's per-request drafting slots: they reserve input
+        budget of cloud steps, and the edge has no legitimate local source
+        (a spec config on the edge would start the draft machinery). The
+        edge picker budgets them so both sides cut the same chunks."""
+        remote = {params.num_draft_slots for params in self._lwd_cloud_params.values()}
+        if len(remote) != 1:
+            raise RuntimeError(
+                f"[LWD] inconsistent drafting slots across cloud DP ranks: "
+                f"{sorted(remote)}"
+            )
+        draft_slots = remote.pop()
+        if draft_slots == self.scheduler._lwd_draft_slots:
+            return
+        lwd_logger.warning(
+            "[cloud-params] adopt cloud draft_slots=%d over edge local %d",
+            draft_slots,
+            self.scheduler._lwd_draft_slots,
+        )
+        self.scheduler._lwd_draft_slots = draft_slots
 
     def _lwd_send_to_cloud(self, dp_idx: int, message: LwdEdgeToCloudMessage) -> None:
         """Send to one cloud DP rank, retrying a full outbound queue; raises
@@ -311,6 +348,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        metadata = self.scheduler.lwd_model_family.request_metadata(request)
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -323,6 +361,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 ),
                 eos_token_id=sampling_params.eos_token_id,
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
+                image_placeholder_spans=metadata.image_placeholder_spans,
                 **values,
             ),
         )

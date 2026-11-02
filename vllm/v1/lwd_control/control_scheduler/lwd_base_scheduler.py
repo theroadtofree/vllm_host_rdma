@@ -37,6 +37,18 @@ def lwd_spec_factor(vllm_config) -> int:
     return (num_spec_tokens or 0) + 1
 
 
+def lwd_draft_slots(vllm_config) -> int:
+    """Extra input slots the native scheduler charges per scheduled request
+    for parallel drafting (`max_num_new_slots_for_drafting`: K-1 for DSpark,
+    0 for MTP), on top of its scheduled tokens. The cloud's chunk boundaries
+    only reproduce the edge's when both budget them; the edge adopts the
+    cloud's value from `LwdCloudParamsNotify`, like the spec factor."""
+    spec_config = getattr(vllm_config, "speculative_config", None)
+    if spec_config is None:
+        return 0
+    return spec_config.max_num_new_slots_for_drafting
+
+
 class LwdReqPhase(Enum):
     """Working phase of a request (same criterion on edge and cloud):
     PREFILL = embedding not fully sent (num_computed < num_prompt), DECODE

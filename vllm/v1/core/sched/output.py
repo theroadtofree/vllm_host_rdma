@@ -112,6 +112,10 @@ class NewRequestData:
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
     lwd_mrope_positions: bytes = b""
+    lwd_image_placeholder_spans: list[int] = field(default_factory=list)
+    """Flattened `(start, length, token_id)` runs of image placeholder ids in
+    the whole prompt; the cloud rebuilds the ids its image routing reads.
+    Empty for text-only prompts and models without them."""
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -140,6 +144,9 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             lwd_mrope_positions=getattr(request, "lwd_mrope_positions", b""),
+            lwd_image_placeholder_spans=getattr(
+                request, "lwd_image_placeholder_spans", []
+            ),
             prefill_token_ids=prefill_token_ids,
         )
 

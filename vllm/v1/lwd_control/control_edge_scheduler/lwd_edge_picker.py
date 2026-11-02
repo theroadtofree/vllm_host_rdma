@@ -35,6 +35,7 @@ def lwd_pick_prefill_batch(
     free_seq: int,
     chunk_unit: int,
     single_prefill_min_tokens: int = 0,
+    slot_overhead: int = 0,
 ) -> tuple[list[str], dict[str, int]]:
     """Pick the next embed batch, returning (req_ids, expected).
 
@@ -52,26 +53,40 @@ def lwd_pick_prefill_batch(
     (resumes included; no other entries are packed before or after it in
     the batch); 0 = disabled (DeepSeek V4 passes 8000, other models pass 0).
 
+    slot_overhead: budget each new start consumes on top of its chunk (the
+    cloud's per-request parallel-drafting slots; resumes are in flight, so
+    the caller's cap already reserves theirs); 0 = none.
+
     """
     picked: list[str] = []
     expected: dict[str, int] = {}
     if cap < 1:
         return picked, expected
-    used, single_prefill = _pick_resumes(
-        running, picked, expected, cap, chunk_unit, single_prefill_min_tokens
+    budget = _LwdPickBudget(cap, slot_overhead)
+    single_prefill = _pick_resumes(
+        running, picked, expected, budget, chunk_unit, single_prefill_min_tokens
     )
     _pick_new_requests(
         waiting,
         picked,
         expected,
-        used,
-        cap,
+        budget,
         free_seq,
         chunk_unit,
         single_prefill_min_tokens,
         single_prefill,
     )
     return picked, expected
+
+
+class _LwdPickBudget:
+    """Batch budget being filled: each new start consumes its chunk plus
+    `slot_overhead`, each resume its chunk."""
+
+    def __init__(self, cap: int, slot_overhead: int) -> None:
+        self.cap = cap
+        self.slot_overhead = slot_overhead
+        self.used = 0
 
 
 def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -> bool:
@@ -85,45 +100,46 @@ def _is_single_prefill(single_prefill_min_tokens: int, num_prompt_tokens: int) -
 def _append_chunk(
     picked: list[str],
     expected: dict[str, int],
-    used: int,
-    cap: int,
+    budget: _LwdPickBudget,
     request_id: str,
     chunk: int,
-) -> tuple[int, bool]:
-    """Pack one chunk into the batch; when used + chunk exceeds the
-    budget, fall back to tail truncation (remaining budget c = cap − used;
-    the entry joins only if c ≥ 1, and the truncated piece still consumes
-    budget). A truncation closes the batch. Returns (new used, whether
-    the batch is closed)."""
-    if used + chunk > cap:
-        c = cap - used
+    overhead: int,
+) -> bool:
+    """Pack one chunk, consuming chunk + overhead of the budget; when that
+    exceeds the budget, fall back to tail truncation (c = cap − used −
+    overhead; the entry joins only if c ≥ 1, and the truncated piece still
+    consumes budget). A truncation closes the batch. Returns whether the
+    batch is closed."""
+    if budget.used + chunk + overhead > budget.cap:
+        c = budget.cap - budget.used - overhead
         if c >= 1:
             picked.append(request_id)
             expected[request_id] = c
-            used += c
-        return used, True
+            budget.used += c + overhead
+        return True
     picked.append(request_id)
     expected[request_id] = chunk
-    return used + chunk, False
+    budget.used += chunk + overhead
+    return False
 
 
 def _pick_resumes(
     running: Sequence[LwdPrefillCandidate],
     picked: list[str],
     expected: dict[str, int],
-    cap: int,
+    budget: _LwdPickBudget,
     chunk_unit: int,
     single_prefill_min_tokens: int,
-) -> tuple[int, bool]:
+) -> bool:
     """Resume loop: walk requests in running order, each taking
-    c = min(remaining, C).
+    c = min(remaining, C). A resume is in flight already, so the caller's
+    cap has reserved its slot overhead.
 
     Exclusive rule: a qualifying request sets the single_prefill flag; if
     the batch already has entries, close it on the spot (long requests
     are never batched with short ones); the flag carries across loops
     (this batch closes, and the new-start loop packs nothing more).
-    Returns (used, single_prefill flag)."""
-    used = 0
+    Returns the single_prefill flag."""
     single_prefill = False
     for cand in running:
         if single_prefill and picked:
@@ -140,35 +156,34 @@ def _pick_resumes(
         )
         if single_prefill and picked:
             break
-        used, batch_closed = _append_chunk(
+        batch_closed = _append_chunk(
             picked,
             expected,
-            used,
-            cap,
+            budget,
             cand.request_id,
             min(remaining, chunk_unit),
+            overhead=0,
         )
         if batch_closed:
             break
-    return used, single_prefill
+    return single_prefill
 
 
 def _pick_new_requests(
     waiting: Sequence[LwdPrefillCandidate],
     picked: list[str],
     expected: dict[str, int],
-    used: int,
-    cap: int,
+    budget: _LwdPickBudget,
     free_seq: int,
     chunk_unit: int,
     single_prefill_min_tokens: int,
     single_prefill: bool,
-) -> int:
+) -> None:
     """New-start loop: take the FCFS prefix of the waiting order,
     c = min(prompt, C), new-start count ≤ free_seq; never skip the queue
-    head (preserves FCFS and seqno chain order). single_prefill is passed
-    in from the resume loop (True means this batch is already closed).
-    Returns used."""
+    head (preserves FCFS and seqno chain order). Each new start also
+    consumes the budget's slot overhead. single_prefill is passed in from
+    the resume loop (True means this batch is already closed)."""
     for new_count, cand in enumerate(waiting):
         if single_prefill and picked:
             break
@@ -183,9 +198,13 @@ def _pick_new_requests(
         chunk = min(remaining, chunk_unit)
         if new_count >= free_seq:
             break
-        used, batch_closed = _append_chunk(
-            picked, expected, used, cap, cand.request_id, chunk
+        batch_closed = _append_chunk(
+            picked,
+            expected,
+            budget,
+            cand.request_id,
+            chunk,
+            overhead=budget.slot_overhead,
         )
         if batch_closed:
             break
-    return used
