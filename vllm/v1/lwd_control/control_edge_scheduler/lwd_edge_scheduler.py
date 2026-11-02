@@ -23,7 +23,6 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -46,7 +45,6 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
-    LWD_MAX_PENDING_CHUNKS,
     LwdCloudDpAccount,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
@@ -698,7 +696,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
-        _t_mrope = time.monotonic()
         positions, _delta = self._lwd_mrope_positions_fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,

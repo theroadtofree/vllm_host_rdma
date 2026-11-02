@@ -186,7 +186,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         prefix_hash_block_size = 0
         coordination = self.lwd_config.coordination
         if (
-            vllm_config.cache_config.enable_prefix_caching
+            self.vllm_config.cache_config.enable_prefix_caching
             and coordination is not None
             and coordination.enabled
         ):
