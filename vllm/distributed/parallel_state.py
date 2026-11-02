@@ -1849,12 +1849,6 @@ def init_distributed_environment(
             )
             backend = "gloo"
         store = None
-        if config is not None and config.lwd_config is not None:
-            from vllm.distributed.lwd.lwd_topology_guard import (
-                validate_lwd_topology_pre_init,
-            )
-
-            validate_lwd_topology_pre_init(config, rank)
         if distributed_init_method.startswith("file://"):
             store = torch.distributed.FileStore(
                 distributed_init_method.removeprefix("file://"), world_size
