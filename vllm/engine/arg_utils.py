@@ -84,7 +84,12 @@ from vllm.config.kernel import (
 )
 from vllm.config.load import SafetensorsLoadStrategy
 from vllm.config.lora import MaxLoRARanks
-from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
+from vllm.config.lwd import (
+    LwdAPIConfig,
+    has_legacy_lwd_args,
+    resolve_legacy_lwd_config,
+    resolve_lwd_config,
+)
 from vllm.config.mamba import MambaBackendEnum, MambaSSUAlgorithm
 from vllm.config.model import (
     ConvertOption,
@@ -753,6 +758,15 @@ class EngineArgs:
     mamba_cache_philox_rounds: int = MambaConfig.stochastic_rounding_philox_rounds
 
     additional_config: dict[str, Any] = get_field(VllmConfig, "additional_config")
+    # Deprecated LWD inputs; used only when lwd_config.path is absent.
+    edge_npu_count: int = 0
+    cloud_npu_count: int = 0
+    cloud_dp_size: int | None = None
+    role_registry: str = ""
+    edge_id: int = 0
+    cloud_id: int = 0
+    instance_parallel_size: int = 1
+    instance_parallel_start_rank: int | None = None
     api_server_rpc_port: str | None = None
     api_server_attach: str | None = None
 
@@ -1212,6 +1226,56 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-elastic-ep", **parallel_kwargs["enable_elastic_ep"]
+        )
+        parallel_group.add_argument(
+            "--edge-npu-count",
+            type=int,
+            default=0,
+            help="Deprecated LWD edge NPU count; use lwd_config.path.",
+        )
+        parallel_group.add_argument(
+            "--cloud-npu-count",
+            type=int,
+            default=0,
+            help="Deprecated LWD cloud NPU count. Without --cloud-dp-size "
+            "this is the cross-instance total; on cloud commands with "
+            "--cloud-dp-size it is the per-engine count.",
+        )
+        parallel_group.add_argument(
+            "--instance-parallel-size",
+            type=int,
+            default=1,
+            help="Deprecated number of LWD cloud instances.",
+        )
+        parallel_group.add_argument(
+            "--instance-parallel-start-rank",
+            type=int,
+            default=None,
+            help="Deprecated cloud instance index (maps to cloud_id).",
+        )
+        parallel_group.add_argument(
+            "--cloud-dp-size",
+            type=int,
+            default=None,
+            help="Deprecated number of cloud DP engines.",
+        )
+        parallel_group.add_argument(
+            "--role-registry",
+            type=str,
+            default="",
+            help="Deprecated shared LWD role-registry YAML path.",
+        )
+        parallel_group.add_argument(
+            "--edge-id",
+            type=int,
+            default=0,
+            help="Deprecated edge instance_id (maps to lwd_config.instance_id).",
+        )
+        parallel_group.add_argument(
+            "--cloud-id",
+            type=int,
+            default=0,
+            help="Deprecated cloud instance_id (maps to lwd_config.instance_id).",
         )
         parallel_group.add_argument(
             "--elastic-ep-max-dp-size",
@@ -2053,11 +2117,16 @@ class EngineArgs:
         """
         lwd_config = None
         lwd_api = LwdAPIConfig.from_namespace(self, headless=headless)
-        if (
-            isinstance(self.additional_config, dict)
-            and "lwd_config" in self.additional_config
-        ):
-            lwd_config = resolve_lwd_config(self.additional_config, api=lwd_api)
+        additional = (
+            self.additional_config if isinstance(self.additional_config, dict) else {}
+        )
+        lwd_entry = additional.get("lwd_config")
+        has_lwd_path = isinstance(lwd_entry, dict) and bool(lwd_entry.get("path"))
+        if has_lwd_path:
+            # A new topology is authoritative; legacy flags cannot alter it.
+            lwd_config = resolve_lwd_config(additional, api=lwd_api)
+        elif has_legacy_lwd_args(self):
+            lwd_config = resolve_legacy_lwd_config(self, api=lwd_api)
         else:
             lwd_api.validate_topology(None)
         current_platform.pre_register_and_update()
@@ -2334,7 +2403,7 @@ class EngineArgs:
                     "data_parallel_backend can only be ray or mp, got %s",
                     self.data_parallel_backend,
                 )
-                lwd_enabled = "lwd_config" in (self.additional_config or {})
+                lwd_enabled = lwd_config is not None
                 if lwd_enabled:
                     # In an LWD deployment master_addr is the shared-world
                     # rendezvous host (usually the edge): the engine-level

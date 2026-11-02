@@ -14,7 +14,7 @@ from typing import TypeAlias
 
 import msgspec
 
-LWD_MESSAGE_VERSION = 3
+LWD_MESSAGE_VERSION = 5
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""

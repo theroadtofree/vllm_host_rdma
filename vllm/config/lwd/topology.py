@@ -3,7 +3,9 @@
 
 """File schema for LWD, independent of devices and distributed initialization."""
 
+import json
 from collections.abc import Hashable
+from dataclasses import asdict
 from hashlib import sha256
 from ipaddress import ip_address
 from pathlib import Path
@@ -215,17 +217,14 @@ class LwdTopology:
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
-    """First 16 hex characters of the source file digest; empty for from_dict."""
+    """First 16 hex characters of the canonical topology SHA-256 digest."""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
         try:
             file_bytes = Path(path).read_bytes()
             raw = yaml.load(file_bytes.decode("utf-8"), Loader=_UniqueKeyLoader)
-            topology = cls.from_dict(raw)
-            # The digest belongs to the loaded snapshot, not to YAML input.
-            object.__setattr__(topology, "digest", sha256(file_bytes).hexdigest()[:16])
-            return topology
+            return cls.from_dict(raw)
         except (OSError, UnicodeError, yaml.YAMLError, ValueError) as exc:
             raise ValueError(f"[LWD] Invalid topology file {path!r}: {exc}") from exc
 
@@ -233,6 +232,18 @@ class LwdTopology:
     def from_dict(cls, raw: Any) -> "LwdTopology":
         topology = TypeAdapter(cls).validate_python(raw)
         topology.validate_layout()
+        # Hash the validated semantic snapshot, never YAML spelling/layout.
+        # Exclude the derived digest field itself from the canonical payload.
+        canonical = asdict(topology)
+        canonical.pop("digest", None)
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
         return topology
 
     @field_validator("edges", "clouds")

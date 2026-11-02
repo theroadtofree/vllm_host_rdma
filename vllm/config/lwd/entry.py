@@ -43,7 +43,21 @@ class LwdConfig:
             )
         entry = TypeAdapter(_LwdEntry).validate_python(raw)
         path, role, identity = entry["path"], entry["role"], entry["instance_id"]
-        topology = LwdTopology.from_file(path)
+        return cls.from_topology(
+            path, role, identity, LwdTopology.from_file(path), api=api
+        )
+
+    @classmethod
+    def from_topology(
+        cls,
+        path: str,
+        role: str,
+        identity: int,
+        topology: LwdTopology,
+        *,
+        api: LwdAPIConfig | None = None,
+    ) -> "LwdConfig":
+        """Build an entry around an already parsed in-memory topology."""
         topology.instance(role, identity)
         coordination = None
         # coordination is embedded in each instance, not at the top level.
