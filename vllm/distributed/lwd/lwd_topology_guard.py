@@ -140,6 +140,12 @@ def validate_lwd_topology_pre_init(vllm_config: "VllmConfig", rank: int) -> None
                 remote_role,
                 remote_instance,
             )
+        # Keep the rank-0 server alive until every rank has finished reading.
+        # Destroying it immediately after the local check resets slower peers.
+        store.set(f"lwd/topology-done/{rank}", b"1")
+        if rank == 0:
+            for remote_rank in range(world_size):
+                store.get(f"lwd/topology-done/{remote_rank}")
     except Exception as exc:
         if isinstance(exc, ValueError):
             raise
