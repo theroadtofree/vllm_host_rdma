@@ -597,7 +597,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if any(item.is_refill for item in items):
             hint_fields["refills"] = [item.is_refill for item in items]
         post_irecv_hint(
-            make_recv_hint(notify.seqno, num_tokens, connection_id, **hint_fields)
+            make_recv_hint(
+                notify.seqno,
+                num_tokens,
+                connection_id=connection_id,
+                **hint_fields,
+            )
         )
 
     def _lwd_track_range(
