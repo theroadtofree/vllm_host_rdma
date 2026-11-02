@@ -33,6 +33,7 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
     LwdReqPhase,
+    lwd_draft_slots,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
@@ -87,7 +88,14 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
-        lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
+        # Input slots the native step charges per scheduled request for
+        # parallel drafting, on top of its tokens; the sole home of the
+        # formula is lwd_base_scheduler.lwd_draft_slots.
+        self._lwd_draft_slots: int = lwd_draft_slots(self.vllm_config)
+        lwd_logger.info(
+            "[cloud-sched] arrival-driven prefill/decode scheduling (draft_slots=%d)",
+            self._lwd_draft_slots,
+        )
 
     def has_requests(self) -> bool:
         """Keep the engine alive until an abort-only worker notice is sent."""
@@ -96,7 +104,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
-        room = self.max_num_scheduled_tokens - decode_exact
+        room = self._lwd_prefill_room(decode_ids, decode_exact)
         windows = self._lwd_collect_prefill_windows(room)
         if windows:
             out = self._lwd_dispatch_windows(windows, decode_ids, decode_exact)
@@ -108,6 +116,34 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
+
+    def _lwd_prefill_room(self, decode_ids: list[str], decode_exact: int) -> int:
+        """Prefill rows this step may admit, after the drafting slots.
+
+        The native step charges a second budget besides its token budget:
+        every scheduled request also spends `max_num_new_slots_for_drafting`
+        input slots, and caps each request at what is left of them. Rows that
+        ignore those slots are cut short by the native step, which costs a
+        retry per step, so they are reserved up front.
+
+        Windows are not collected yet, so prefills are charged at the number
+        of requests that could still take one. That over-reserves when fewer
+        of them have arrivals ready, which only defers rows to the next step;
+        under-reserving is what causes the native truncation.
+        """
+        room = self.max_num_scheduled_tokens - decode_exact
+        if not self._lwd_draft_slots:
+            return room
+        decoding = set(decode_ids)
+        num_prefill = sum(
+            1
+            for request in itertools.chain(
+                self.running, self.waiting, self.skipped_waiting
+            )
+            if request.request_id not in decoding
+            and request.request_id not in self._lwd_dropped
+        )
+        return room - (len(decode_ids) + num_prefill) * self._lwd_draft_slots
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [

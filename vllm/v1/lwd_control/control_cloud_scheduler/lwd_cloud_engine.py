@@ -478,6 +478,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # Before the request is built: metadata that does not fit this
         # cloud's model would otherwise reach the runner as wrong rows.
         self._lwd_metadata_layout.validate(notify)
+        if notify.image_placeholder_spans:
+            # Paired with the edge's "[engram] edge" line: the same values on
+            # the far side of the hop, so one diff tells a transport fault
+            # from a hashing one.
+            lwd_logger.info(
+                "[engram] cloud metadata req=%s prompt=%d spans=%s",
+                request_id,
+                notify.num_prompt_tokens,
+                notify.image_placeholder_spans,
+            )
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
