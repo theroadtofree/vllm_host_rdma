@@ -1277,8 +1277,9 @@ class VllmConfig:
                 # Cloud-side structured output compiles grammars and therefore
                 # needs the tokenizer even though prompt rendering stays on edge.
                 self.model_config.skip_tokenizer_init = False
-                self.multimodal_config.skip_mm_profiling = True
-                self.multimodal_config.mm_encoder_remote = True
+                if self.model_config.multimodal_config is not None:
+                    self.model_config.multimodal_config.skip_mm_profiling = True
+                    self.model_config.multimodal_config.mm_encoder_remote = True
 
         self._resolve_mm_encoder_only()
 
