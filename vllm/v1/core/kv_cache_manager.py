@@ -286,9 +286,12 @@ class KVCacheManager:
         lwd_prefix_coordinator = getattr(self, "lwd_prefix_coordinator", None)
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
-        if lwd_prefix_coordinator is not None and lwd_prefix_coordinator.has_reservation(
-            request.request_id
-        ):
+        if lwd_prefix_coordinator is not None:
+            if not lwd_prefix_coordinator.has_reservation(request.request_id):
+                # Gateway fail-open/placement-only sends the full prompt. Never
+                # fall back to hashing placeholder embeddings or renegotiating
+                # a different hit after the edge has chosen its trim boundary.
+                return self.empty_kv_cache_blocks, 0, 0
             pinned = lwd_prefix_coordinator.pinned_computed_blocks(request.request_id)
             if pinned is None:
                 return self.empty_kv_cache_blocks, 0, 0

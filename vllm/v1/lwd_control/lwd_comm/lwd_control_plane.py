@@ -266,9 +266,9 @@ class LwdControlPlane(ABC):
         self._thread: threading.Thread | None = None
         self._sender: LwdControlSender | None = None
         self._is_shut_down = False
-        # IO thread only. Each peer has an independent bounded FIFO: a full
-        # link holds back only that peer, and never stops accepting or
-        # draining payloads for the other peers.
+        # IO thread only. Each peer has an independent bounded FIFO. A full
+        # FIFO applies backpressure through the shared inproc socket rather
+        # than dropping an already-accepted payload; inbound IO stays live.
         self._num_dropped: dict[LwdPeer, int] = {}
         self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
@@ -379,9 +379,8 @@ class LwdControlPlane(ABC):
             poller.register(socket, zmq.POLLIN)
         poller.register(outbound, zmq.POLLIN)
         while not self._stop.is_set():
-            # Always drain the inproc queue. Blocked peers retain their own
-            # FIFOs; they must not prevent unrelated outbound messages from
-            # being consumed or inbound traffic from being processed.
+            # Drain the inproc queue while peer FIFOs have room. Blocked peers
+            # retain their FIFOs; inbound traffic continues to be processed.
             poller.poll(_LWD_IO_POLL_TICK_MS)
             self._drain_inbound(transport)
             if self._stop.is_set():
@@ -433,21 +432,21 @@ class LwdControlPlane(ABC):
         self, transport: LwdControlTransport, outbound: zmq.Socket
     ) -> None:
         while True:
+            # Once any peer FIFO reaches its bound, leave further messages in
+            # the inproc PULL socket. This applies backpressure to senders
+            # instead of acknowledging a message here and silently dropping it
+            # later. Inbound traffic and already-held peers are still drained.
+            if any(
+                len(queue) >= self.spec.config.send_queue_max
+                for queue in self._held.values()
+            ):
+                break
             try:
                 peer_frame, payload = outbound.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
                 break
             peer = lwd_decode_peer(peer_frame)
-            queue = self._held.setdefault(peer, deque())
-            if len(queue) >= self.spec.config.send_queue_max:
-                logger.warning(
-                    "control plane %s: per-peer FIFO for %s is full; dropping "
-                    "the newest outbound payload",
-                    self._label,
-                    peer,
-                )
-                continue
-            queue.append(payload)
+            self._held.setdefault(peer, deque()).append(payload)
 
         # Retry only each FIFO's head, preserving per-peer ordering while
         # allowing every other peer to make progress.

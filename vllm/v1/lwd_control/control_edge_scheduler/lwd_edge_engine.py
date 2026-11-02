@@ -16,6 +16,8 @@ engine. There is no self-healing: restart the whole group.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import threading
 import time
 from collections import deque
@@ -338,8 +340,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         completion: LwdProbeCompletion | None = None,
     ) -> None:
         preferred = self._lwd_preferred_connection(completion)
+        request.lwd_prefix_probe_succeeded = False
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
+            request.lwd_prefix_probe_succeeded = not coordination.placement_only
             hit = 0 if coordination.placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
             alignment = completion.result.alignment_tokens
@@ -438,6 +442,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if values["max_tokens"] is None:
             values["max_tokens"] = LWD_SAMPLING_DEFAULTS["max_tokens"]
         values["stop_token_ids"] = list(values["stop_token_ids"] or [])
+        structured_outputs = sampling_params.structured_outputs
+        structured_outputs_payload = (
+            json.dumps(dataclasses.asdict(structured_outputs))
+            if structured_outputs is not None
+            else ""
+        )
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(
@@ -451,6 +461,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 eos_token_id=sampling_params.eos_token_id,
                 prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
                 skip_reading_prefix_cache=request.skip_reading_prefix_cache,
+                prefix_hit_tokens=request.num_computed_tokens,
+                prefix_probe_succeeded=getattr(
+                    request, "lwd_prefix_probe_succeeded", False
+                ),
+                structured_outputs=structured_outputs_payload,
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
                 **values,
             ),

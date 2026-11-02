@@ -525,6 +525,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
+    @staticmethod
+    def _lwd_grammar_ready(request: Request) -> bool:
+        """Keep grammar-compiling requests out of the native visible set."""
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            return True
+        structured = request.structured_output_request
+        return bool(structured and structured.grammar)
+
     def _lwd_pick_prefill_batch(
         self, dp_idx: LwdConnectionId
     ) -> tuple[list[str], dict[str, int], int]:
@@ -556,6 +564,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
+            and self._lwd_grammar_ready(r)
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -997,11 +1006,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
-            )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params

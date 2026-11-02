@@ -1274,7 +1274,9 @@ class VllmConfig:
         if self.lwd_config is not None:
             log_lwd_config(logger, self.lwd_config)
             if self.lwd_config.role == "cloud":
-                self.model_config.skip_tokenizer_init = True
+                # Cloud-side structured output compiles grammars and therefore
+                # needs the tokenizer even though prompt rendering stays on edge.
+                self.model_config.skip_tokenizer_init = False
                 self.multimodal_config.skip_mm_profiling = True
                 self.multimodal_config.mm_encoder_remote = True
 
