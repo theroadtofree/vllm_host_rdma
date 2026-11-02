@@ -137,6 +137,7 @@ class LwdPrefixCoordinator:
         if old is None:
             raise RuntimeError(f"missing initial LWD reservation: {request.request_id}")
         manifest = old.manifest
+        prompt_chain = self._prompt_chains.get(request.request_id)
         self.discard(request.request_id)
         hit_kv_blocks = [block for group in groups for block in group]
         if hit_kv_blocks and self._kv_cache_manager is not None:
@@ -150,6 +151,8 @@ class LwdPrefixCoordinator:
             created_at=time.monotonic(),
             claimed=True,
         )
+        if prompt_chain is not None:
+            self._prompt_chains[request.request_id] = prompt_chain
 
     def truncate(self, groups, hit_tokens: int):
         managers = self._kv_cache_manager.coordinator.single_type_managers

@@ -236,6 +236,10 @@ class LwdTopology:
         # Exclude the derived digest field itself from the canonical payload.
         canonical = asdict(topology)
         canonical.pop("digest", None)
+        canonical["instance_links"] = sorted(
+            canonical["instance_links"],
+            key=lambda link: (link["edge"], link["cloud"]),
+        )
         encoded = json.dumps(
             canonical,
             sort_keys=True,
