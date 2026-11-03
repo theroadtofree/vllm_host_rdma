@@ -814,6 +814,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 self._lwd_retired_prompt_lens[request_id] = prompt_len
 
     def _lwd_clear_retired(self, request_id: str) -> None:
+        if any(request_id in notify.req_ids for notify in self.scheduler.pending_c2e):
+            # A final or zero-accepted notification still needs the original
+            # route. Keep the tombstone until post_step has flushed it.
+            self._lwd_retired_req_ids.add(request_id)
+            return
+        self._lwd_request_routes.pop(request_id, None)
         self._lwd_retired_req_ids.discard(request_id)
         self._lwd_retired_prompt_lens.pop(request_id, None)
         getattr(self, "_lwd_retired_nonces", {}).pop(request_id, None)
@@ -1120,6 +1126,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
         if self.scheduler.pending_c2e:
+            finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
                 if not notify.req_ids:
                     continue
@@ -1138,15 +1145,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     req_ids=[unwrap_req_id(request_id) for request_id in notify.req_ids],
                 )
                 self._lwd_send_until_queued(peer, restored)
-                # Finished routes have no later result. Other routes stay pinned
-                # for every chunk and result of the request lifetime.
+                # Finished routes stay pinned until every pending C2E has
+                # flushed; later zero-accepted/retirement notices are legal.
                 for index, request_id in enumerate(notify.req_ids):
                     if (
                         notify.finish_reasons
                         and notify.finish_reasons[index] != -1
                     ):
-                        self._lwd_request_routes.pop(request_id, None)
+                        finished_ids.append(request_id)
             self.scheduler.pending_c2e.clear()
+            for request_id in finished_ids:
+                self._lwd_clear_retired(request_id)
         super().post_step(model_executed)
 
 
