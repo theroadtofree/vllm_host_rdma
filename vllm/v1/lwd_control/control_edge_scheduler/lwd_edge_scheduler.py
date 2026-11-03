@@ -202,6 +202,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     (
                         self._lwd_connections.index(account.connection_id)
                         - self._lwd_last_engine
+                        - 1
                     )
                     % len(accounts),
                 ),
