@@ -326,21 +326,11 @@ class LwdTopology:
             )
 
     def _validate_control_ports(self) -> None:
+        # Every cloud DP binds its ctrl_port on all interfaces, so two DPs on
+        # the same address must not share a port. Ports may repeat across
+        # addresses (their namespaces are independent), which also covers
+        # edge_share clouds hosted on distinct machines.
         dps = [dp for cloud in self.clouds for dp in cloud.dp]
-        if self.deployment.scene == "edge_share":
-            # These are shared per-DP channel references, not cloud bind addresses.
-            ports: dict[int, int | None] = {}
-            for dp in dps:
-                if ports.setdefault(dp.dp_idx, dp.ctrl_port) != dp.ctrl_port:
-                    raise ValueError(
-                        "[LWD] edge_share requires the same ctrl_port for "
-                        "the same DP across all cloud instances"
-                    )
-            if len(set(ports.values())) != len(ports):
-                raise ValueError(
-                    "[LWD] edge_share requires different ctrl_port values per DP"
-                )
-            return
         if len({(dp.addr, dp.ctrl_port) for dp in dps}) != len(dps):
             raise ValueError(
                 "[LWD] Cloud DPs on the same address must use "
