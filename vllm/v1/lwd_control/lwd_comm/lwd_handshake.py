@@ -52,6 +52,11 @@ class LwdEdgeHandshake:
             and now - self._last_accept_at >= timeout_s
         )
 
+    def touch(self) -> None:
+        """Refresh cloud liveness after any authenticated inbound frame."""
+        if self.completed:
+            self._last_accept_at = time.monotonic()
+
     def disconnect(self) -> None:
         self.cloud = None
         self._last_accept_at = None

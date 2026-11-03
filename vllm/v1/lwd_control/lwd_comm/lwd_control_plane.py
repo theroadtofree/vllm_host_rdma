@@ -731,7 +731,11 @@ class LwdEdgeControlPlane(LwdControlPlane):
         handshake = self._handshakes.get(connection_id)
         if handshake is None:
             return None
-        return handshake.cloud
+        cloud = handshake.cloud
+        if cloud is not None:
+            # Any authenticated frame proves the peer is alive, not only Accept.
+            handshake.touch()
+        return cloud
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         """The link index of the DEALER that reaches `peer`."""
