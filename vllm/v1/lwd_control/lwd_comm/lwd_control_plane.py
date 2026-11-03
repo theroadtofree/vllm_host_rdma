@@ -272,7 +272,6 @@ class LwdControlPlane(ABC):
         self._num_dropped: dict[LwdPeer, int] = {}
         self._held: dict[LwdPeer, deque[bytes]] = {}
         self._held_since: dict[LwdPeer, float] = {}
-        self._heartbeat_timeout_s = max(3.0 * spec.config.hello_retry_interval_s, 1.0)
 
     @property
     def registered_peers(self) -> frozenset[LwdPeer]:
@@ -753,13 +752,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
         for connection_id, handshake in self._handshakes.items():
-            cloud = handshake.cloud
-            if cloud is not None and handshake.heartbeat_expired(
-                now, self._heartbeat_timeout_s
-            ):
-                handshake.disconnect()
-                self._unregister_peer(cloud, "cloud heartbeat timed out")
-            if not handshake.should_send_hello(now):
+            if handshake.completed or not handshake.should_send_hello(now):
                 continue
             hello = lwd_encode_link_message(handshake.hello)
             link_index = self._link_indices[connection_id]
@@ -860,9 +853,9 @@ class LwdCloudControlPlane(LwdControlPlane):
             self._unregister_peer(peer, "ROUTER reported the DEALER unreachable")
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
-        for peer in self._handshake.expired_peers(now, self._heartbeat_timeout_s):
-            self._handshake.drop_peer(peer)
-            self._unregister_peer(peer, "edge heartbeat timed out")
+        # Static deployments use startup handshake and explicit socket errors;
+        # idle periods never invalidate an established peer.
+        return None
 
     def _outbound_identity(self, peer: LwdPeer) -> bytes | None:
         identity = self._handshake.identity_of(peer)

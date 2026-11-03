@@ -45,13 +45,6 @@ class LwdEdgeHandshake:
             or now - self._last_hello_at >= self._hello_retry_interval_s
         )
 
-    def heartbeat_expired(self, now: float, timeout_s: float) -> bool:
-        return (
-            self.completed
-            and self._last_accept_at is not None
-            and now - self._last_accept_at >= timeout_s
-        )
-
     def touch(self) -> None:
         """Refresh cloud liveness after any authenticated inbound frame."""
         if self.completed:
@@ -195,13 +188,6 @@ class LwdCloudHandshake:
             return None
         self._sessions_by_identity.pop(session.identity, None)
         return session.identity
-
-    def expired_peers(self, now: float, timeout_s: float) -> list[LwdPeer]:
-        return [
-            session.peer
-            for session in self._sessions_by_peer.values()
-            if now - session.last_seen >= timeout_s
-        ]
 
     def _accept(self, hello: LwdLinkHello) -> LwdLinkAccept:
         return LwdLinkAccept(
