@@ -598,7 +598,7 @@ def run_attach_api_server(args: Any) -> None:
             wait_for_completion_or_failure,
         )
 
-        listen_address, sock = setup_server(args)
+        listen_address, sock = setup_server(args, reuse_port=False)
         bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
         manager = APIServerProcessManager(
             listen_address=listen_address,
