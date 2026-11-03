@@ -68,6 +68,7 @@ from vllm.v1.request import Request
 # Sleep between retries of a full outbound queue: step metadata must not be
 # lost, the edge posts its receive of the exact size from it.
 _LWD_SEND_RETRY_SLEEP_S = 0.05
+_LWD_RETIRED_ROUTE_CAP = 4096
 
 
 def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
@@ -172,6 +173,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_retired_req_ids: set[str] = set()
         self._lwd_rejected_nonces: dict[str, int] = {}
         self._lwd_request_routes: dict[str, LwdPeer] = {}
+        self._lwd_retired_routes: dict[str, LwdPeer] = {}
         self._lwd_pending_seqnos: dict[
             LwdConnectionId, dict[int, set[str]]
         ] = {}
@@ -511,6 +513,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         canonical_id = wrap_req_id(peer.instance_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=canonical_id)
         if isinstance(msg, LwdRequestNotify):
+            self._lwd_retired_routes.pop(canonical_id, None)
             self._lwd_request_routes[canonical_id] = peer
             self._lwd_handle_request_notify(msg)
         elif isinstance(msg, LwdAbortNotify):
@@ -819,7 +822,13 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             # route. Keep the tombstone until post_step has flushed it.
             self._lwd_retired_req_ids.add(request_id)
             return
-        self._lwd_request_routes.pop(request_id, None)
+        route = self._lwd_request_routes.pop(request_id, None)
+        if route is not None:
+            # DOWN metadata can trail native request retirement by one or more
+            # asynchronous steps. Keep a bounded tombstone for those batches.
+            self._lwd_retired_routes[request_id] = route
+            while len(self._lwd_retired_routes) > _LWD_RETIRED_ROUTE_CAP:
+                self._lwd_retired_routes.pop(next(iter(self._lwd_retired_routes)))
         self._lwd_retired_req_ids.discard(request_id)
         self._lwd_retired_prompt_lens.pop(request_id, None)
         getattr(self, "_lwd_retired_nonces", {}).pop(request_id, None)
@@ -1132,6 +1141,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     continue
                 peers = {
                     self._lwd_request_routes.get(request_id)
+                    or self._lwd_retired_routes.get(request_id)
                     for request_id in notify.req_ids
                 }
                 if len(peers) != 1 or None in peers:
