@@ -119,6 +119,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # this edge connects to several clouds.
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
+        self._lwd_instance_id = lwd_config.instance_id
+        self._lwd_edge_share = (
+            lwd_config.topology.deployment.scene == "edge_share"
+        )
         connections = tuple(
             sorted(c.connection_id for c in lwd_config.connections)
         )
@@ -184,19 +188,41 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         (a late result racing its own finish)."""
         return self._lwd_route.get(request_id)
 
+    def _lwd_edge_id_of(self, request: Request) -> int:
+        """Logical edge id owning the request. In edge_share the shared edge
+        engine serves every logical frontend, whose identity is the attach
+        client_index; a standalone edge process owns exactly its
+        instance_id."""
+        if self._lwd_edge_share:
+            return request.client_index
+        return self._lwd_instance_id
+
     def _lwd_route_request(
-        self, request_id: str, preferred: LwdConnectionId | None = None
+        self, request_id: str, edge_id: int, preferred: LwdConnectionId | None = None
     ) -> LwdConnectionId:
-        """Pick and pin the target connection. A healthy preferred route wins
-        when supplied; otherwise score and ordered round-robin decide."""
+        """Pick and pin the target connection for the requesting edge. Only
+        connections originating at edge_id are candidates (the shared
+        edge_share engine would otherwise balance every logical edge's
+        request across every cloud); a healthy preferred route wins when
+        supplied, otherwise score and ordered round-robin decide."""
         accounts = self._lwd_accounts
-        if preferred is not None and preferred in accounts:
-            best = accounts[preferred]
-        elif len(accounts) == 1:
-            best = accounts[self._lwd_connections[0]]
+        candidates = {
+            connection_id: accounts[connection_id]
+            for connection_id in self._lwd_connections
+            if connection_id.edge_id == edge_id
+        }
+        if not candidates:
+            raise RuntimeError(
+                f"[LWD] no cloud connection for edge_id={edge_id} "
+                f"(request {request_id})"
+            )
+        if preferred is not None and preferred in candidates:
+            best = candidates[preferred]
+        elif len(candidates) == 1:
+            best = next(iter(candidates.values()))
         else:
             best = min(
-                accounts.values(),
+                candidates.values(),
                 key=lambda account: (
                     account.score(),
                     (
@@ -204,15 +230,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         - self._lwd_last_engine
                         - 1
                     )
-                    % len(accounts),
+                    % len(self._lwd_connections),
                 ),
             )
         connection_id = best.connection_id
         self._lwd_route[request_id] = connection_id
         best.note_prefill_admitted(request_id)
         lwd_logger.info(
-            "[edge-route] req=%s -> %s (score=%d loads=%s)",
+            "[edge-route] req=%s edge=%d -> %s (score=%d loads=%s)",
             request_id,
+            edge_id,
             connection_id,
             best.score(),
             [(a.prefill_load, a.decode_load) for a in accounts.values()],
@@ -637,7 +664,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         engine path (the ledger is pruned in the abort_requests override)."""
         self._lwd_validate_request(request)
         self._lwd_compute_mrope_positions(request)
-        return self._lwd_route_request(request.request_id, preferred)
+        return self._lwd_route_request(
+            request.request_id, self._lwd_edge_id_of(request), preferred
+        )
 
     def lwd_edge_prefix_ready(self, request: Request, hit_tokens: int) -> bool:
         hash_block_size = self._lwd_prefix_hash_block_size
