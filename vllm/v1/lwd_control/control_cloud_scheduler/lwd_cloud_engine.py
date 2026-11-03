@@ -83,6 +83,36 @@ def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | No
     return params
 
 
+def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
+    """Full-payload log of one cloud->edge control-plane message once queued
+    for the peer; pairs with the edge-side `[edge] c2e received` log. The
+    per-step c2e notify gets per-row detail (top tree / token payloads are
+    reduced to lengths to bound log volume)."""
+    if isinstance(message, LwdC2eNotify):
+        lwd_logger.info(
+            "[cloud] c2e sent to edge %s seqno=%d reqs=%d hidden_numel=%d "
+            "req_ids=%s accepted=%s finish=%s nonces=%s top_tree_lens=%s "
+            "token_lens=%s",
+            peer,
+            message.down_seqno,
+            len(message.req_ids),
+            message.hidden_num_elements,
+            message.req_ids,
+            message.num_accepted_tokens,
+            message.finish_reasons,
+            message.prefix_nonces,
+            [len(top) for top in message.top_id_ths],
+            [len(tokens) for tokens in message.token_ids],
+        )
+    else:
+        lwd_logger.info(
+            "[cloud] %s sent to edge %s: %s",
+            type(message).__name__,
+            peer,
+            message,
+        )
+
+
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     """The LWD seams of a cloud engine, shared by both engine bases."""
 
@@ -303,6 +333,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 return
             time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        _lwd_log_sent_to_edge(peer, message)
 
     def _lwd_send_prefix_ready(
         self, request_id: str, hit_tokens: int, nonce: int, error: str = ""
