@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     VLLM_CONFIGURE_LOGGING: bool = True
     VLLM_LOGGING_LEVEL: str = "INFO"
     VLLM_LWD_LOG_LEVEL: str = "DISABLE"
+    VLLM_LWD_CLOUD_API_KEY: str | None = None
     VLLM_LOGGING_PREFIX: str = ""
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
@@ -836,6 +837,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Valid values: disable, debug, info, warning, error, critical.
     # Default: disable.
     "VLLM_LWD_LOG_LEVEL": lambda: os.getenv("VLLM_LWD_LOG_LEVEL", "DISABLE").upper(),
+    # Bearer token for the LWD cloud gateway. None (unset) means the edge
+    # sends no Authorization header.
+    "VLLM_LWD_CLOUD_API_KEY": lambda: os.getenv("VLLM_LWD_CLOUD_API_KEY"),
     # this is used for configuring the default logging stream
     "VLLM_LOGGING_STREAM": lambda: os.getenv("VLLM_LOGGING_STREAM", "ext://sys.stdout"),
     # if set, VLLM_LOGGING_PREFIX will be prepended to all log messages
@@ -2291,6 +2295,7 @@ def compile_factors() -> dict[str, object]:
         # Credential; never affects compiled artifacts and must not be
         # persisted in cache_key_factors.json.
         "VLLM_API_KEY",
+        "VLLM_LWD_CLOUD_API_KEY",
         "VLLM_USAGE_STATS_SERVER",
         "VLLM_NO_USAGE_STATS",
         "VLLM_DO_NOT_TRACK",
