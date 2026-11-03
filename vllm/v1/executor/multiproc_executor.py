@@ -989,6 +989,17 @@ class WorkerProc:
         ready_event = getattr(inner, "lwd_meta_ready_event", None)
         if ready_event is not None:
             delattr(inner, "lwd_meta_ready_event")
+        ready_events = getattr(inner, "lwd_meta_ready_events", None)
+        if ready_events is not None:
+            delattr(inner, "lwd_meta_ready_events")
+        carriers = getattr(inner, "lwd_down_carriers", None)
+        if carriers:
+            harvested = [
+                self._lwd_harvest_connection_carrier(carrier, ready_events)
+                for carrier in carriers
+            ]
+            inner.lwd_down_carriers = harvested
+            inner.lwd_down_carrier = harvested[0][:4]
         carrier = getattr(inner, "lwd_down_carrier", None)
         if carrier is not None and len(carrier) == 5:
             if ready_event is None:
@@ -1038,6 +1049,53 @@ class WorkerProc:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+
+    def _lwd_harvest_connection_carrier(self, carrier: Any, ready_events: Any) -> tuple:
+        """Harvest one multi-connection DOWN carrier behind its ready event.
+
+        Device-side input is (meta_dev, seg_lens_host, req_ids, hidden_numel,
+        seqno, connection); the returned host carrier keeps the connection
+        tag with the pinned [meta|seg_lens] buffer. Each connection owns its
+        pinned buffer so same-step carriers stay valid until the scheduler
+        consumes them.
+        """
+        if len(carrier) != 6:
+            # Already host-side; nothing to harvest.
+            return carrier
+        meta_dev, seg_lens_host, req_ids, hidden_numel, seqno, connection = carrier
+        ready_event = ready_events.get(connection) if ready_events else None
+        if ready_event is None:
+            raise RuntimeError("LWD DOWN carrier is missing its ready event")
+        stream = getattr(self, "_lwd_harvest_stream", None)
+        if stream is None:
+            stream = self._lwd_harvest_stream = torch.npu.Stream()
+        n_dev = meta_dev.numel()
+        n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
+        n_meta = n_dev + n_seg
+        buffers = getattr(self, "_lwd_harvest_pinned_by_connection", None)
+        if buffers is None:
+            buffers = self._lwd_harvest_pinned_by_connection = {}
+        buf = buffers.get(connection)
+        if buf is None or buf.numel() < n_meta:
+            buf = buffers[connection] = torch.empty(
+                max(n_meta, 4096), dtype=torch.int32, pin_memory=True
+            )
+        started = time.monotonic()
+        with torch.npu.stream(stream):
+            stream.wait_event(ready_event)
+            buf[:n_dev].copy_(meta_dev, non_blocking=True)
+            done = torch.npu.Event()
+            done.record()
+        done.synchronize()
+        if n_seg:
+            buf.numpy()[n_dev:n_meta] = seg_lens_host
+        lwd_logger.info(
+            "[Lwd][perf] meta-harvest connection=%s dur=%.2fms ts=%.3f",
+            connection,
+            (time.monotonic() - started) * 1000,
+            time.monotonic(),
+        )
+        return (buf[:n_meta], req_ids, hidden_numel, seqno, connection)
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
