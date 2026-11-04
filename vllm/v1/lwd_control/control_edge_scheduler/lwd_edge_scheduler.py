@@ -129,6 +129,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_route: dict[str, int] = {}
         """Request id -> dp_idx, pinned at admission, never changes."""
         self._lwd_last_engine = -1
+        self._lwd_dispatch_stall: str | None = None
+        """Reason the edge last stopped producing EMBED batches, for
+        transition logging only."""
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
@@ -246,6 +249,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if dp_idx < len(self._lwd_accounts)
         }
         if not routed:
+            self._lwd_note_dispatch_stall("no-routed-work")
             return None
         num_engines = len(self._lwd_accounts)
         for offset in range(num_engines):
@@ -260,8 +264,34 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 self._lwd_log_gate_transition(account)
                 continue
             self._lwd_last_engine = dp_idx
+            self._lwd_note_dispatch_stall(None)
             return dp_idx
+        self._lwd_note_dispatch_stall(
+            "all-gated: "
+            + " ".join(
+                f"dp{account.dp_idx}(load={account.load}/{self.max_num_running_reqs},"
+                f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
+                f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
+                for account in self._lwd_accounts
+                if account.dp_idx in routed
+            )
+        )
         return None
+
+    def _lwd_note_dispatch_stall(self, reason: str | None) -> None:
+        """Log why the edge stopped (or resumed) producing EMBED batches.
+
+        A stall that no later event clears is the shape of an edge/cloud
+        deadlock: the cloud keeps accepting requests it can never get UP
+        rows for. Only transitions are logged, so a steady idle edge stays
+        quiet."""
+        if reason == self._lwd_dispatch_stall:
+            return
+        self._lwd_dispatch_stall = reason
+        if reason is None:
+            lwd_logger.info("[edge-sched] dispatch resumed")
+            return
+        lwd_logger.info("[edge-sched] dispatch stalled: %s", reason)
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
         held = account.pending_chunks() >= account.max_pending_chunks
@@ -293,6 +323,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return self._lwd_schedule_abort_notice()
         out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
+            # An ungated engine that still yields nothing: the picker found
+            # no candidate it could cut a chunk for. Left silent this looks
+            # exactly like an idle edge, while the cloud waits on UP rows
+            # that are never produced.
+            self._lwd_note_dispatch_stall(
+                f"empty-batch dp{dp_idx}: "
+                f"{self._lwd_describe_candidates(dp_idx)}"
+            )
             return self._lwd_schedule_abort_notice()
         self.lwd_edge_notify_range(dp_idx, out)
         return out
@@ -413,12 +451,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 request = self.requests.get(request_id)
                 current_nonce = getattr(request, "lwd_prefix_nonce", 0)
                 if request is None or prefix_nonces[index] != current_nonce:
+                    # "gone" = the request already left self.requests, which
+                    # is reachable with prefix caching off (both nonces 0);
+                    # "nonce" = a genuinely superseded generation.
                     lwd_logger.warning(
                         "[edge-deliver] drop stale generation req=%s nonce=%d "
-                        "current=%d",
+                        "current=%d cause=%s routed=%s",
                         request_id,
                         prefix_nonces[index],
                         current_nonce,
+                        "gone" if request is None else "nonce",
+                        self._lwd_dp_of_settling(request_id),
                     )
                     continue
             finish_reason = self._lwd_finish_code(notify, index)
@@ -526,6 +569,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
         ]
+        self._lwd_last_candidates = (len(running), len(waiting), free_seq, cap)
         req_ids, expected = lwd_pick_prefill_batch(
             running,
             waiting,
@@ -541,6 +585,33 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             slot_overhead=self._lwd_draft_slots,
         )
         return req_ids, expected
+
+    def _lwd_describe_candidates(self, dp_idx: int) -> str:
+        """The picker inputs of the last pick for dp_idx, plus the routed
+        requests it had to choose from: enough to tell a starved queue from
+        a budget that admits nothing."""
+        running, waiting, free_seq, cap = getattr(
+            self, "_lwd_last_candidates", (-1, -1, -1, -1)
+        )
+        routed = [
+            request_id
+            for request_id, routed_dp in self._lwd_route.items()
+            if routed_dp == dp_idx
+        ]
+        unsent = [
+            request.request_id
+            for request in self.running
+            if self._lwd_route.get(request.request_id) == dp_idx
+            and not request.is_finished()
+            and request.num_computed_tokens < request.num_prompt_tokens
+        ]
+        return (
+            f"running={running} waiting={waiting} free_seq={free_seq} cap={cap} "
+            f"chunk_unit={self._lwd_chunk_unit} slots={self._lwd_draft_slots} "
+            f"routed={len(routed)} unsent={len(unsent)} "
+            f"sched_running={len(self.running)} sched_waiting={len(self.waiting)} "
+            f"skipped={len(self.skipped_waiting)} requests={len(self.requests)}"
+        )
 
     def _lwd_schedule_batch(self, dp_idx: int) -> SchedulerOutput:
         """Chunk batch assembly: the picker selects the batch of one engine,
@@ -626,6 +697,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         a seqno of that engine is only taken by a notify that was sent."""
         built = self._lwd_build_range_items(scheduler_output.num_scheduled_tokens)
         if built is None:
+            # Scheduled tokens that produced no range item: every scheduled
+            # request vanished from self.requests between the pick and here.
+            # The batch is dropped without taking a seqno, so the cloud
+            # never learns of it -- never seen, but silent if it happens.
+            lwd_logger.warning(
+                "[edge] range dropped dp%d: scheduled=%s none are live",
+                dp_idx,
+                sorted(scheduler_output.num_scheduled_tokens),
+            )
             return
         items, req_ids, token_slices, prompt_offsets, has_mrope = built
         account = self._lwd_accounts[dp_idx]

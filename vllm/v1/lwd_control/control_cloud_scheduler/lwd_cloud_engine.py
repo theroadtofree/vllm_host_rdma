@@ -68,6 +68,11 @@ from vllm.v1.request import Request
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 
+# Admitted requests with no UP rows for this long, while nothing runs, is
+# an edge/cloud stall rather than a slow edge: a healthy edge keeps the
+# data plane moving well inside this window.
+LWD_ARRIVAL_STARVATION_S = 30.0
+
 
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
@@ -148,6 +153,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_pending_seqnos: dict[int, set[str]] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqno = -1
+        self._lwd_last_arrival_ts = time.monotonic()
+        self._lwd_starved_since: float | None = None
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits are checked by the edge. The coordinator address
         # lets the edge
@@ -651,6 +658,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Drain the early-recv watermark at the head of the step (done
         MQ -> gate readiness predicate); the rest is native."""
         self._lwd_drain_irecv_completions()
+        self._lwd_check_starvation()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
@@ -659,6 +667,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Same for the synchronous step path: drain the watermark at
         the head of the step, the rest is native."""
         self._lwd_drain_irecv_completions()
+        self._lwd_check_starvation()
         engine_core_outputs, model_executed = super().step()
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
@@ -672,6 +681,35 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             for output in outputs.outputs:
                 if output.finish_reason is not None:
                     self._lwd_retire_request(output.request_id)
+
+    def _lwd_check_starvation(self) -> None:
+        """Report a cloud that holds admitted requests but receives no UP
+        rows for them.
+
+        The edge and the cloud can disagree silently: the control plane
+        keeps admitting requests while the data plane stopped delivering,
+        and both sides then look healthy (no error, health 200) while
+        nothing runs. Log the transition so the stall is visible from the
+        cloud alone, with the edge's view of it unavailable here."""
+        waiting = len(self.scheduler.waiting)
+        if not waiting or self.scheduler.running:
+            self._lwd_starved_since = None
+            return
+        idle_s = time.monotonic() - self._lwd_last_arrival_ts
+        if idle_s < LWD_ARRIVAL_STARVATION_S:
+            return
+        if self._lwd_starved_since is not None:
+            return
+        self._lwd_starved_since = time.monotonic()
+        lwd_logger.warning(
+            "[cloud] UP starvation: waiting=%d running=0 for %.0fs, "
+            "pending_seqnos=%s latest_seqno=%d; the edge admitted these "
+            "requests but sent no rows for them",
+            waiting,
+            idle_s,
+            sorted(self._lwd_pending_seqnos),
+            self._lwd_latest_seqno,
+        )
 
     def _lwd_drain_irecv_completions(self) -> None:
         """Merge done-MQ arrivals into per-request rows and UP watermarks."""
@@ -719,6 +757,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if not watermark_items:
             return
         advanced = record_irecv_completions(watermark_items)
+        if advanced:
+            self._lwd_last_arrival_ts = time.monotonic()
         for _channel, seqno in advanced:
             self._lwd_complete_seqno(seqno)
         lwd_logger.info(
