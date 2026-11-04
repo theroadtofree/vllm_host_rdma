@@ -30,6 +30,8 @@ class LwdCloudDpAccount:
         max_pending_chunks: int = LWD_MAX_PENDING_CHUNKS,
     ) -> None:
         self.dp_idx = dp_idx
+        self.max_pending_chunks = max_pending_chunks
+        """Pending chunk cap of this engine's prefill gate."""
         self.seqno = 0
         """Next UP pairing number of this engine; taken only by a range
         notify that was sent."""
@@ -128,4 +130,4 @@ class LwdCloudDpAccount:
             return False
         if self.load >= max_num_running_reqs:
             return True
-        return self.pending_chunks() >= LWD_MAX_PENDING_CHUNKS
+        return self.pending_chunks() >= self.max_pending_chunks
