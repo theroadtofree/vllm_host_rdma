@@ -73,10 +73,6 @@ _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 # data plane moving well inside this window.
 LWD_ARRIVAL_STARVATION_S = 30.0
 
-# The arrival reader blocks on the done MQ in this slice; it only bounds
-# how fast the thread notices shutdown, not arrival latency.
-LWD_ARRIVAL_POLL_S = 0.5
-
 
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
@@ -128,18 +124,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 f"completions, got {len(handles)}"
             )
         self._lwd_done_mq = MessageQueue.create_from_handle(handles[0], 0)
-        # Only now does the MQ exist: _lwd_assemble ran inside the super
-        # constructor above, so the reader cannot start with the rest.
-        self._lwd_arrival_thread = threading.Thread(
-            target=self._lwd_arrival_reader_loop,
-            name="lwd-cloud-arrival",
-            daemon=True,
-        )
-        self._lwd_arrival_thread.start()
-        lwd_logger.info(
-            "[pre-recv] hint MQ created, done MQ attached via RPC, "
-            "arrival reader started"
-        )
+        lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
 
     def _lwd_init_prefix_cache(self) -> None:
         state = init_lwd_prefix_cache(
@@ -158,9 +143,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _lwd_assemble(self) -> None:
         self._lwd_init_prefix_cache()
         self._lwd_ingest_thread: threading.Thread | None = None
-        # The reader itself starts once the done MQ exists, after this.
-        self._lwd_arrival_stop = threading.Event()
-        self._lwd_arrival_queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self._lwd_edge: LwdPeer | None = None
         self._lwd_prompt_lens: dict[str, int] = {}
         self._lwd_retired_prompt_lens: dict[str, int] = {}
@@ -380,31 +362,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 self._lwd_fail(f"ingest of {type(item[1]).__name__}: {e!r}")
                 return
-
-    def _lwd_arrival_reader_loop(self) -> None:
-        """Move done-MQ arrivals to the engine and wake it.
-
-        The done MQ is a side channel the native loop knows nothing about:
-        an engine with nothing running has no work by the native predicate
-        and blocks on its input queue, while the step that drains arrivals
-        is exactly what a blocked engine never reaches. Admitted requests
-        then wait forever on rows that already arrived. Reading here makes
-        an arrival a wakeup source like any edge message; the engine
-        thread still does all the bookkeeping, off the handoff queue."""
-        done_mq = self._lwd_done_mq
-        while not self._lwd_arrival_stop.is_set():
-            try:
-                item = done_mq.dequeue(timeout=LWD_ARRIVAL_POLL_S)
-            except TimeoutError:
-                continue
-            except Exception:
-                if self._lwd_arrival_stop.is_set():
-                    return
-                lwd_logger.exception("[pre-recv] arrival reader failed")
-                self._lwd_fail("[LWD] arrival reader failed")
-                return
-            self._lwd_arrival_queue.put(item)
-            self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
     def _lwd_handle_edge_message(
         self, peer: LwdPeer, msg: LwdEdgeToCloudMessage
@@ -637,12 +594,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if self._lwd_ingest_thread is not None:
             self._lwd_ingest_queue.put(None)
             self._lwd_ingest_thread.join(_LWD_INGEST_JOIN_TIMEOUT_S)
-        # Started after _lwd_assemble, so a failed startup reaches here
-        # without it.
-        arrival_thread = getattr(self, "_lwd_arrival_thread", None)
-        if arrival_thread is not None:
-            self._lwd_arrival_stop.set()
-            arrival_thread.join(_LWD_INGEST_JOIN_TIMEOUT_S)
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
@@ -761,12 +712,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def _lwd_drain_irecv_completions(self) -> None:
-        """Merge arrivals into per-request rows and UP watermarks.
-
-        The reader thread owns the done MQ and hands completions over, so
-        an arrival wakes the engine even when it has nothing to run."""
-        arrivals = getattr(self, "_lwd_arrival_queue", None)
-        if arrivals is None:
+        """Merge done-MQ arrivals into per-request rows and UP watermarks."""
+        done_mq = getattr(self, "_lwd_done_mq", None)
+        if done_mq is None:
             return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             record_irecv_completions,
@@ -775,8 +723,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         items: list[Any] = []
         while True:
             try:
-                items.append(arrivals.get_nowait())
-            except queue.Empty:
+                items.append(done_mq.dequeue(timeout=0))
+            except TimeoutError:
+                break
+            except Exception:
+                lwd_logger.exception("[pre-recv] done MQ drain failed")
                 break
         watermark_items: list[Any] = []
         for item in items:
