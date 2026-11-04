@@ -23,6 +23,7 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -86,6 +87,10 @@ _LWD_FINISH_STATUS = {
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
 
+# Step-activity report interval: slow enough to stay out of the way, fast
+# enough that a stall is bounded by one line rather than inferred.
+LWD_STEP_REPORT_S = 5.0
+
 
 def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
     scheduler_config = copy.copy(vllm_config)
@@ -134,6 +139,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         transition logging only."""
         self._lwd_drift_seen: set[int] = set()
         """Engines already reported as having drifted books."""
+        self._lwd_steps = 0
+        self._lwd_embed_batches = 0
+        self._lwd_unembed_batches = 0
+        self._lwd_last_step_report = time.monotonic()
+        self._lwd_unembed_blocked = False
+        self._lwd_unembed_blocked_since = 0.0
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
@@ -270,6 +281,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """Dispatch refills and EMBED batches before consuming cloud results."""
+        self._lwd_steps += 1
+        now = time.monotonic()
+        if now - self._lwd_last_step_report >= LWD_STEP_REPORT_S:
+            # Separates "the engine stopped stepping" from "it steps but
+            # produces nothing": the stall reasons look identical in the
+            # log otherwise, and only the latter can consume c2e.
+            lwd_logger.info(
+                "[edge-sched] steps=%d embed=%d unembed=%d c2e_queued=%d "
+                "refills=%d",
+                self._lwd_steps,
+                self._lwd_embed_batches,
+                self._lwd_unembed_batches,
+                len(self.unembed_notify_queue),
+                len(self._lwd_pending_refills),
+            )
+            self._lwd_last_step_report = now
         if self._lwd_pending_refills:
             return self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
         LwdControlDiag.edge_step_activity(
@@ -278,6 +305,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         out = self._lwd_schedule_embed()
         if out is not None:
+            self._lwd_embed_batches += 1
+            if self.unembed_notify_queue and not self._lwd_unembed_blocked:
+                # EMBED wins every step it produces anything, so a c2e can
+                # wait here indefinitely. A delivery is the only thing that
+                # moves load off the prefill books, so this starves the
+                # gate that admits new work.
+                self._lwd_unembed_blocked = True
+                self._lwd_unembed_blocked_since = time.monotonic()
+                lwd_logger.warning(
+                    "[edge-sched] unembed starved: c2e_queued=%d while EMBED "
+                    "keeps winning the step (batch=%s)",
+                    len(self.unembed_notify_queue),
+                    getattr(getattr(out, "lwd_batch", None), "batch_type", None),
+                )
             return out
         return self._lwd_schedule_unembed()
 
@@ -307,7 +348,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 self._lwd_log_gate_transition(account)
                 continue
             self._lwd_last_engine = dp_idx
-            self._lwd_note_dispatch_stall(None)
             return dp_idx
         self._lwd_note_dispatch_stall(
             "all-gated: "
@@ -387,6 +427,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 key=f"empty-batch-{dp_idx}",
             )
             return self._lwd_schedule_abort_notice()
+        self._lwd_note_dispatch_stall(None)
         self.lwd_edge_notify_range(dp_idx, out)
         return out
 
@@ -411,6 +452,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Consume a c2e notify to produce an UNEMBED batch."""
         if self.unembed_notify_queue:
             dp_idx, notify = self.unembed_notify_queue.popleft()
+            self._lwd_unembed_batches += 1
+            if self._lwd_unembed_blocked:
+                # Deliveries resumed: whatever held them is the thing that
+                # kept load on the prefill books (only a delivery moves it).
+                self._lwd_unembed_blocked = False
+                lwd_logger.info(
+                    "[edge-sched] unembed resumed after %.1fs: queued=%d",
+                    time.monotonic() - self._lwd_unembed_blocked_since,
+                    len(self.unembed_notify_queue) + 1,
+                )
             return lwd_build_unembed_batch(dp_idx, notify)
         return SchedulerOutput.make_empty()
 
