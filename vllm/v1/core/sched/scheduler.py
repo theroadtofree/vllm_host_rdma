@@ -1206,6 +1206,9 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    # LWD: a failed readmission releases snapshot pins so the
+                    # next step re-queries instead of wedging the block pool.
+                    self.kv_cache_manager.lwd_rollback_allocation(request)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1235,6 +1238,9 @@ class Scheduler(SchedulerInterface):
                     )
 
                 request = request_queue.pop_request()
+                # LWD: the first successful admission settles the prefix
+                # snapshot (pins released, snapshot retired).
+                self.kv_cache_manager.lwd_commit_allocation(request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.

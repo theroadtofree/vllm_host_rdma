@@ -177,12 +177,34 @@ class LwdPrefixCoordinator:
         reservation = self._reservations.get(request_id)
         if reservation is None or reservation.pool_blocks is None:
             return None
-        # Frozen exactly once: native admission takes ownership of these
-        # blocks. A preempted request must explicitly reserve a fresh hit;
-        # its old snapshot is never valid for a second allocation.
-        snapshot = reservation.pool_blocks
+        # Read-only: the snapshot is settled (not consumed) by the allocation
+        # outcome via commit_allocation / rollback_allocation below. A failed
+        # admission therefore never leaves a consumed snapshot with pins held.
+        return reservation.pool_blocks, reservation.hit_tokens
+
+    def commit_allocation(self, request_id: str) -> None:
+        """First successful admission: release pins and retire the snapshot.
+
+        The native KV chain now owns the blocks, so the reservation's pin is
+        no longer needed. pool_blocks=None makes a later preemption go through
+        reserve_hit again (no stale snapshot is ever re-allocated).
+        """
+        self._settle_snapshot(request_id)
+
+    def rollback_allocation(self, request_id: str) -> None:
+        """Failed admission of a preempted request: release pins and drop the
+        snapshot so the next readmission re-queries a fresh hit instead of
+        wedging the pool with a pin that can never be settled."""
+        self._settle_snapshot(request_id)
+
+    def _settle_snapshot(self, request_id: str) -> None:
+        reservation = self._reservations.get(request_id)
+        if reservation is None:
+            return
+        if reservation.touched_blocks and self._kv_cache_manager is not None:
+            self._kv_cache_manager.block_pool.free_blocks(reservation.touched_blocks)
+            reservation.touched_blocks = None
         reservation.pool_blocks = None
-        return snapshot, reservation.hit_tokens
 
     def _digest_hit(self, chain: list[bytes]) -> int:
         """摘要域最长命中块数(``complete_request`` 回填的集合)。
