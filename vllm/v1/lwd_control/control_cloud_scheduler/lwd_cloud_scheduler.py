@@ -47,7 +47,8 @@ if TYPE_CHECKING:
     from vllm.v1.outputs import ModelRunnerOutput
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
-"""ModelRunnerOutput.lwd_down_carrier attached by the cloud worker."""
+"""Finished ModelRunnerOutput.lwd_down_carrier harvested by the executor
+output thread."""
 
 
 @dataclass

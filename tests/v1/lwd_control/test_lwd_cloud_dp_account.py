@@ -94,6 +94,14 @@ def test_gate_blocks_on_slots_and_pending_chunks_but_not_resumes() -> None:
     assert other.is_gated(max_num_running_reqs=100, has_resume_inflight=False)
 
 
+def test_gate_uses_account_pending_chunk_limit() -> None:
+    account = LwdCloudDpAccount(0, max_pending_chunks=1)
+    account.register_batch(0, {"r"})
+
+    assert account.max_pending_chunks == 1
+    assert account.is_gated(max_num_running_reqs=100, has_resume_inflight=False)
+
+
 def test_score_matches_native_dp_balancer_weights() -> None:
     account = LwdCloudDpAccount(0)
     account.prefill_load = 3

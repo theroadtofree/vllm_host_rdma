@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.platforms import current_platform
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
@@ -984,6 +985,46 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        inner = getattr(output, "_model_runner_output", output)
+        ready_event = getattr(inner, "lwd_meta_ready_event", None)
+        if ready_event is not None:
+            delattr(inner, "lwd_meta_ready_event")
+        carrier = getattr(inner, "lwd_down_carrier", None)
+        if carrier is not None and len(carrier) == 5:
+            if ready_event is None:
+                raise RuntimeError("LWD DOWN carrier is missing its ready event")
+            meta_dev, seg_lens_host, req_ids, hidden_numel, seqno = carrier
+            stream = getattr(self, "_lwd_harvest_stream", None)
+            if stream is None:
+                stream = self._lwd_harvest_stream = torch.npu.Stream()
+            n_dev = meta_dev.numel()
+            n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
+            n_meta = n_dev + n_seg
+            buf = getattr(self, "_lwd_harvest_pinned", None)
+            if buf is None or buf.numel() < n_meta:
+                buf = torch.empty(max(n_meta, 4096), dtype=torch.int32, pin_memory=True)
+                self._lwd_harvest_pinned = buf
+            started = time.monotonic()
+            with torch.npu.stream(stream):
+                stream.wait_event(ready_event)
+                buf[:n_dev].copy_(meta_dev, non_blocking=True)
+                done = torch.npu.Event()
+                done.record()
+            done.synchronize()
+            if n_seg:
+                buf.numpy()[n_dev:n_meta] = seg_lens_host
+            inner.lwd_down_carrier = (
+                buf[:n_meta],
+                req_ids,
+                hidden_numel,
+                seqno,
+            )
+            lwd_logger.info(
+                "[Lwd][perf] meta-harvest dur=%.2fms ts=%.3f",
+                (time.monotonic() - started) * 1000,
+                time.monotonic(),
+            )
+
         if isinstance(output, AsyncModelRunnerOutput):
             try:
                 output = output.get_output()
