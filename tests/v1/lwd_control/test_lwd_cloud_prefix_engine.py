@@ -107,6 +107,43 @@ def test_request_build_adopts_wire_hashes_and_skip_reading() -> None:
     assert request.skip_reading_prefix_cache
 
 
+@pytest.mark.parametrize("wire_hashes", [[], [b"h0"]])
+def test_request_build_never_hashes_meta_embeds_on_wire_chain_mismatch(
+    wire_hashes: list[bytes],
+) -> None:
+    """A missing/partial edge chain must not fall back to local hashing.
+
+    The cloud request owns a meta prompt-embeds placeholder, so the local
+    hasher raises ``Cannot copy out of meta tensor`` (seen under concurrent
+    gateway/probe requests whose chain length differs from the cloud block
+    count).  Admission must fail closed through ``lwd_wire_hashes_adopted``
+    instead.
+    """
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine.request_block_hasher = Mock(
+        side_effect=AssertionError("local hasher read placeholder input")
+    )
+    engine._lwd_hash_block_size = 2
+    engine.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            get_hidden_size=lambda: 8,
+            dtype=torch.float32,
+        )
+    )
+    notify = LwdRequestNotify(
+        "r",
+        4,
+        block_hashes=wire_hashes,
+        prefix_nonce=7,
+    )
+
+    request = engine._lwd_build_request(notify)
+
+    assert request.block_hashes == wire_hashes
+    assert not request.lwd_wire_hashes_adopted
+    engine.request_block_hasher.assert_not_called()
+
+
 @pytest.mark.parametrize("prompt_tokens", [3, 4])
 def test_decode_never_hashes_or_caches_output_blocks(prompt_tokens: int) -> None:
     engine = object.__new__(LwdCloudEngineCoreMixin)

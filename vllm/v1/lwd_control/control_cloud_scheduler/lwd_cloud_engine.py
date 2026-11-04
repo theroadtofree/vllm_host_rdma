@@ -895,14 +895,20 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         def block_hasher(request: Request) -> list[bytes]:
             if request.num_output_tokens > 0:
                 return []
+            # The cloud holds only a meta placeholder for the prompt
+            # embeddings (the real rows arrive later over the UP channel), so
+            # a local token/embedding hash raises "Cannot copy out of meta
+            # tensor".  Adopt the edge's wire chain only when it matches the
+            # cloud hash granularity; otherwise leave the request without
+            # hashes and let add_request fail closed through
+            # lwd_wire_hashes_adopted.
             if (
                 local_hasher is not None
                 and not request.block_hashes
                 and len(req_notify.block_hashes) == expected
             ):
                 return list(req_notify.block_hashes)
-            assert local_hasher is not None
-            return local_hasher(request)
+            return []
 
         request = Request(
             request_id=req_notify.request_id,
