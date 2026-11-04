@@ -217,11 +217,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_prefix_coordinator = None
         prefix_hash_block_size = 0
         coordination = self.lwd_config.coordination
-        if (
-            self.vllm_config.cache_config.enable_prefix_caching
-            and coordination is not None
-            and coordination.enabled
-        ):
+        # The coordinator serves probes whenever coordination is enabled,
+        # NOT only with prefix caching: probe replies also carry placement
+        # and routing data (engine_index / cloud_id) plus health
+        # bookkeeping, which must keep flowing with prefix caching off.
+        # With caching disabled the NoPrefixCache coordinator returns an
+        # empty hit, so probes answer with zero hits instead of hanging in
+        # a consumer-less command queue until the 20s timeout.
+        if coordination is not None and coordination.enabled:
             from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
             from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_coordinator import (
                 LwdPrefixCoordinator,
