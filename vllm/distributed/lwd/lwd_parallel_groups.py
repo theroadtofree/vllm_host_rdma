@@ -62,9 +62,6 @@ class LwdParallelGroupsSpec:
         """Derive the groups, or raise before any process creates one.
 
         Raises:
-            NotImplementedError: Instances share a rank allocation, or a
-                rank holds the channels of several DP connections, outside
-                single_instance.
             ValueError: Allocations of distinct instances or DPs overlap.
         """
         scene = topology.deployment.scene
@@ -99,9 +96,7 @@ class LwdParallelGroupsSpec:
                 LwdChannelEndpoints(
                     connection.connection_id,
                     connection.edge.ranks[0],
-                    connection.cloud.ranks[
-                        connection.edge_id % len(connection.cloud.ranks)
-                    ],
+                    connection.cloud.ranks[0],
                 )
                 for connection in connections
             ),
