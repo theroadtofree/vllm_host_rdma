@@ -46,6 +46,14 @@ class LwdCloudDpAccount:
         self.prefill_load = 0
         """Requests routed here that still prefill (waiting, skipped or
         running)."""
+        self.dispatched_requests: set[str] = set()
+        """Routed requests whose first chunk was announced to the cloud.
+
+        Admission alone must never reach the gate: a request that is only
+        queued cannot be worked off by the cloud, and the gate is what
+        lets it be sent in the first place. Counting those would let a
+        queue deeper than max_num_seqs close the gate on the very
+        requests that would reopen it."""
         self.decode_load = 0
         """Requests routed here that finished embedding and await cloud
         results."""
@@ -56,7 +64,17 @@ class LwdCloudDpAccount:
 
     @property
     def load(self) -> int:
+        """Routing load: every routed request, queued ones included, so the
+        balancer sees the work it already handed to this engine."""
         return self.prefill_load + self.decode_load
+
+    @property
+    def inflight(self) -> int:
+        """Gate load: only requests the cloud is actually working on.
+
+        The native scheduler admits against its running queue, never
+        against what is merely queued; this is that count, per engine."""
+        return len(self.dispatched_requests) + self.decode_load
 
     def score(self) -> int:
         """Routing score, lowest wins: prefill weighs 4, decode 1, the same
@@ -67,6 +85,11 @@ class LwdCloudDpAccount:
         self.prefill_load += 1
         self.prefill_requests.add(request_id)
 
+    def note_dispatched(self, request_id: str) -> None:
+        """A chunk of this request was announced to the cloud; idempotent
+        across the chunks of one request."""
+        self.dispatched_requests.add(request_id)
+
     def note_prefill_done(self, request_id: str) -> bool:
         """Move one request from prefill to decode. Returns False when the
         request was not on the prefill books (already moved, or settled):
@@ -75,12 +98,15 @@ class LwdCloudDpAccount:
         if request_id not in self.prefill_requests:
             return False
         self.prefill_requests.discard(request_id)
+        # decode_load takes over the gate slot from here.
+        self.dispatched_requests.discard(request_id)
         self.prefill_load -= 1
         self.decode_load += 1
         return True
 
     def note_request_settled(self, request_id: str, was_awaiting: bool) -> None:
         """A request left the account (finished, aborted or dropped)."""
+        self.dispatched_requests.discard(request_id)
         if was_awaiting:
             self.decode_load -= 1
         else:
@@ -121,13 +147,18 @@ class LwdCloudDpAccount:
     def is_gated(self, max_num_running_reqs: int, has_resume_inflight: bool) -> bool:
         """Whether new prefill admission to this engine must wait.
 
+        The gate counts what the cloud is working on, never what is only
+        queued here: the gate is the sole path by which a queued request
+        is sent, so gating on queued requests makes a queue deeper than
+        max_num_seqs permanent -- the requests holding the gate shut are
+        exactly the ones it refuses to send.
+
         A resume in flight is exempt (finish in-flight chunks before new
         ones; also prevents a max_num_seqs=1 config from deadlocking on
-        itself). Otherwise the engine is gated when its request slots are
-        full or its pending chunks reached the cap.
+        itself).
         """
         if has_resume_inflight:
             return False
-        if self.load >= max_num_running_reqs:
+        if self.inflight >= max_num_running_reqs:
             return True
         return self.pending_chunks() >= self.max_pending_chunks

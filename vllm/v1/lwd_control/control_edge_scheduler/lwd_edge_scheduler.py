@@ -23,7 +23,6 @@ single-cloud behaviour.
 from __future__ import annotations
 
 import copy
-import time
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -87,10 +86,6 @@ _LWD_FINISH_STATUS = {
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
 
-# Step-activity report interval: slow enough to stay out of the way, fast
-# enough that a stall is bounded by one line rather than inferred.
-LWD_STEP_REPORT_S = 5.0
-
 
 def lwd_edge_scheduler_config(vllm_config: VllmConfig) -> VllmConfig:
     scheduler_config = copy.copy(vllm_config)
@@ -139,12 +134,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         transition logging only."""
         self._lwd_drift_seen: set[int] = set()
         """Engines already reported as having drifted books."""
-        self._lwd_steps = 0
-        self._lwd_embed_batches = 0
-        self._lwd_unembed_batches = 0
-        self._lwd_last_step_report = time.monotonic()
-        self._lwd_unembed_blocked = False
-        self._lwd_unembed_blocked_since = 0.0
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
@@ -223,15 +212,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     # ------------------------------------------------------------- stepping
 
     def _lwd_audit_accounts(self) -> None:
-        """Reconcile every engine's load against the live requests it is
-        charged for.
+        """Audit every engine's books while the gate holds everything shut.
 
-        load decides free_seq, so a slot charged to a request that no
-        longer exists is never returned: admission keeps shrinking until
-        the engine can start nothing and the cloud waits forever on rows
-        the edge will never send. The books are maintained incrementally
-        across many paths, so a missed settlement is silent -- audit the
-        invariant instead of trusting the increments."""
+        Two ways this state becomes permanent, both silent at the point
+        they happen: a slot charged to a request that no longer exists is
+        never returned, and a gate slot held by a request the cloud is not
+        working on can only be released by sending that request -- which
+        the gate refuses. Check both invariants rather than trusting the
+        increments that maintain them."""
         for account in self._lwd_accounts:
             charged = [
                 request_id
@@ -243,7 +231,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 for request_id in charged
                 if request_id not in self.requests
             ]
-            if not missing and len(charged) == account.load:
+            # Every gate slot must belong to a request that was actually
+            # announced to this cloud and is still live.
+            stuck = [
+                request_id
+                for request_id in account.dispatched_requests
+                if request_id not in self.requests
+            ]
+            if not missing and not stuck and len(charged) == account.load:
                 self._lwd_drift_seen.discard(account.dp_idx)
                 continue
             # Drift grows one leak at a time; report the engine once and
@@ -252,15 +247,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 continue
             self._lwd_drift_seen.add(account.dp_idx)
             lwd_logger.warning(
-                "[edge-sched] account drift dp%d: load=%d charged=%d "
-                "missing=%d (%s) prefill=%d decode=%d",
+                "[edge-sched] account drift dp%d: load=%d inflight=%d "
+                "charged=%d missing=%d (%s) stuck=%d (%s) "
+                "prefill=%d decode=%d dispatched=%d",
                 account.dp_idx,
                 account.load,
+                account.inflight,
                 len(charged),
                 len(missing),
                 sorted(missing)[:5],
+                len(stuck),
+                sorted(stuck)[:5],
                 account.prefill_load,
                 account.decode_load,
+                len(account.dispatched_requests),
             )
 
     def has_requests(self) -> bool:
@@ -281,22 +281,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """Dispatch refills and EMBED batches before consuming cloud results."""
-        self._lwd_steps += 1
-        now = time.monotonic()
-        if now - self._lwd_last_step_report >= LWD_STEP_REPORT_S:
-            # Separates "the engine stopped stepping" from "it steps but
-            # produces nothing": the stall reasons look identical in the
-            # log otherwise, and only the latter can consume c2e.
-            lwd_logger.info(
-                "[edge-sched] steps=%d embed=%d unembed=%d c2e_queued=%d "
-                "refills=%d",
-                self._lwd_steps,
-                self._lwd_embed_batches,
-                self._lwd_unembed_batches,
-                len(self.unembed_notify_queue),
-                len(self._lwd_pending_refills),
-            )
-            self._lwd_last_step_report = now
         if self._lwd_pending_refills:
             return self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
         LwdControlDiag.edge_step_activity(
@@ -305,20 +289,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         out = self._lwd_schedule_embed()
         if out is not None:
-            self._lwd_embed_batches += 1
-            if self.unembed_notify_queue and not self._lwd_unembed_blocked:
-                # EMBED wins every step it produces anything, so a c2e can
-                # wait here indefinitely. A delivery is the only thing that
-                # moves load off the prefill books, so this starves the
-                # gate that admits new work.
-                self._lwd_unembed_blocked = True
-                self._lwd_unembed_blocked_since = time.monotonic()
-                lwd_logger.warning(
-                    "[edge-sched] unembed starved: c2e_queued=%d while EMBED "
-                    "keeps winning the step (batch=%s)",
-                    len(self.unembed_notify_queue),
-                    getattr(getattr(out, "lwd_batch", None), "batch_type", None),
-                )
             return out
         return self._lwd_schedule_unembed()
 
@@ -352,7 +322,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_note_dispatch_stall(
             "all-gated: "
             + " ".join(
-                f"dp{account.dp_idx}(load={account.load}/{self.max_num_running_reqs},"
+                f"dp{account.dp_idx}("
+                f"inflight={account.inflight}/{self.max_num_running_reqs},"
+                f"routed={account.load},"
                 f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
                 f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
                 for account in self._lwd_accounts
@@ -452,16 +424,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Consume a c2e notify to produce an UNEMBED batch."""
         if self.unembed_notify_queue:
             dp_idx, notify = self.unembed_notify_queue.popleft()
-            self._lwd_unembed_batches += 1
-            if self._lwd_unembed_blocked:
-                # Deliveries resumed: whatever held them is the thing that
-                # kept load on the prefill books (only a delivery moves it).
-                self._lwd_unembed_blocked = False
-                lwd_logger.info(
-                    "[edge-sched] unembed resumed after %.1fs: queued=%d",
-                    time.monotonic() - self._lwd_unembed_blocked_since,
-                    len(self.unembed_notify_queue) + 1,
-                )
             return lwd_build_unembed_batch(dp_idx, notify)
         return SchedulerOutput.make_empty()
 
@@ -653,7 +615,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Picker adapter layer: candidates routed to dp_idx, cap and
         free_seq from that engine's account."""
         account = self._lwd_accounts[dp_idx]
-        inflight = account.load
+        # Same count as the gate: budgeting against queued requests would
+        # starve the very batch that drains the queue.
+        inflight = account.inflight
         cap = self.max_num_scheduled_tokens
         free_seq = self.max_num_running_reqs - inflight
         # Resume candidates take only the prefill phase (decode-phase
@@ -734,8 +698,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             f"cap={cap} chunk_unit={self._lwd_chunk_unit} "
             f"slots={self._lwd_draft_slots} routed={len(routed)} "
             f"routed_unsent={unsent} routed_at={located} "
-            f"load={account.load}(prefill={account.prefill_load},"
-            f"decode={account.decode_load}) "
+            f"inflight={account.inflight} load={account.load}"
+            f"(prefill={account.prefill_load},decode={account.decode_load},"
+            f"dispatched={len(account.dispatched_requests)}) "
             f"sched_running={len(self.running)} sched_waiting={len(self.waiting)} "
             f"skipped={len(self.skipped_waiting)} requests={len(self.requests)}"
         )
@@ -847,6 +812,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         self.lwd_send_to_cloud(dp_idx, LwdRangeNotify(seqno=seqno, items=items))
         account.register_batch(seqno, set(req_ids))
+        for request_id in req_ids:
+            account.note_dispatched(request_id)
         # On successful send, assemble the EMBED batch and attach it to SO:
         # seqno is the pairing key of the data-plane tensor sent to the
         # cloud (same value as registered by the cloud-side RangeNotify);
