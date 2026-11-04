@@ -385,8 +385,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 if key[0] != dp_idx or key[1] > watermark
             }
         batch = getattr(scheduler_output, "lwd_batch", None)
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        outputs: dict[int, list[EngineCoreOutput]] = {}
+        finished: dict[int, set[str]] = {}
         if batch is not None and batch.batch_type == LwdBatchType.LWD_UNEMBED:
             notify = scheduler_output.lwd_c2e_notify[0]
             req_ids = getattr(model_runner_output, "req_ids", None) or ()
@@ -407,10 +407,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if not outputs:
             return {}
         return {
-            0: EngineCoreOutputs(
-                outputs=outputs,
-                finished_requests=finished or None,
+            client_index: EngineCoreOutputs(
+                outputs=outs,
+                finished_requests=finished.get(client_index) or None,
             )
+            for client_index, outs in outputs.items()
         }
 
     @staticmethod
@@ -440,13 +441,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_deliver_unembed(
         self, notify: LwdC2eNotify, sampled_token_map: dict[str, list[int]]
-    ) -> tuple[list[EngineCoreOutput], set[str]]:
+    ) -> tuple[dict[int, list[EngineCoreOutput]], dict[int, set[str]]]:
         """Per-request delivery: row disposition goes through
         _lwd_row_disposition (zero-accepted live rows are skipped; ERROR
         only when accepted>0 yet token missing); late results not in
-        awaiting are idempotently dropped."""
-        outputs: list[EngineCoreOutput] = []
-        finished: set[str] = set()
+        awaiting are idempotently dropped.
+
+        Results are grouped by ``request.client_index`` so each logical edge
+        receives only its own outputs (edge0->client 0, edge2->client 2)."""
+        outputs: dict[int, list[EngineCoreOutput]] = {}
+        finished: dict[int, set[str]] = {}
         # accepted is position-aligned with rows (same contract as
         # lwd_build_unembed_batch); the DISABLE_DOWN bypass carries no
         # accepted, so token presence/absence is used instead
@@ -509,6 +513,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
                 continue
             request = self.requests[request_id]
+            client_index = getattr(request, "client_index", 0)
             if sampled_token_ids:
                 request.append_output_token_ids(sampled_token_ids)
                 if self.lwd_on_tokens is not None:
@@ -532,7 +537,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                         finish_reason, RequestStatus.FINISHED_STOPPED
                     ),
                 )
-            outputs.append(
+            outputs.setdefault(client_index, []).append(
                 EngineCoreOutput(
                     request_id,
                     sampled_token_ids,
@@ -540,7 +545,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
             )
             if finished_now:
-                finished.add(request_id)
+                finished.setdefault(client_index, set()).add(request_id)
         return outputs, finished
 
     @staticmethod

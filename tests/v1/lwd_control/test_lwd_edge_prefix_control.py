@@ -374,7 +374,7 @@ def test_stale_c2e_is_ignored_and_current_generation_delivers() -> None:
 
     outputs, finished = scheduler._lwd_deliver_unembed(stale, {"r": []})
 
-    assert outputs == [] and finished == set()
+    assert outputs == {} and finished == {}
     scheduler.finish_requests.assert_not_called()
     assert scheduler._lwd_route["r"] == 1
 
@@ -388,6 +388,6 @@ def test_stale_c2e_is_ignored_and_current_generation_delivers() -> None:
     )
     outputs, finished = scheduler._lwd_deliver_unembed(current, {"r": [42]})
 
-    assert len(outputs) == 1
-    assert outputs[0].new_token_ids == [42]
-    assert finished == set()
+    assert list(outputs) == [0]
+    assert outputs[0][0].new_token_ids == [42]
+    assert finished == {}
