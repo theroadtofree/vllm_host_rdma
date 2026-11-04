@@ -16,9 +16,19 @@ import aiohttp
 class LwdProbeRuntime:
     """Own a bounded probe event loop outside the engine thread."""
 
-    def __init__(self, *, max_connections: int = 64, max_inflight: int = 64) -> None:
-        if max_connections <= 0 or max_inflight <= 0:
-            raise ValueError("probe concurrency limits must be positive")
+    def __init__(self, *, max_connections: int = 0, max_inflight: int = 64) -> None:
+        """max_connections: 0 = unlimited (aiohttp TCPConnector semantics).
+
+        The probe pool is shared with usage-drain streams, each of which
+        holds one connection until the request settles on the cloud. Any
+        finite cap therefore lets long-lived drains starve new probes into
+        the connect timeout under load; the old baseline deliberately ran
+        unlimited (_LWD_PROBE_MAX_CONNS = 0)."""
+        if max_connections < 0 or max_inflight <= 0:
+            raise ValueError(
+                "probe connection limit must be non-negative and the "
+                "inflight limit must be positive"
+            )
         self._max_connections = max_connections
         self._loop = asyncio.new_event_loop()
         self._session: aiohttp.ClientSession | None = None
