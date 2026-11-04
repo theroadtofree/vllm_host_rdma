@@ -14,6 +14,7 @@ the arrived-row high watermark is retained for readmission.
 from __future__ import annotations
 
 import itertools
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -99,13 +100,53 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_refill_sender = None
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
+        self._lwd_conc_last_log = 0.0
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
         """Keep the engine alive until an abort-only worker notice is sent."""
         return bool(self._lwd_abort_pending) or super().has_requests()
 
+    _LWD_CONCURRENCY_LOG_INTERVAL_S = 5.0
+
+    def _lwd_log_concurrency(self) -> None:
+        """[Lwd][conc] Periodic (~5s) concurrency and prefill-backlog snapshot.
+
+        avail_rows sums (arrived - computed) rows over in-flight prefill
+        requests: a sustained high value while the token budget is not
+        saturated is direct evidence of "data arrived but not scheduled".
+        """
+        now = time.monotonic()
+        if now - self._lwd_conc_last_log < self._LWD_CONCURRENCY_LOG_INTERVAL_S:
+            return
+        self._lwd_conc_last_log = now
+        ledger = self.lwd_recv_rows
+        total = len(self.requests)
+        running = len(self.running)
+        waiting = len(self.waiting) + len(self.skipped_waiting)
+        decode_ready = 0
+        prefill_inflight = 0
+        avail_rows = 0
+        for queue in (self.running, self.waiting, self.skipped_waiting):
+            for req in queue:
+                if req.num_computed_tokens >= req.num_prompt_tokens:
+                    decode_ready += 1
+                else:
+                    prefill_inflight += 1
+                    avail_rows += max(
+                        0,
+                        int(ledger.get(req.request_id, 0)) - req.num_computed_tokens,
+                    )
+        lwd_logger.info(
+            "[Lwd][conc] total=%d running=%d waiting=%d decode_ready=%d "
+            "prefill_inflight=%d avail_rows=%d ledger=%d budget=%d",
+            total, running, waiting, decode_ready,
+            prefill_inflight, avail_rows, len(ledger),
+            self.max_num_scheduled_tokens,
+        )
+
     def _lwd_schedule_step(self) -> SchedulerOutput:
+        self._lwd_log_concurrency()
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
         room = self.max_num_scheduled_tokens - decode_exact

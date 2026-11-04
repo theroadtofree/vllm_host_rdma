@@ -342,6 +342,11 @@ class DefaultModelLoader(BaseModelLoader):
         skip_name = (
             (lambda name: name_is_skipped(name, skip_keys)) if skip_keys else None
         )
+        if skip_name is not None:
+            logger.info_once(
+                "LWD weight filter: %d placeholder module(s) skipped before reading",
+                len(skip_keys),
+            )
         yield from self._skip_unbuilt_weights(
             model, self._get_weights_iterator(primary_weights, skip_name)
         )

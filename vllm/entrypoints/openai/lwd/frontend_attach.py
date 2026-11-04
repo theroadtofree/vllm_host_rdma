@@ -61,7 +61,6 @@ _ATTACH_CONFIG_EXCLUDE_KEYS = frozenset(
         "master_port",
         "data_parallel_address",
         "data_parallel_rpc_port",
-        "nnodes",
         "uvicorn_log_level",
         "disable_uvicorn_access_log",
         "disable_access_log_for_endpoints",
@@ -254,8 +253,6 @@ def get_route_ip(target_ip: str) -> str:
 
 
 def _resolve_listen(args: Any) -> tuple[str, int]:
-    if getattr(args, "uds", None):
-        return f"uds:{args.uds}", 0
     return getattr(args, "host", None) or "0.0.0.0", args.port
 
 

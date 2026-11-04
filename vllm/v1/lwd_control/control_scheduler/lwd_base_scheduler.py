@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from enum import Enum, auto
 from typing import Any
 
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import RequestQueue, create_request_queue
@@ -169,6 +170,35 @@ class LwdBaseScheduler(AsyncScheduler):
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Record the finish snapshot and release prefix/refill state.
+
+        Normal termination (check_stop in update_from_output) calls
+        ``self._free_request(request)`` directly, aborts/errors arrive via
+        ``finish_requests``; both converge here, so the snapshot must be
+        taken in this single choke point (finish_requests would miss most
+        normal endings). The engine consumes ``lwd_finished_records``
+        (removing entries as it publishes usage); without this snapshot the
+        ledger stays empty and usage events are never published.
+        """
+        try:
+            records = self.lwd_finished_records
+            records[request.request_id] = (
+                request.num_prompt_tokens,
+                request.num_tokens - request.num_prompt_tokens,
+            )
+            if len(records) > 1024:
+                for stale in list(records)[:256]:
+                    records.pop(stale, None)
+                lwd_logger.warning(
+                    "[Lwd][coord] finished-record table full; evicted oldest"
+                )
+        except AttributeError:
+            # Edge schedulers keep no finished-record ledger.
+            pass
+        except Exception:  # noqa: BLE001  snapshot failure must not block release
+            lwd_logger.warning(
+                "[Lwd][coord] finished snapshot failed (non-fatal)", exc_info=True
+            )
         reservations = getattr(self, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request.request_id)

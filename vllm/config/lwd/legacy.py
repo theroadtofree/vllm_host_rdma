@@ -72,24 +72,14 @@ def _coordination(
 
 
 def _from_registry(args: Any, address: str) -> LwdTopology:
-    try:
-        raw = yaml.safe_load(Path(args.role_registry).read_text(encoding="utf-8")) or {}
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
-        raise ValueError(
-            f"[LWD] Invalid legacy role registry {args.role_registry!r}: {exc}"
-        ) from exc
-    if not isinstance(raw, dict):
-        raise ValueError("[LWD] Legacy role registry must contain a mapping")
-    edges_in, clouds_in = raw.get("edges"), raw.get("clouds")
-    if not isinstance(edges_in, list) or not isinstance(clouds_in, list):
-        raise ValueError("[LWD] Legacy role registry requires edges and clouds lists")
-    if not edges_in or not clouds_in:
-        raise ValueError("[LWD] Legacy role registry requires at least one edge/cloud")
+    raw = yaml.safe_load(Path(args.role_registry).read_text(encoding="utf-8")) or {}
+    edges_in = raw.get("edges") or []
+    clouds_in = raw.get("clouds") or []
 
     edges = []
     for edge in edges_in:
         ranks = list(edge.get("ranks", ()))
-        dp_count = clouds_in[0].get("dp_size", 1)
+        dp_count = clouds_in[0].get("dp_size", 1) if clouds_in else 1
         edges.append(
             {
                 "id": edge["id"],

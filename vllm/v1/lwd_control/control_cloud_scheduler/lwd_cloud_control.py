@@ -179,27 +179,8 @@ class LwdCloudControlBridge:
         request_id = manifest.request_id
         logger.debug("[Lwd][ctrl] bridge probe req=%s", request_id)
         if len(self._command_queues) > 1:
-            # 云内 DP:扇出逐引擎只读求命中 → 放置 → 赢家引擎落预留。
-            # usage future 仍须先行注册(A4):结算方(赢家引擎的 finish)
-            # 按 request_id 对 _usage_futures 结账,wait_usage 依赖它在
-            # 位——此前扇出路径先 return、future 从未注册 → dp>1 的
-            # wait_usage 恒 None(每请求 SSE 无 usage 帧、网关计费为零)。
-            # 重复 probe 取代语义同单引擎路径:旧流以「无用量」收口。
-            loop = asyncio.get_running_loop()
-            self._loop = loop
-            with self._lock:
-                stale_usage = self._usage_futures.pop(request_id, None)
-                self._usage_futures[request_id] = loop.create_future()
-            if stale_usage is not None and not stale_usage.done():
-                stale_usage.set_result(None)
-            try:
-                return await self._probe_fanout(manifest, timeout)
-            except BaseException:
-                # 扇出失败:摘除已注册的 usage future(此时 wait_usage
-                # 不会到达,留着即泄漏)并原样上抛
-                with self._lock:
-                    self._usage_futures.pop(request_id, None)
-                raise
+            # 云内 DP:扇出逐引擎只读求命中 → 放置 → 赢家引擎落预留
+            return await self._probe_fanout(manifest, timeout)
         loop = asyncio.get_running_loop()
         self._loop = loop
         with self._lock:

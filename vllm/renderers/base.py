@@ -354,20 +354,28 @@ class BaseRenderer(ABC, Generic[_T]):
         """
         from vllm.entrypoints.chat_utils import ChatTemplateResolutionError
 
-        # prevent MM processor hangs
-        with set_default_torch_num_threads(1):
-            try:
-                logger.debug("Warming up chat template processing...")
-                start_time = time.perf_counter()
+        if self.tokenizer is None:
+            # e.g. LWD cloud: skip_tokenizer_init=True, rendering happens on the
+            # edge. render_chat() would raise here, so skip it instead of
+            # logging a traceback on every startup.
+            logger.debug("Skipping chat template warmup: no tokenizer available")
+        else:
+            # prevent MM processor hangs
+            with set_default_torch_num_threads(1):
+                try:
+                    logger.debug("Warming up chat template processing...")
+                    start_time = time.perf_counter()
 
-                self.render_chat([[{"role": "user", "content": "warmup"}]], chat_params)
+                    self.render_chat(
+                        [[{"role": "user", "content": "warmup"}]], chat_params
+                    )
 
-                elapsed = time.perf_counter() - start_time
-                logger.debug("Chat template warmup completed in %.3fs", elapsed)
-            except ChatTemplateResolutionError:
-                logger.debug("This model does not support chat template.")
-            except Exception:
-                logger.warning("Chat template warmup failed", exc_info=True)
+                    elapsed = time.perf_counter() - start_time
+                    logger.debug("Chat template warmup completed in %.3fs", elapsed)
+                except ChatTemplateResolutionError:
+                    logger.debug("This model does not support chat template.")
+                except Exception:
+                    logger.warning("Chat template warmup failed", exc_info=True)
 
         if self._mm_warmup_future is not None:
             # Join a background MM warmup launched to overlap engine-core init.
