@@ -129,9 +129,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_route: dict[str, int] = {}
         """Request id -> dp_idx, pinned at admission, never changes."""
         self._lwd_last_engine = -1
-        self._lwd_dispatch_stall: str | None = None
-        """Reason the edge last stopped producing EMBED batches, for
+        self._lwd_dispatch_stall: set[str] = set()
+        """Dispatch stalls already reported, cleared when dispatch resumes;
         transition logging only."""
+        self._lwd_drift_seen: set[int] = set()
+        """Engines already reported as having drifted books."""
         """Round-robin anchor shared by routing and engine picking."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
@@ -209,6 +211,47 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     # ------------------------------------------------------------- stepping
 
+    def _lwd_audit_accounts(self) -> None:
+        """Reconcile every engine's load against the live requests it is
+        charged for.
+
+        load decides free_seq, so a slot charged to a request that no
+        longer exists is never returned: admission keeps shrinking until
+        the engine can start nothing and the cloud waits forever on rows
+        the edge will never send. The books are maintained incrementally
+        across many paths, so a missed settlement is silent -- audit the
+        invariant instead of trusting the increments."""
+        for account in self._lwd_accounts:
+            charged = [
+                request_id
+                for request_id, dp_idx in self._lwd_route.items()
+                if dp_idx == account.dp_idx
+            ]
+            missing = [
+                request_id
+                for request_id in charged
+                if request_id not in self.requests
+            ]
+            if not missing and len(charged) == account.load:
+                self._lwd_drift_seen.discard(account.dp_idx)
+                continue
+            # Drift grows one leak at a time; report the engine once and
+            # stay quiet until it reconciles.
+            if account.dp_idx in self._lwd_drift_seen:
+                continue
+            self._lwd_drift_seen.add(account.dp_idx)
+            lwd_logger.warning(
+                "[edge-sched] account drift dp%d: load=%d charged=%d "
+                "missing=%d (%s) prefill=%d decode=%d",
+                account.dp_idx,
+                account.load,
+                len(charged),
+                len(missing),
+                sorted(missing)[:5],
+                account.prefill_load,
+                account.decode_load,
+            )
+
     def has_requests(self) -> bool:
         """Keep stepping while any UP send still needs watermark settlement.
 
@@ -274,23 +317,35 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
                 for account in self._lwd_accounts
                 if account.dp_idx in routed
-            )
+            ),
+            key="all-gated",
         )
+        # Every engine gated is the state a leaked slot never leaves, so
+        # audit here rather than on every step.
+        self._lwd_audit_accounts()
         return None
 
-    def _lwd_note_dispatch_stall(self, reason: str | None) -> None:
+    def _lwd_note_dispatch_stall(self, reason: str | None, key: str = "") -> None:
         """Log why the edge stopped (or resumed) producing EMBED batches.
 
         A stall that no later event clears is the shape of an edge/cloud
         deadlock: the cloud keeps accepting requests it can never get UP
-        rows for. Only transitions are logged, so a steady idle edge stays
-        quiet."""
-        if reason == self._lwd_dispatch_stall:
-            return
-        self._lwd_dispatch_stall = reason
+        rows for. Only transitions are logged, and `key` identifies the
+        stall across steps whose detail text changes every time: two
+        engines alternating between stalled and dispatchable would
+        otherwise log on every step."""
+        # Engines take turns stalling, so a single last-reason would log on
+        # every step; remember the set and clear it only on a real resume.
         if reason is None:
+            if not self._lwd_dispatch_stall:
+                return
+            self._lwd_dispatch_stall.clear()
             lwd_logger.info("[edge-sched] dispatch resumed")
             return
+        state = key or reason
+        if state in self._lwd_dispatch_stall:
+            return
+        self._lwd_dispatch_stall.add(state)
         lwd_logger.info("[edge-sched] dispatch stalled: %s", reason)
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
@@ -323,13 +378,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return self._lwd_schedule_abort_notice()
         out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
-            # An ungated engine that still yields nothing: the picker found
-            # no candidate it could cut a chunk for. Left silent this looks
-            # exactly like an idle edge, while the cloud waits on UP rows
-            # that are never produced.
+            # An ungated engine that still yields nothing. Harmless when
+            # every routed request already sent its prompt (the engine is
+            # simply decode-saturated); a real stall when prefill work is
+            # routed here and still never reaches the picker.
             self._lwd_note_dispatch_stall(
-                f"empty-batch dp{dp_idx}: "
-                f"{self._lwd_describe_candidates(dp_idx)}"
+                f"empty-batch dp{dp_idx}: {self._lwd_describe_candidates(dp_idx)}",
+                key=f"empty-batch-{dp_idx}",
             )
             return self._lwd_schedule_abort_notice()
         self.lwd_edge_notify_range(dp_idx, out)
@@ -587,9 +642,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         return req_ids, expected
 
     def _lwd_describe_candidates(self, dp_idx: int) -> str:
-        """The picker inputs of the last pick for dp_idx, plus the routed
-        requests it had to choose from: enough to tell a starved queue from
-        a budget that admits nothing."""
+        """The picker inputs of the last pick for dp_idx, plus where this
+        engine's routed requests actually sit.
+
+        An engine can be ungated and still yield nothing for two very
+        different reasons: it genuinely has no prefill work (every routed
+        request already sent its prompt and awaits the cloud), or it holds
+        prefill work that never reaches the picker. Locating each routed
+        request in the queues separates the two."""
         running, waiting, free_seq, cap = getattr(
             self, "_lwd_last_candidates", (-1, -1, -1, -1)
         )
@@ -598,17 +658,33 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for request_id, routed_dp in self._lwd_route.items()
             if routed_dp == dp_idx
         ]
-        unsent = [
-            request.request_id
-            for request in self.running
-            if self._lwd_route.get(request.request_id) == dp_idx
-            and not request.is_finished()
-            and request.num_computed_tokens < request.num_prompt_tokens
-        ]
+        in_running = {request.request_id for request in self.running}
+        in_waiting = {request.request_id for request in self.waiting}
+        in_skipped = {request.request_id for request in self.skipped_waiting}
+        located = {"running": 0, "waiting": 0, "skipped": 0, "nowhere": 0}
+        unsent = 0
+        for request_id in routed:
+            request = self.requests.get(request_id)
+            if request is not None and not request.is_finished():
+                unsent += request.num_computed_tokens < request.num_prompt_tokens
+            if request_id in in_running:
+                located["running"] += 1
+            elif request_id in in_waiting:
+                located["waiting"] += 1
+            elif request_id in in_skipped:
+                located["skipped"] += 1
+            else:
+                # Routed, charged to this engine's load, but in no queue:
+                # nothing will ever schedule it, yet it holds a slot.
+                located["nowhere"] += 1
+        account = self._lwd_accounts[dp_idx]
         return (
-            f"running={running} waiting={waiting} free_seq={free_seq} cap={cap} "
-            f"chunk_unit={self._lwd_chunk_unit} slots={self._lwd_draft_slots} "
-            f"routed={len(routed)} unsent={len(unsent)} "
+            f"cand_running={running} cand_waiting={waiting} free_seq={free_seq} "
+            f"cap={cap} chunk_unit={self._lwd_chunk_unit} "
+            f"slots={self._lwd_draft_slots} routed={len(routed)} "
+            f"routed_unsent={unsent} routed_at={located} "
+            f"load={account.load}(prefill={account.prefill_load},"
+            f"decode={account.decode_load}) "
             f"sched_running={len(self.running)} sched_waiting={len(self.waiting)} "
             f"skipped={len(self.skipped_waiting)} requests={len(self.requests)}"
         )
