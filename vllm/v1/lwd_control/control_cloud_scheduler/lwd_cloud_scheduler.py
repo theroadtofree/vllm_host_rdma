@@ -16,7 +16,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -80,6 +80,30 @@ class LwdCloudScheduler(LwdBaseScheduler):
     """Mix all decode requests with prefill windows whose rows have arrived."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # LWD keeps every real Mamba checkpoint until the native mapping from
+        # state blocks to prefix boundaries supports sparse retention safely.
+        if len(args) > 1:
+            kv_cache_config = args[1]
+            if kv_cache_config.prefix_cache_retention_interval is not None:
+                lwd_logger.info(
+                    "[prefix] LWD uses dense Mamba checkpoints; override "
+                    "retention_interval=%s -> None",
+                    kv_cache_config.prefix_cache_retention_interval,
+                )
+                kv_cache_config = replace(
+                    kv_cache_config, prefix_cache_retention_interval=None
+                )
+                args = (args[0], kv_cache_config, *args[2:])
+        elif kwargs["kv_cache_config"].prefix_cache_retention_interval is not None:
+            previous = kwargs["kv_cache_config"].prefix_cache_retention_interval
+            lwd_logger.info(
+                "[prefix] LWD uses dense Mamba checkpoints; override "
+                "retention_interval=%s -> None",
+                previous,
+            )
+            kwargs["kv_cache_config"] = replace(
+                kwargs["kv_cache_config"], prefix_cache_retention_interval=None
+            )
         super().__init__(*args, **kwargs)
         self.lwd_recv_rows: dict[str, int] = {}
         self._lwd_dropped: set[str] = set()
