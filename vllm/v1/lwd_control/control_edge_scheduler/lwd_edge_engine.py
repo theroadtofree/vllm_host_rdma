@@ -178,7 +178,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
         if isinstance(msg, LwdC2eNotify):
-            lwd_logger.info(
+            # One per decode step per engine on the control-plane IO thread,
+            # which shares the GIL with the only scheduling thread: debug,
+            # not info.
+            lwd_logger.debug(
                 "[edge] c2e received from dp%d reqs=%d hidden_numel=%d",
                 peer.dp_rank,
                 len(msg.req_ids),

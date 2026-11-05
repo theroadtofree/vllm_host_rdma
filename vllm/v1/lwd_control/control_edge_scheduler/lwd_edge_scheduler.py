@@ -381,31 +381,39 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         for account in pending:
             self._lwd_log_gate_transition(account)
-        # inflight is split into its two terms: the seats are shared between
-        # requests the cloud has been told about but has not answered yet
-        # (dispatched) and requests it is decoding, and only the split says
-        # which of the two is holding the gate shut. Steady state is this
-        # branch, not empty-batch, so a split printed only there is a split
-        # never seen.
-        self._lwd_note_dispatch_stall(
-            "all-gated: "
-            + " ".join(
-                f"dp{account.dp_idx}("
-                f"inflight={account.inflight}/{self.max_num_running_reqs}"
-                f"[dispatched={len(account.dispatched_requests)},"
-                f"decode={account.decode_load}],"
-                f"routed={account.load},"
-                f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
-                f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
-                for account in pending
-            ),
-            key="all-gated",
+        reported = self._lwd_note_dispatch_stall(
+            "all-gated", lambda: self._lwd_gate_detail(pending)
         )
-        # Every engine gated is the state a leaked slot never leaves, so
-        # audit here rather than on every step.
-        self._lwd_audit_accounts()
+        # Every engine gated is the state a leaked slot never leaves -- but a
+        # loaded fleet is gated on most steps, and the audit walks the route
+        # table once per engine. Audit when the stall is first reported, not
+        # on every step that is still in it.
+        if reported:
+            self._lwd_audit_accounts()
 
-    def _lwd_note_dispatch_stall(self, reason: str | None, key: str = "") -> None:
+    def _lwd_gate_detail(self, pending: list[LwdCloudDpAccount]) -> str:
+        """Per-engine gate terms, built only when a stall is really logged.
+
+        inflight is split into its two terms: the seats are shared between
+        requests the cloud has been told about but has not answered yet
+        (dispatched) and requests it is decoding, and only the split says
+        which of the two is holding the gate shut. Steady state is the
+        all-gated branch, not empty-batch, so a split printed only there is
+        a split never seen."""
+        return "all-gated: " + " ".join(
+            f"dp{account.dp_idx}("
+            f"inflight={account.inflight}/{self.max_num_running_reqs}"
+            f"[dispatched={len(account.dispatched_requests)},"
+            f"decode={account.decode_load}],"
+            f"routed={account.load},"
+            f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
+            f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
+            for account in pending
+        )
+
+    def _lwd_note_dispatch_stall(
+        self, key: str | None, detail: Callable[[], str] | None = None
+    ) -> bool:
         """Log why the edge stopped (or resumed) producing EMBED batches.
 
         A stall that no later event clears is the shape of an edge/cloud
@@ -413,20 +421,32 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         rows for. Only transitions are logged, and `key` identifies the
         stall across steps whose detail text changes every time: two
         engines alternating between stalled and dispatchable would
-        otherwise log on every step."""
+        otherwise log on every step.
+
+        `detail` is a thunk, and the key is checked before it runs. This is
+        a per-step path on the edge's only scheduling thread, and the detail
+        of a repeated stall is text nobody reads: building it anyway cost
+        more than the stall it described (1k-token prompts at 92 concurrent
+        lost 37 points of throughput to this one line).
+
+        Returns whether this call logged, so that work which is only worth
+        doing alongside a fresh report can be skipped on the repeats.
+        """
         # Engines take turns stalling, so a single last-reason would log on
         # every step; remember the set and clear it only on a real resume.
-        if reason is None:
+        if key is None:
             if not self._lwd_dispatch_stall:
-                return
+                return False
             self._lwd_dispatch_stall.clear()
             lwd_logger.info("[edge-sched] dispatch resumed")
-            return
-        state = key or reason
-        if state in self._lwd_dispatch_stall:
-            return
-        self._lwd_dispatch_stall.add(state)
-        lwd_logger.info("[edge-sched] dispatch stalled: %s", reason)
+            return True
+        if key in self._lwd_dispatch_stall:
+            return False
+        self._lwd_dispatch_stall.add(key)
+        lwd_logger.info(
+            "[edge-sched] dispatch stalled: %s", detail() if detail else key
+        )
+        return True
 
     def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
         held = account.pending_chunks() >= account.max_pending_chunks
@@ -444,15 +464,22 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
         One line answers the question the per-engine accounting exists for:
         are the cloud DPs filling up in parallel, or is the fleet pinned at
-        one DP's worth of concurrency? Reported on change rather than per
-        step -- a step is milliseconds."""
-        seats = tuple(account.inflight for account in self._lwd_accounts)
-        if seats == self._lwd_last_fleet_seats:
+        one DP's worth of concurrency?
+
+        Reported when the ledger crosses an eighth of a seat budget, not on
+        every change: under load every seat turns over continuously, so the
+        exact tuple differs on most steps while the answer to the question
+        does not."""
+        bucket = max(1, self.max_num_running_reqs // 8)
+        coarse = tuple(
+            account.inflight // bucket for account in self._lwd_accounts
+        )
+        if coarse == self._lwd_last_fleet_seats:
             return
-        self._lwd_last_fleet_seats = seats
+        self._lwd_last_fleet_seats = coarse
         lwd_logger.info(
             "[edge-sched] fleet seats %s of %d per dp, waiting=%d",
-            list(seats),
+            [account.inflight for account in self._lwd_accounts],
             self.max_num_running_reqs,
             len(self.waiting) + len(self.skipped_waiting),
         )
@@ -485,8 +512,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # simply decode-saturated); a real stall when prefill work is
             # routed here and still never reaches the picker.
             self._lwd_note_dispatch_stall(
-                f"empty-batch dp{dp_idx}: {self._lwd_describe_candidates(dp_idx)}",
-                key=f"empty-batch-{dp_idx}",
+                f"empty-batch-{dp_idx}",
+                lambda: f"empty-batch dp{dp_idx}: "
+                f"{self._lwd_describe_candidates(dp_idx)}",
             )
             return self._lwd_schedule_abort_notice()
         self._lwd_note_dispatch_stall(None)
