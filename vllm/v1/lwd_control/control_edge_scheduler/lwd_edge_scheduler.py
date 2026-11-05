@@ -129,12 +129,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_route: dict[str, int] = {}
         """Request id -> dp_idx, pinned at admission, never changes."""
         self._lwd_last_engine = -1
+        """Round-robin anchor shared by routing and engine picking; advanced
+        only by the step that serves an engine, never by a liveness query."""
         self._lwd_dispatch_stall: set[str] = set()
         """Dispatch stalls already reported, cleared when dispatch resumes;
         transition logging only."""
         self._lwd_drift_seen: set[int] = set()
         """Engines already reported as having drifted books."""
-        """Round-robin anchor shared by routing and engine picking."""
+        self._lwd_last_fleet_seats: tuple[int, ...] | None = None
+        """Last reported per-engine seat ledger; transition logging only."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -264,12 +267,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
 
     def has_requests(self) -> bool:
-        """Keep stepping while any UP send still needs watermark settlement.
+        """Whether this step has anything to do; False parks the engine on
+        its input queue.
 
-        A full pending gate stops new EMBED batches, but the empty UNEMBED
-        step still executes the worker and harvests completed sends. Without
-        this predicate the edge can sleep forever with pending sends that no
-        later batch can clear.
+        Keep stepping while any UP send still needs watermark settlement: a
+        full pending gate stops new EMBED batches, but the empty UNEMBED
+        step still executes the worker and harvests completed sends, and
+        without that term the edge sleeps holding sends no later batch can
+        clear.
+
+        Every term is one an event can clear while parked: requests arrive
+        on the input queue, and the control plane posts a WAKEUP for c2e,
+        prefix-ready and refill notifies (LwdEdgeEngineCore.
+        _lwd_dispatch_message). A term no such event follows would park the
+        edge for good.
         """
         return (
             bool(self.unembed_notify_queue)
@@ -287,38 +298,68 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             len(self.running),
             sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
         )
+        self._lwd_log_fleet_seats()
         out = self._lwd_schedule_embed()
         if out is not None:
             return out
         return self._lwd_schedule_unembed()
 
-    def _lwd_pick_serving_engine(self) -> int | None:
-        """The engine this step serves: one that has routed work and passes
-        its gate, rotating from the last served engine so a busy engine
-        never starves the others. None when every engine with work is
-        gated or there is no work at all."""
-        routed = {
-            dp_idx
-            for dp_idx in self._lwd_route.values()
-            if dp_idx < len(self._lwd_accounts)
-        }
-        if not routed:
-            self._lwd_note_dispatch_stall("no-routed-work")
-            return None
+    def _lwd_has_prefill_work(self, dp_idx: int) -> bool:
+        """Whether this engine holds prefill the picker could batch.
+
+        Same two sources as `_lwd_pick_prefill_batch`: a resume still in
+        running, or a queued request routed here. Routed-but-decoding
+        requests are not work for the edge -- their prompt is already sent
+        and only the cloud can advance them."""
+        if self._lwd_has_prefill_chunk_inflight(dp_idx):
+            return True
+        return any(
+            self._lwd_route.get(request.request_id) == dp_idx
+            for queue in (self.skipped_waiting, self.waiting)
+            for request in queue
+        )
+
+    def _lwd_servable_engine(self) -> int | None:
+        """The engine this step would serve: one that holds prefill work and
+        passes its gate, rotating from the last served engine so a busy
+        engine never starves the others. None when no engine can be served.
+
+        Pure by contract: the liveness predicate calls this on every step,
+        so the rotation anchor, the gate transition log and the stall log
+        all belong to the caller that actually serves a step. Moving them
+        here makes a query indistinguishable from a dispatch -- the rotation
+        skips engines nobody served, and the stall log fires every step."""
         num_engines = len(self._lwd_accounts)
         for offset in range(num_engines):
             dp_idx = (self._lwd_last_engine + 1 + offset) % num_engines
-            if dp_idx not in routed:
+            if not self._lwd_has_prefill_work(dp_idx):
                 continue
             account = self._lwd_accounts[dp_idx]
             if account.is_gated(
                 self.max_num_running_reqs,
                 self._lwd_has_prefill_chunk_inflight(dp_idx),
             ):
-                self._lwd_log_gate_transition(account)
                 continue
-            self._lwd_last_engine = dp_idx
             return dp_idx
+        return None
+
+    def _lwd_note_embed_stall(self) -> None:
+        """Report prefill work that exists but is gated on every engine --
+        the shape of an edge/cloud deadlock.
+
+        Holding no prefill work at all is not a stall but the normal decode
+        steady state, and reporting it would flip stalled/resumed on every
+        request that finishes its prompt. The fleet seat ledger already
+        covers that state."""
+        pending = [
+            account
+            for account in self._lwd_accounts
+            if self._lwd_has_prefill_work(account.dp_idx)
+        ]
+        if not pending:
+            return
+        for account in pending:
+            self._lwd_log_gate_transition(account)
         self._lwd_note_dispatch_stall(
             "all-gated: "
             + " ".join(
@@ -327,15 +368,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"routed={account.load},"
                 f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
                 f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
-                for account in self._lwd_accounts
-                if account.dp_idx in routed
+                for account in pending
             ),
             key="all-gated",
         )
         # Every engine gated is the state a leaked slot never leaves, so
         # audit here rather than on every step.
         self._lwd_audit_accounts()
-        return None
 
     def _lwd_note_dispatch_stall(self, reason: str | None, key: str = "") -> None:
         """Log why the edge stopped (or resumed) producing EMBED batches.
@@ -371,10 +410,28 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 account.pending_chunks(),
             )
 
+    def _lwd_log_fleet_seats(self) -> None:
+        """Report the fleet's seat ledger whenever it changes.
+
+        One line answers the question the per-engine accounting exists for:
+        are the cloud DPs filling up in parallel, or is the fleet pinned at
+        one DP's worth of concurrency? Reported on change rather than per
+        step -- a step is milliseconds."""
+        seats = tuple(account.inflight for account in self._lwd_accounts)
+        if seats == self._lwd_last_fleet_seats:
+            return
+        self._lwd_last_fleet_seats = seats
+        lwd_logger.info(
+            "[edge-sched] fleet seats %s of %d per dp, waiting=%d",
+            list(seats),
+            self.max_num_running_reqs,
+            len(self.waiting) + len(self.skipped_waiting),
+        )
+
     def _lwd_embed_dispatchable(self) -> bool:
-        """EMBED dispatchability: some engine has routed work and passes its
-        gate."""
-        return self._lwd_pick_serving_engine() is not None
+        """EMBED dispatchability: some engine holds prefill work and passes
+        its gate."""
+        return self._lwd_servable_engine() is not None
 
     def _lwd_schedule_embed(self) -> SchedulerOutput | None:
         """Chunked batch + budget clamp + RangeNotify of one engine, then
@@ -385,9 +442,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         advanced num_computed_tokens, so a dropped chunk would never be
         embedded and the next offset would not match the cloud. A notify
         that cannot be sent raises instead."""
-        dp_idx = self._lwd_pick_serving_engine()
+        dp_idx = self._lwd_servable_engine()
         if dp_idx is None:
+            self._lwd_note_embed_stall()
             return self._lwd_schedule_abort_notice()
+        # The rotation advances on the step that serves an engine, never on
+        # the liveness query, which runs several times per step.
+        self._lwd_last_engine = dp_idx
         out = self._lwd_schedule_batch(dp_idx)
         if not out.num_scheduled_tokens:
             # An ungated engine that still yields nothing. Harmless when
@@ -710,9 +771,26 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         scheduled via the base-class visible-set mechanism (budget clamped
         to the picked chunk total -- the picker's cap also covers the cloud's
         drafting slots, which the edge's native budget does not charge -- so
-        the chunk split is reproduced natively)."""
+        the chunk split is reproduced natively).
+
+        Only this engine's hidden requests are charged against the seat
+        budget: the batch goes to one cloud DP, and `max_num_seqs` is that
+        DP's own limit. Charging the siblings' running requests would drive
+        this engine's budget to zero once the fleet total reaches a single
+        DP's cap, which is the same 1/N ceiling the gate avoids."""
         req_ids, expected = self._lwd_pick_prefill_batch(dp_idx)
-        return self._lwd_schedule(req_ids, token_budget_cap=sum(expected.values()))
+        picked = set(req_ids)
+        hidden_seats = sum(
+            1
+            for request in self.running
+            if request.request_id not in picked
+            and self._lwd_route.get(request.request_id) == dp_idx
+        )
+        return self._lwd_schedule(
+            req_ids,
+            token_budget_cap=sum(expected.values()),
+            hidden_seats=hidden_seats,
+        )
 
     def _try_schedule_encoder_inputs(
         self,

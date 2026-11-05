@@ -103,6 +103,7 @@ class LwdBaseScheduler(AsyncScheduler):
         *,
         token_budget_cap: int | None = None,
         chunk_threshold: int | None = None,
+        hidden_seats: int | None = None,
     ) -> SchedulerOutput:
         """Isolated scheduling: schedule only the requests named by req_ids
         -- the rest are temporarily removed from the three queues and
@@ -125,7 +126,14 @@ class LwdBaseScheduler(AsyncScheduler):
         invisible to native concurrent admission; slots are deducted by the
         hidden count to prevent over-issue (edge-side picker free_seq and
         cloud-side preflight are the first line of defense; this is defense
-        in depth)."""
+        in depth).
+
+        `hidden_seats` overrides that deduction for callers whose seat
+        budget is not the whole hidden set. The edge serves one cloud DP
+        per step while holding the requests of every DP, and each cloud DP
+        has its own `max_num_seqs`; deducting the siblings' requests would
+        leave this DP no seats at all once the fleet total reaches one
+        DP's cap, pinning concurrency at 1/N of the deployment."""
         picked = {self.requests[req_id] for req_id in req_ids}
         from_running = [req for req in self.running if req in picked]
         from_waiting = [req for req in self.waiting if req in picked]
@@ -139,7 +147,8 @@ class LwdBaseScheduler(AsyncScheduler):
         self.waiting = self._lwd_new_queue(from_waiting)
         self.skipped_waiting = self._lwd_new_queue(from_skipped)
         saved_cap = self.max_num_running_reqs
-        self.max_num_running_reqs = max(0, saved_cap - len(saved[0]))
+        hidden = len(saved[0]) if hidden_seats is None else hidden_seats
+        self.max_num_running_reqs = max(0, saved_cap - hidden)
         saved_budget = self.max_num_scheduled_tokens
         if token_budget_cap is not None:
             self.max_num_scheduled_tokens = min(saved_budget, max(0, token_budget_cap))
