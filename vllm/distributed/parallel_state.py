@@ -2372,20 +2372,27 @@ def _lwd_initialize_model_parallel(
     # The Engram group is the host-local part of the DP group: co-located
     # replicas map one host table instead of one each, which keeps the
     # driver's pinned pool from holding a copy per replica. One replica per
-    # host makes it a singleton, the table then being split by TP alone.
+    # host has nothing to share, so the table is split by TP alone and no
+    # group is built -- an absent group is how the native path below
+    # `engram_dp_size > 1` says that, and the readers rely on it: a lookup
+    # takes the gathering path whenever the group exists, where it needs the
+    # DP token metadata that vLLM only publishes above one DP replica.
     #
-    # Built unconditionally, unlike the native path's `engram_config is not
-    # None`: group creation is a world collective, and only the cloud has an
-    # Engram config. Deciding per side would have the cloud create a group the
-    # edge never joins, which deadlocks before any error surfaces. Groups of
-    # a model without Engram layers cost a communicator nobody uses.
+    # The decision reads the whole topology rather than this rank's own
+    # group: group creation is a world collective, so one side finding its
+    # replicas co-located while the other does not would have that side
+    # create a group the other never joins, deadlocking before any error
+    # surfaces. The same reason keeps the decision independent of
+    # `engram_config`, which the native path consults but only the cloud has.
+    engram_dp_shares_a_host = any(len(group) > 1 for group in spec.engram_dp_groups)
     assert _ENGRAM_DP is None, "engram data parallel group is already initialized"
-    _ENGRAM_DP = init_model_parallel_group(
-        [list(group) for group in spec.engram_dp_groups],
-        local_rank,
-        backend,
-        group_name="edp",
-    )
+    if engram_dp_shares_a_host:
+        _ENGRAM_DP = init_model_parallel_group(
+            [list(group) for group in spec.engram_dp_groups],
+            local_rank,
+            backend,
+            group_name="edp",
+        )
     if vllm_config.model_config is None or vllm_config.model_config.is_moe:
         # The MoE all2all rides the EP group, so it spans the whole instance:
         # an EP group per TP group would route each token to the experts of
@@ -2405,12 +2412,13 @@ def _lwd_initialize_model_parallel(
     engram_config = vllm_config.engram_config
     logger.info(
         "[LWD] rank %d in world size %d: TP group %s, DP group %s, Engram "
-        "group %s (shared=%s), EP group %s, data-plane channels %s",
+        "group %s (built=%s, shared=%s), EP group %s, data-plane channels %s",
         rank,
         world_size,
         list(tp_group),
         spec.dp_group_of(rank),
         spec.engram_dp_group_of(rank),
+        engram_dp_shares_a_host,
         engram_config is not None and engram_config.dp_shared_memory,
         spec.ep_group_of(rank),
         spec.channel_endpoints_of(rank),
