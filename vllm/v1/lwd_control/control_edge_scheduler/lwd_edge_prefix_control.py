@@ -88,7 +88,8 @@ class LwdEdgePrefixControl:
         timer.daemon = True
         self._pending[request.request_id] = (request, timer)
         try:
-            engine._lwd_admit_and_notify(request)
+            if not engine._lwd_probe_manager.submit(request):
+                engine._lwd_add_request_after_probe(request)
         except Exception:
             self._pending.pop(request.request_id, None)
             timer.cancel()

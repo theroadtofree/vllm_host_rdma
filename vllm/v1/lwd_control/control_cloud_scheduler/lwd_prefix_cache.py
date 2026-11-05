@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from math import lcm
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -217,3 +217,50 @@ def init_lwd_prefix_cache(
         use_eagle=use_eagle,
         reservations=LwdPrefixReservations(manager),
     )
+
+
+class LwdProbeQueryAdapter:
+    """Read-only HTTP prefix lookup; RequestNotify owns reservations."""
+
+    def __init__(
+        self,
+        manager: KVCacheManager,
+        hash_block_size: int,
+        alignment_tokens: int,
+        instance_id: str,
+        cloud_id: int,
+    ) -> None:
+        self._manager = manager
+        self._hash_block_size = hash_block_size
+        self._alignment_tokens = alignment_tokens
+        self._instance_id = instance_id
+        self._cloud_id = cloud_id
+
+    def _query(self, manifest) -> Any:
+        from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
+
+        if manifest.block_size != self._hash_block_size:
+            raise ValueError(
+                "LWD manifest block size must match the cloud hash block size "
+                f"({manifest.block_size} != {self._hash_block_size})"
+            )
+        _, hit, _ = self._manager.coordinator.find_longest_cache_hit(
+            list(manifest.full_block_hashes),
+            max_cache_hit_length=max(0, manifest.prompt_tokens - 1),
+        )
+        hit = hit // self._hash_block_size * self._hash_block_size
+        return LwdProbeResult(
+            request_id=manifest.request_id,
+            instance_id=self._instance_id,
+            block_size=self._hash_block_size,
+            hit_blocks=hit // self._hash_block_size,
+            hit_tokens=hit,
+            alignment_tokens=self._alignment_tokens,
+            cloud_id=self._cloud_id,
+        )
+
+    def peek(self, manifest) -> Any:
+        return self._query(manifest)
+
+    def probe(self, manifest) -> Any:
+        return self._query(manifest)

@@ -97,9 +97,8 @@ class LwdCloudControlBridge:
         self._probe_futures: dict[str, asyncio.Future] = {}
         self._usage_futures: dict[str, asyncio.Future] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
-        # 扇出/预留应答收集:键为 reply_key(扇出 "<rid>#probe"、赢家预留
-        # "<rid>#reserve"),与单引擎 future 命名空间隔离,迟到的扇出
-        # 应答找不到 waiter 即丢弃,不污染后续同 rid 流量
+        # 扇出应答收集:键为 reply_key("<rid>#probe")，与单引擎
+        # future 命名空间隔离，迟到的扇出应答找不到 waiter 即丢弃
         self._fanout_waiters: dict[str, queue.Queue] = {}
         # 并列轮转计数器(命中并列时依次轮换赢家引擎,防热点钉死)
         self._rr_counter = 0
@@ -317,37 +316,7 @@ class LwdCloudControlBridge:
             "[Lwd][ctrl] fanout placement req=%s hits=%s winner=%d",
             manifest.request_id, hits, winner,
         )
-        # 预留只落赢家引擎:复用 probe 命令的预留语义(reserve=True)
-        reserve_key = f"{manifest.request_id}#reserve"
-        rsv_waiter: queue.Queue = queue.Queue(maxsize=1)
-        with self._lock:
-            self._fanout_waiters[reserve_key] = rsv_waiter
-        self._command_queues[winner].put({
-            "type": "probe",
-            "manifest": manifest,
-            "reserve": True,
-            "engine_index": winner,
-            "reply_key": reserve_key,
-        })
-        try:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"prefix reserve timed out after {timeout}s")
-            ok, _, payload = await asyncio.wait_for(
-                loop.run_in_executor(None, rsv_waiter.get), remaining
-            )
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                f"prefix reserve timed out after {timeout}s") from None
-        finally:
-            with self._lock:
-                self._fanout_waiters.pop(reserve_key, None)
-            with contextlib.suppress(Exception):
-                rsv_waiter.put_nowait((False, -1, "poison"))
-        if not ok:
-            raise RuntimeError(payload or "reserve failed")
-        return dataclass_replace(payload, engine_index=winner)
+        return dataclass_replace(results[winner], engine_index=winner)
 
     async def wait_usage(
         self, request_id: str, timeout: float = _USAGE_WAIT_TIMEOUT

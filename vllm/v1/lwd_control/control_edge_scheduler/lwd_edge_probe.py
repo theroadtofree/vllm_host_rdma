@@ -153,11 +153,7 @@ class LwdEdgeProbeManager:
         )
 
     def submit(self, request: Any) -> bool:
-        if (
-            not self.enabled
-            or request.skip_reading_prefix_cache
-            or request.request_id in self._inflight
-        ):
+        if not self.enabled or request.request_id in self._inflight:
             return False
         coordination = self._vllm_config.lwd_config.coordination
         target_cloud = self._health.next() if coordination.control_url_map else None
@@ -179,14 +175,19 @@ class LwdEdgeProbeManager:
         model_config = self._vllm_config.model_config
         model_name = model_config.served_model_name or model_config.model
         placement_only = coordination.placement_only
+        manifest_chain: list[bytes] | None = None
         if self._runtime is None:
             self._runtime = LwdProbeRuntime()
         runtime = self._runtime
 
         async def job() -> Any:
+            nonlocal manifest_chain
             session = await runtime.ensure_session()
             manifest = client.build_manifest(
                 request_id, prompt_ids, media_items=media_items
+            )
+            manifest_chain = None if placement_only else list(
+                manifest.full_block_hashes
             )
             result = await client.negotiate(
                 session,
@@ -196,8 +197,7 @@ class LwdEdgeProbeManager:
                 media_items=media_items,
                 model=model_name,
             )
-            chain = None if placement_only else list(manifest.full_block_hashes)
-            return result, chain
+            return result, manifest_chain
 
         try:
             future = runtime.submit(job())
@@ -217,7 +217,7 @@ class LwdEdgeProbeManager:
         def watchdog() -> None:
             if not future.done():
                 future.cancel()
-                enqueue(None)
+                enqueue((None, manifest_chain))
 
         timer = threading.Timer(
             coordination.probe_timeout + _WATCHDOG_HEADROOM_S, watchdog
@@ -230,7 +230,7 @@ class LwdEdgeProbeManager:
                 outcome = future.result()
             except Exception:
                 logger.warning("[LWD] probe failed; using full prefill", exc_info=True)
-                outcome = None
+                outcome = (None, manifest_chain)
             enqueue(outcome)
 
         future.add_done_callback(done)
@@ -253,7 +253,7 @@ class LwdEdgeProbeManager:
                 continue
             del self._inflight[request_id]
             if target is not None:
-                if outcome is None:
+                if outcome is None or outcome[0] is None:
                     self._health.record_failure(target)
                 else:
                     self._health.record_success(target)
@@ -263,6 +263,11 @@ class LwdEdgeProbeManager:
                 )
                 continue
             result, chain = outcome
+            if result is None:
+                completions.append(
+                    LwdProbeCompletion(inflight.request, None, chain, target, build_size)
+                )
+                continue
             learned = int(result.block_size)
             self._hash_sizes[self._cloud_for_result(target, result)] = learned
             if chain is not None and learned != build_size:

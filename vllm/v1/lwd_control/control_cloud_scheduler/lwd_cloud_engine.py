@@ -36,6 +36,7 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
     LwdCloudScheduler,
 )
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+    LwdProbeQueryAdapter,
     init_lwd_prefix_cache,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
@@ -53,8 +54,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudParamsNotify,
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
-    LwdFinishNotify,
-    LwdGenChainNotify,
     LwdMessage,
     LwdPrefixReadyNotify,
     LwdRangeNotify,
@@ -194,6 +193,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.scheduler.lwd_refill_sender = self._lwd_send_refill
 
     def _lwd_assemble(self) -> None:
+        self.lwd_config.validate_prefix_caching(
+            self.vllm_config.cache_config.enable_prefix_caching
+        )
         self._lwd_init_prefix_cache()
         self._lwd_edges: set[LwdPeer] = set()
         self._lwd_prompt_lens: dict[str, int] = {}
@@ -210,38 +212,23 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
         self._lwd_failed_connections: set[LwdConnectionId] = set()
-        self._lwd_edge_chains: dict[str, tuple[int, list[bytes]]] = {}
-        self.scheduler.lwd_edge_chains = self._lwd_edge_chains
-        self.scheduler.lwd_hash_block_size = 0
+        self.scheduler.lwd_hash_block_size = self._lwd_hash_block_size
         self._lwd_prefix_hits: dict[str, int] = {}
-        self._lwd_prefix_coordinator = None
-        prefix_hash_block_size = 0
+        prefix_hash_block_size = self._lwd_hash_block_size
         coordination = self.lwd_config.coordination
-        # The coordinator serves probes whenever coordination is enabled,
-        # NOT only with prefix caching: probe replies also carry placement
-        # and routing data (engine_index / cloud_id) plus health
-        # bookkeeping, which must keep flowing with prefix caching off.
-        # With caching disabled the NoPrefixCache coordinator returns an
-        # empty hit, so probes answer with zero hits instead of hanging in
-        # a consumer-less command queue until the 20s timeout.
-        if coordination is not None and coordination.enabled:
-            from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-            from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_coordinator import (
-                LwdPrefixCoordinator,
-            )
-
-            hash_block_size = resolve_kv_cache_block_sizes(
-                self.scheduler.kv_cache_config, self.vllm_config
-            )[1]
-            prefix_hash_block_size = hash_block_size
-            self.scheduler.lwd_hash_block_size = hash_block_size
-            self._lwd_prefix_coordinator = LwdPrefixCoordinator(
-                hash_block_size=hash_block_size,
+        self._lwd_probe_query = None
+        if (
+            self._lwd_prefix_enabled
+            and coordination is not None
+            and coordination.enabled
+        ):
+            self._lwd_probe_query = LwdProbeQueryAdapter(
+                manager=self.scheduler.kv_cache_manager,
+                hash_block_size=self._lwd_hash_block_size,
+                alignment_tokens=self._lwd_prefix_state.alignment_tokens,
                 instance_id=f"cloud-{self.lwd_config.instance_id}",
-                kv_cache_manager=self.scheduler.kv_cache_manager,
                 cloud_id=self.lwd_config.instance_id,
             )
-        self.scheduler.lwd_prefix_coordinator = self._lwd_prefix_coordinator
         self.scheduler.lwd_prefix_hits = self._lwd_prefix_hits
         self.scheduler.lwd_refill_sender = self._lwd_send_refill
         self._lwd_coord_pending: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -250,11 +237,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self, "cloud_control_event_queue", None
         )
         command_queue = getattr(self, "cloud_control_command_queue", None)
-        if (
-            self._lwd_prefix_coordinator is not None
-            and command_queue is not None
-            and self.cloud_control_event_queue is not None
-        ):
+        if self._lwd_probe_query is not None:
+            if command_queue is None or self.cloud_control_event_queue is None:
+                raise RuntimeError(
+                    "[LWD] prefix caching requires HTTP coordination queues"
+                )
             from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_control import (
                 LwdCloudControlProcessor,
             )
@@ -379,9 +366,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
-        if self._lwd_prefix_coordinator is not None:
-            super().add_request(request, request_wave)
-            return
         nonce = getattr(request, "lwd_prefix_nonce", 0)
         if not nonce:
             if self._lwd_prefix_enabled:
@@ -427,6 +411,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 request_id, 0, nonce, error="cloud admission failed"
             )
             raise
+        self._lwd_prefix_hits[request_id] = hit_tokens
         self._lwd_send_prefix_ready(request_id, hit_tokens, nonce)
 
     def _lwd_register_recv_hint(self) -> None:
@@ -469,8 +454,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 LwdRangeNotify,
                 LwdRequestNotify,
                 LwdAbortNotify,
-                LwdGenChainNotify,
-                LwdFinishNotify,
             ),
         ):
             return False
@@ -534,15 +517,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
             self._lwd_handle_range_notify(connection_id, msg)
             return
-        if not isinstance(
-            msg,
-            (
-                LwdRequestNotify,
-                LwdAbortNotify,
-                LwdGenChainNotify,
-                LwdFinishNotify,
-            ),
-        ):
+        if not isinstance(msg, (LwdRequestNotify, LwdAbortNotify)):
             return
         canonical_id = wrap_req_id(peer.instance_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=canonical_id)
@@ -550,25 +525,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_retired_routes.pop(canonical_id, None)
             self._lwd_request_routes[canonical_id] = peer
             self._lwd_handle_request_notify(msg)
-        elif isinstance(msg, LwdAbortNotify):
+        else:
             self._lwd_handle_abort_notify(msg)
-        elif isinstance(msg, LwdGenChainNotify):
-            # Generation notifications carry the full chain, not a delta.
-            self._lwd_edge_chains[canonical_id] = (
-                msg.block_size,
-                list(msg.block_hashes),
-            )
-        elif isinstance(msg, LwdFinishNotify):
-            coordinator = getattr(self, "_lwd_prefix_coordinator", None)
-            if coordinator is not None:
-                coordinator.apply_finish_chain(
-                    canonical_id,
-                    msg.prompt_tokens,
-                    msg.completion_tokens,
-                    list(msg.full_block_hashes),
-                    msg.publish_cache,
-                )
-            self._lwd_edge_chains.pop(canonical_id, None)
 
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
         return LwdConnectionId(
@@ -694,84 +652,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             raise RuntimeError(
                 f"[LWD] request_id {request_id} reused before previous generation drained"
             )
-        coordinator = self._lwd_prefix_coordinator
-        if coordinator is not None:
-            if notify.prefix_nonce:
-                edge_request_id = unwrap_req_id(notify.request_id)
-                if (
-                    not coordinator.has_reservation(notify.request_id)
-                    and not notify.skip_reading_prefix_cache
-                ):
-                    from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
-                        LwdPrefixManifest,
-                    )
-
-                    block_size = self.scheduler.lwd_hash_block_size
-                    try:
-                        coordinator.probe(
-                            LwdPrefixManifest(
-                                request_id=notify.request_id,
-                                prompt_tokens=notify.num_prompt_tokens,
-                                block_size=block_size,
-                                full_block_hashes=tuple(notify.block_hashes),
-                                tail_hash=(
-                                    b"\0" * 32
-                                    if notify.num_prompt_tokens % block_size
-                                    else None
-                                ),
-                            )
-                        )
-                    except Exception as exc:
-                        self._lwd_send_until_queued(
-                            self._lwd_request_routes[notify.request_id],
-                            LwdPrefixReadyNotify(
-                                edge_request_id, 0, notify.prefix_nonce, str(exc)
-                            ),
-                        )
-                        return
-                if notify.skip_reading_prefix_cache:
-                    hit = 0
-                else:
-                    hit = coordinator.claim(notify.request_id)
-                    if hit is None:
-                        self._lwd_send_until_queued(
-                            self._lwd_request_routes[notify.request_id],
-                            LwdPrefixReadyNotify(
-                                edge_request_id,
-                                0,
-                                notify.prefix_nonce,
-                                "missing prefix reservation",
-                            ),
-                        )
-                        return
-                self._lwd_prefix_hits[notify.request_id] = hit
-                self._lwd_send_until_queued(
-                    self._lwd_request_routes[notify.request_id],
-                    LwdPrefixReadyNotify(
-                        edge_request_id, hit, notify.prefix_nonce
-                    ),
-                )
-            elif (
-                notify.skip_reading_prefix_cache
-                or (
-                    not notify.prefix_probe_succeeded
-                    and notify.prefix_hit_tokens == 0
-                )
-            ):
-                # Fail-open and placement-only send the full prompt, so any
-                # late/stale probe reservation must not select a cloud hit.
-                coordinator.discard(notify.request_id)
-                self._lwd_prefix_hits[notify.request_id] = 0
-            else:
-                hit = coordinator.claim(notify.request_id)
-                if hit is None or hit != notify.prefix_hit_tokens:
-                    coordinator.discard(notify.request_id)
-                    raise RuntimeError(
-                        "[LWD] gateway prefix boundary mismatch for "
-                        f"{notify.request_id}: edge={notify.prefix_hit_tokens} "
-                        f"cloud={hit}; refusing to consume trimmed embeddings"
-                    )
-                self._lwd_prefix_hits[notify.request_id] = hit
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         if notify.prefix_nonce:
             self._lwd_request_nonces[request_id] = notify.prefix_nonce
@@ -823,8 +703,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             return
         self.scheduler._lwd_refill_gate.discard(request_id)
         self.scheduler._lwd_refill_pending.pop(request_id, None)
-        if self._lwd_prefix_coordinator is not None:
-            self._lwd_prefix_coordinator.discard(request_id)
+        reservations = getattr(self.scheduler, "lwd_prefix_reservations", None)
+        if reservations is not None:
+            reservations.release(request_id)
         self._lwd_retire_request(request_id, preserve_prompt=True)
         lwd_logger.info(
             "[cloud] abort req=%s nonce=%d", request_id, notify.prefix_nonce
@@ -955,15 +836,14 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
     def _lwd_poll_coordination(self) -> None:
-        coordinator = self._lwd_prefix_coordinator
-        if coordinator is None:
+        probe_query = getattr(self, "_lwd_probe_query", None)
+        if probe_query is None:
             return
         processor = getattr(
             self, "cloud_control_processor", self._lwd_control_processor
         )
         if processor is not None:
-            processor.poll(coordinator)
-        coordinator.sweep_expired(time.monotonic())
+            processor.poll(probe_query)
 
     def has_work(self) -> bool:
         # Native WAKEUP reevaluates this predicate even when the scheduler is
@@ -977,7 +857,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
-        self._lwd_complete_prefix_requests(engine_core_outputs)
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
@@ -988,23 +867,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
         engine_core_outputs, model_executed = super().step()
-        self._lwd_complete_prefix_requests(engine_core_outputs)
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
-
-    def _lwd_complete_prefix_requests(self, engine_core_outputs: Any) -> None:
-        coordinator = self._lwd_prefix_coordinator
-        if coordinator is None or not engine_core_outputs:
-            return
-        for outputs in engine_core_outputs.values():
-            for output in outputs.outputs:
-                request = self.scheduler.requests.get(output.request_id)
-                if (
-                    request is not None
-                    and request.num_computed_tokens >= request.num_prompt_tokens
-                ):
-                    coordinator.complete_request(output.request_id)
 
     def _lwd_publish_finished_usage(self, engine_core_outputs: Any) -> None:
         records = self.scheduler.lwd_finished_records
@@ -1020,12 +885,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 completion_tokens=completion_tokens,
                 cached_tokens=cached_tokens,
             )
-            if self._lwd_prefix_coordinator is not None:
-                # Release the reservation and remember cloud-side counters. The
-                # tenant-keyed generated hashes arrive in LwdFinishNotify.
-                usage = self._lwd_prefix_coordinator.finish(
-                    request_id, [], prompt_tokens, completion_tokens
-                )
             if event_queue is not None:
                 event_queue.put(
                     {

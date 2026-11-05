@@ -86,6 +86,17 @@ class LwdConfig:
             api=api if api is not None else LwdAPIConfig(),
         )
 
+    def validate_prefix_caching(self, enabled: bool) -> None:
+        """Require one explicit HTTP coordination path for prefix caching."""
+        if not enabled:
+            return
+        if self.coordination is None or not self.coordination.enabled:
+            raise ValueError(
+                "[LWD] prefix caching requires enabled HTTP coordination "
+                "on both edge and cloud"
+            )
+        self.coordination.validate_role(self.role)
+
     def skips_module(self, path: str) -> bool:
         """Whether this role replaces a model component with a placeholder."""
         if self.role == "edge":

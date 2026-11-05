@@ -280,30 +280,12 @@ class KVCacheManager:
                   Pinned so sparse prefix-cache retention does not drop
                   the junction and defeat cross-request reuse.
         """
-        # LWD cross-edge probes freeze both zero hits and the exact positive-hit
-        # block layout. Reusing that snapshot prevents EAGLE/MTP alignment from
-        # being applied a second time during native admission.
-        lwd_prefix_coordinator = getattr(self, "lwd_prefix_coordinator", None)
+        # Cache lookup was already rejected above for disabled caching and
+        # skip_reading_prefix_cache requests. LWD consumes the snapshot frozen
+        # by RequestNotify -> reserve -> READY.
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
-        if lwd_prefix_coordinator is not None:
-            if not lwd_prefix_coordinator.has_reservation(request.request_id):
-                # Gateway fail-open/placement-only sends the full prompt. Never
-                # fall back to hashing placeholder embeddings or renegotiating
-                # a different hit after the edge has chosen its trim boundary.
-                return self.empty_kv_cache_blocks, 0, 0
-            pinned = lwd_prefix_coordinator.pinned_computed_blocks(request.request_id)
-            if pinned is None:
-                return self.empty_kv_cache_blocks, 0, 0
-            blocks_by_group, num_computed_tokens = pinned
-            return (
-                self.create_kv_cache_blocks(blocks_by_group),
-                num_computed_tokens,
-                0,
-            )
 
-        # Cache lookup was already rejected above for disabled caching and
-        # skip_reading_prefix_cache requests.
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
         # This can trigger recomputation of an entire block, rather than just
@@ -346,9 +328,6 @@ class KVCacheManager:
         Pins are released and snapshots retired: the native KV chain now owns
         the blocks. A later preemption must reserve a fresh hit.
         """
-        coordinator = getattr(self, "lwd_prefix_coordinator", None)
-        if coordinator is not None:
-            coordinator.commit_allocation(request.request_id)
         reservations = getattr(self, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request.request_id)
@@ -363,9 +342,6 @@ class KVCacheManager:
         """
         if request.num_preemptions <= 0:
             return
-        coordinator = getattr(self, "lwd_prefix_coordinator", None)
-        if coordinator is not None:
-            coordinator.rollback_allocation(request.request_id)
         reservations = getattr(self, "lwd_prefix_reservations", None)
         if reservations is not None:
             reservations.release(request.request_id)

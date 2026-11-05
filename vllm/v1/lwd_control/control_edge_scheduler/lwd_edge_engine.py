@@ -53,8 +53,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdC2eNotify,
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
-    LwdFinishNotify,
-    LwdGenChainNotify,
     LwdMessage,
     LwdPrefixReadyNotify,
     LwdRefillNotify,
@@ -86,9 +84,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
+        self.lwd_config.validate_prefix_caching(self._lwd_prefix_enabled)
         self._lwd_prefix_control = (
             LwdEdgePrefixControl(self, LWD_PREFIX_READY_TIMEOUT_S)
-            if self._lwd_prefix_enabled and self.lwd_config.coordination is None
+            if self._lwd_prefix_enabled
             else None
         )
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
@@ -99,10 +98,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             ),
         )
         self._lwd_probe_chains: dict[str, list[bytes]] = {}
-        self._lwd_probe_block_sizes: dict[str, int] = {}
-        self._lwd_gen_chain_sent: dict[str, int] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
-        self.scheduler.lwd_on_tokens = self._lwd_announce_gen_chain
         self.scheduler.lwd_has_pending = lambda: (
             self._lwd_probe_manager.pending
             or bool(
@@ -288,8 +284,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return
         self._lwd_add_request_after_probe(request)
 
-    def _lwd_admit_and_notify(self, request: Request) -> None:
-        dp_idx = self.scheduler.lwd_admit_request(request)
+    def _lwd_admit_and_notify(
+        self,
+        request: Request,
+        preferred: LwdConnectionId | None = None,
+    ) -> None:
+        dp_idx = self.scheduler.lwd_admit_request(request, preferred)
         client = self._lwd_coord_clients.get(dp_idx)
         try:
             if client is not None:
@@ -341,38 +341,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> None:
         preferred = self._lwd_preferred_connection(completion)
         request.lwd_prefix_probe_succeeded = False
+        if completion is not None and completion.chain is not None:
+            self._lwd_probe_chains[request.request_id] = completion.chain
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
-            request.lwd_prefix_probe_succeeded = not coordination.placement_only
-            hit = 0 if coordination.placement_only else completion.result.hit_tokens
+            placement_only = (
+                coordination is not None and coordination.placement_only
+            )
+            request.lwd_prefix_probe_succeeded = not placement_only
+            hit = 0 if placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
             alignment = completion.result.alignment_tokens
             if alignment > 0:
                 hit -= hit % alignment
             request.num_computed_tokens = hit
-            if completion.chain is not None:
-                self._lwd_probe_chains[request.request_id] = completion.chain
-                self._lwd_probe_block_sizes[request.request_id] = (
-                    completion.result.block_size
-                )
-        dp_idx = self.scheduler.lwd_admit_request(request, preferred)
-        client = self._lwd_coord_clients.get(dp_idx)
-        if client is not None:
-            client.send_first_req()
-        self._lwd_notify_request(dp_idx, request)
-        chain = self._lwd_probe_chains.get(request.request_id)
-        if chain is not None:
-            block_size = self._lwd_probe_block_sizes[request.request_id]
-            self._lwd_send_to_cloud(
-                dp_idx,
-                LwdGenChainNotify(
-                    request_id=request.request_id,
-                    block_hashes=list(chain),
-                    block_size=block_size,
-                ),
-            )
-            self._lwd_gen_chain_sent[request.request_id] = len(chain)
-        super().add_request(request)
+        self._lwd_admit_and_notify(request, preferred)
+        control = getattr(self, "_lwd_prefix_control", None)
+        if control is None or request.request_id not in control.pending:
+            self._lwd_enqueue_request(request)
 
     def _lwd_preferred_connection(
         self, completion: LwdProbeCompletion | None
@@ -416,8 +402,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         for request_id in request_ids:
             self._lwd_probe_manager.abort(request_id)
             self._lwd_probe_chains.pop(request_id, None)
-            self._lwd_probe_block_sizes.pop(request_id, None)
-            self._lwd_gen_chain_sent.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
         for dp_idx, request_id in routed_aborts:
             request = self.scheduler.requests.get(request_id)
@@ -460,7 +444,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 ),
                 eos_token_id=sampling_params.eos_token_id,
                 prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
-                skip_reading_prefix_cache=request.skip_reading_prefix_cache,
+                skip_reading_prefix_cache=(
+                    request.skip_reading_prefix_cache
+                    or (
+                        self.lwd_config.coordination is not None
+                        and self.lwd_config.coordination.placement_only
+                    )
+                ),
                 prefix_hit_tokens=request.num_computed_tokens,
                 prefix_probe_succeeded=getattr(
                     request, "lwd_prefix_probe_succeeded", False
@@ -471,110 +461,5 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             ),
         )
 
-    def _lwd_announce_gen_chain(self, request: Request) -> None:
-        """Publish each newly completed block with full-chain replacement."""
-        request_id = request.request_id
-        route = self.scheduler._lwd_dp_of_settling(request_id)
-        block_size = self._lwd_probe_block_sizes.get(request_id)
-        coordination = self.lwd_config.coordination
-        if (
-            route is None
-            or block_size is None
-            or coordination is None
-            or not coordination.enabled
-            or coordination.placement_only
-        ):
-            return
-        prompt_ids = list(request.prompt_token_ids or ())
-        token_ids = prompt_ids + list(request.output_token_ids)
-        if len(token_ids) // block_size <= self._lwd_gen_chain_sent.get(
-            request_id, 0
-        ):
-            return
-        try:
-            from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdPrefixHasher
-
-            hasher = LwdPrefixHasher(
-                tenant_key=self._lwd_probe_manager._key(),
-                block_size=block_size,
-                processor_fingerprint=self._lwd_probe_manager._fingerprint(),
-            )
-            state = self._lwd_probe_chains.setdefault(request_id, [])
-            if request.mm_features:
-                state[:] = hasher.build_manifest(
-                    request_id,
-                    token_ids,
-                    media_items=self._lwd_probe_manager._media_items(request),
-                ).full_block_hashes
-            else:
-                state.extend(hasher.chain_extend(state, token_ids))
-            self._lwd_send_to_cloud(
-                route,
-                LwdGenChainNotify(
-                    request_id=request_id,
-                    block_hashes=list(state),
-                    block_size=block_size,
-                ),
-            )
-            self._lwd_gen_chain_sent[request_id] = len(state)
-        except Exception:
-            lwd_logger.warning(
-                "[edge] generation chain announce failed for req=%s (fail-open)",
-                request_id,
-                exc_info=True,
-            )
-
     def _lwd_finish_request(self, request: Request) -> None:
-        """Best-effort final hash-chain publication; never blocks termination."""
-        request_id = request.request_id
-        route = self.scheduler._lwd_dp_of_settling(request_id)
-        block_size = self._lwd_probe_block_sizes.pop(request_id, None)
-        self._lwd_probe_chains.pop(request_id, None)
-        self._lwd_gen_chain_sent.pop(request_id, None)
-        coordination = self.lwd_config.coordination
-        if (
-            route is None
-            or coordination is None
-            or not coordination.enabled
-            or coordination.placement_only
-        ):
-            return
-        try:
-            from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdPrefixHasher
-
-            if block_size is None:
-                block_size = next(
-                    (
-                        params.prefix_hash_block_size
-                        for connection, params in self._lwd_cloud_params.items()
-                        if connection == route and params.prefix_hash_block_size > 0
-                    ),
-                    self.vllm_config.cache_config.block_size,
-                )
-            hasher = LwdPrefixHasher(
-                tenant_key=self._lwd_probe_manager._key(),
-                block_size=block_size,
-                processor_fingerprint=self._lwd_probe_manager._fingerprint(),
-            )
-            prompt_ids = list(request.prompt_token_ids or ())
-            completion_ids = list(request.output_token_ids)
-            manifest = hasher.build_manifest(
-                request_id,
-                prompt_ids + completion_ids,
-                media_items=self._lwd_probe_manager._media_items(request),
-            )
-            self._lwd_send_to_cloud(
-                route,
-                LwdFinishNotify(
-                    request_id=request_id,
-                    prompt_tokens=len(prompt_ids),
-                    completion_tokens=len(completion_ids),
-                    full_block_hashes=list(manifest.full_block_hashes),
-                ),
-            )
-        except Exception:
-            lwd_logger.warning(
-                "[edge] finish chain announce failed for req=%s (fail-open)",
-                request_id,
-                exc_info=True,
-            )
+        self._lwd_probe_chains.pop(request.request_id, None)
