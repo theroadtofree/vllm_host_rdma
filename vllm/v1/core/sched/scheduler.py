@@ -471,12 +471,11 @@ class Scheduler(SchedulerInterface):
         # to the boundary. A block too wide for one chunk advances sub-block
         # and re-aligns at the next boundary.
         if end < prefill_end:
-            max_prefill_tokens = self.max_num_scheduled_tokens
-            long_prefill_threshold = self.scheduler_config.long_prefill_token_threshold
-            if long_prefill_threshold > 0:
-                max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            # A sub-block chunk keeps private running state and re-aligns at
+            # the next boundary; never clamp it down to zero when the whole
+            # chunk sits inside one Mamba block (aligned_end == start).
+            if aligned_end > start:
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
