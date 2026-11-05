@@ -219,6 +219,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
         """Revalidate a preempted request against live blocks and arrivals."""
+        if not getattr(request, "lwd_prefix_probe_succeeded", True):
+            # Fail-open requests have no initial reservation by contract.
+            # Recompute the full prompt after preemption instead of creating a
+            # fictitious zero-hit reservation or triggering a refill.
+            self.lwd_prefix_hits[request.request_id] = 0
+            return True
         reservations = getattr(self, "lwd_prefix_reservations", None)
         assert reservations is not None
         floor = self.lwd_prefix_hits.get(
