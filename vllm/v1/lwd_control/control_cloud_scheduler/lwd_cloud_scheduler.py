@@ -110,10 +110,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
-        # Collect against the gross budget, then charge the drafting slots
-        # of the requests that actually entered: the slot count is a
-        # property of the batch, and the batch is not known until the
-        # windows are collected (_lwd_fit_drafting_slots).
+        # Collect against the token budget left by decode, then fit the
+        # result to the input budget: the drafting slots are charged per
+        # request in the batch, and the batch is not known until the windows
+        # are collected (_lwd_fit_drafting_slots).
         room = max(0, self.max_num_scheduled_tokens - decode_exact)
         windows = self._lwd_collect_prefill_windows(room)
         collected = len(windows)
@@ -136,37 +136,48 @@ class LwdCloudScheduler(LwdBaseScheduler):
         decode_ids: list[str],
         decode_exact: int,
     ) -> list[_LwdPrefillWindow]:
-        """Shrink the collected windows until the batch fits its drafting
-        slots.
+        """Shrink the collected windows to what the native input budget can
+        hold once every decode has been served.
 
-        The native step charges a second budget besides its tokens: every
-        scheduled request also spends `max_num_new_slots_for_drafting` input
-        slots, and caps each request at what is left of them. Rows that
-        ignore those slots are cut short by the native step, which costs a
-        retry per step, so they are charged here first.
+        The native step charges two budgets. Its token budget we clamp
+        through `token_budget_cap`; its *input* budget is
+        `max_num_batched_tokens` and cannot be clamped
+        (`Scheduler.schedule`): each scheduled request spends its tokens
+        plus `max_num_new_slots_for_drafting` slots of it, and the running
+        loop stops outright once less than one slot's worth is left.
 
-        Charged per request in the batch, never per request in the queues.
-        The edge announces a request at admission, so the cloud's waiting
-        queue holds every request routed to this engine -- including those
-        whose prompt has not arrived and which therefore cannot enter this
-        step at all. Reserving for those made the reservation grow with the
-        queue: a deeper queue left less room for prefill, which deepened the
-        queue, and concurrency collapsed to a few requests per step under
-        load while the seats stayed full.
+        Decode has to survive that loop. A resumed prefill is *in* running,
+        so it is served before the other decodes -- a window sized to the
+        whole budget then spends the input budget on itself and the decodes
+        behind it are cut off mid-loop, which shows up as a TPOT tail with
+        an unchanged median. So the decodes keep their share up front, and
+        prefill only ever gets the remainder.
+
+        What is charged to prefill is the batch, never the queues: the edge
+        announces a request at admission, so the waiting queue holds every
+        request routed here, including those whose prompt has not arrived
+        and which cannot enter this step at all. Charging those made the
+        reservation grow with the queue -- a deeper queue left less room for
+        prefill, which deepened the queue.
 
         The last window shrinks before any window is dropped: one long
-        prompt can fill the whole budget by itself, and dropping it would
-        hand the step no prefill at all while the slots it was charged for
-        go unused. A window is only dropped once it has nothing left to
-        give.
+        prompt can fill the budget by itself, and dropping it would hand the
+        step no prefill at all while the slots it was charged for go unused.
         """
-        if not self._lwd_draft_slots or not windows:
+        if not windows:
             return windows
-        budget = self.max_num_scheduled_tokens
-        fixed = decode_exact + len(decode_ids) * self._lwd_draft_slots
+        # What the decodes of this step take out of the input budget: their
+        # tokens (decode_exact already counts 1+k each) plus one drafting
+        # allotment per request, and one more slot so the running loop ends
+        # above its `input_budget <= draft_slots` guard rather than on it.
+        reserved = (
+            decode_exact + len(decode_ids) * self._lwd_draft_slots
+        ) + self._lwd_draft_slots
+        room = self.scheduler_config.max_num_batched_tokens - reserved
         rows = sum(window.num_rows for window in windows)
         while windows:
-            over = fixed + rows + len(windows) * self._lwd_draft_slots - budget
+            # Each window costs its rows plus its own drafting allotment.
+            over = rows + len(windows) * self._lwd_draft_slots - room
             if over <= 0:
                 break
             last = windows[-1]
@@ -316,13 +327,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
         """
         no_arrival, partial = self._lwd_window_skips
         queued = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+        # Keyed on the shape, not on the counts: queue depths move almost
+        # every step, and this runs on the cloud's hot path. Bucketing the
+        # counts to powers of two keeps a real change loggable while a
+        # busy steady state stays quiet.
         shape = (
             len(windows),
             collected,
-            no_arrival,
-            partial,
+            no_arrival.bit_length(),
+            partial.bit_length(),
             len(decode_ids),
-            queued,
+            queued.bit_length(),
         )
         if shape == self._lwd_last_admission:
             return
