@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -93,11 +93,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         # parallel drafting, on top of its tokens; the sole home of the
         # formula is lwd_base_scheduler.lwd_draft_slots.
         self._lwd_draft_slots: int = lwd_draft_slots(self.vllm_config)
-        self._lwd_window_skips: tuple[int, int] = (0, 0)
-        """Candidates the last collection passed over: (no arrival yet,
-        partial window refused); admission reporting only."""
-        self._lwd_last_admission: tuple[int, ...] | None = None
-        """Last reported admission shape; transition logging only."""
         lwd_logger.info(
             "[cloud-sched] arrival-driven prefill/decode scheduling (draft_slots=%d)",
             self._lwd_draft_slots,
@@ -110,15 +105,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
-        # Collect against the token budget left by decode, then fit the
-        # result to the input budget: the drafting slots are charged per
-        # request in the batch, and the batch is not known until the windows
-        # are collected (_lwd_fit_drafting_slots).
-        room = max(0, self.max_num_scheduled_tokens - decode_exact)
+        room = self._lwd_prefill_room(decode_ids, decode_exact)
         windows = self._lwd_collect_prefill_windows(room)
-        collected = len(windows)
-        windows = self._lwd_fit_drafting_slots(windows, decode_ids, decode_exact)
-        self._lwd_report_admission(windows, collected, decode_ids, room)
         if windows:
             out = self._lwd_dispatch_windows(windows, decode_ids, decode_exact)
         else:
@@ -130,66 +118,33 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_attach_abort_notice(out)
         return out
 
-    def _lwd_fit_drafting_slots(
-        self,
-        windows: list[_LwdPrefillWindow],
-        decode_ids: list[str],
-        decode_exact: int,
-    ) -> list[_LwdPrefillWindow]:
-        """Shrink the collected windows to what the native input budget can
-        hold once every decode has been served.
+    def _lwd_prefill_room(self, decode_ids: list[str], decode_exact: int) -> int:
+        """Prefill rows this step may admit, after the drafting slots.
 
-        The native step charges two budgets. Its token budget we clamp
-        through `token_budget_cap`; its *input* budget is
-        `max_num_batched_tokens` and cannot be clamped
-        (`Scheduler.schedule`): each scheduled request spends its tokens
-        plus `max_num_new_slots_for_drafting` slots of it, and the running
-        loop stops outright once less than one slot's worth is left.
+        The native step charges a second budget besides its token budget:
+        every scheduled request also spends `max_num_new_slots_for_drafting`
+        input slots, and caps each request at what is left of them. Rows that
+        ignore those slots are cut short by the native step, which costs a
+        retry per step, so they are reserved up front.
 
-        Decode has to survive that loop. A resumed prefill is *in* running,
-        so it is served before the other decodes -- a window sized to the
-        whole budget then spends the input budget on itself and the decodes
-        behind it are cut off mid-loop, which shows up as a TPOT tail with
-        an unchanged median. So the decodes keep their share up front, and
-        prefill only ever gets the remainder.
-
-        What is charged to prefill is the batch, never the queues: the edge
-        announces a request at admission, so the waiting queue holds every
-        request routed here, including those whose prompt has not arrived
-        and which cannot enter this step at all. Charging those made the
-        reservation grow with the queue -- a deeper queue left less room for
-        prefill, which deepened the queue.
-
-        The last window shrinks before any window is dropped: one long
-        prompt can fill the budget by itself, and dropping it would hand the
-        step no prefill at all while the slots it was charged for go unused.
+        Windows are not collected yet, so prefills are charged at the number
+        of requests that could still take one. That over-reserves when fewer
+        of them have arrivals ready, which only defers rows to the next step;
+        under-reserving is what causes the native truncation.
         """
-        if not windows:
-            return windows
-        # What the decodes of this step take out of the input budget: their
-        # tokens (decode_exact already counts 1+k each) plus one drafting
-        # allotment per request, and one more slot so the running loop ends
-        # above its `input_budget <= draft_slots` guard rather than on it.
-        reserved = (
-            decode_exact + len(decode_ids) * self._lwd_draft_slots
-        ) + self._lwd_draft_slots
-        room = self.scheduler_config.max_num_batched_tokens - reserved
-        rows = sum(window.num_rows for window in windows)
-        while windows:
-            # Each window costs its rows plus its own drafting allotment.
-            over = rows + len(windows) * self._lwd_draft_slots - room
-            if over <= 0:
-                break
-            last = windows[-1]
-            if over >= last.num_rows:
-                # Nothing left to shrink: its own rows no longer cover the
-                # overrun, so the request waits for a later step.
-                rows -= last.num_rows
-                windows.pop()
-                continue
-            windows[-1] = replace(last, num_rows=last.num_rows - over)
-            rows -= over
-        return windows
+        room = self.max_num_scheduled_tokens - decode_exact
+        if not self._lwd_draft_slots:
+            return room
+        decoding = set(decode_ids)
+        num_prefill = sum(
+            1
+            for request in itertools.chain(
+                self.running, self.waiting, self.skipped_waiting
+            )
+            if request.request_id not in decoding
+            and request.request_id not in self._lwd_dropped
+        )
+        return room - (len(decode_ids) + num_prefill) * self._lwd_draft_slots
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [
@@ -308,62 +263,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if request is not None:
             request.lwd_resume_cap_tokens = pending.hit_tokens
 
-    def _lwd_report_admission(
-        self,
-        windows: list[_LwdPrefillWindow],
-        collected: int,
-        decode_ids: list[str],
-        room: int,
-    ) -> None:
-        """Report the shape of one admission whenever it changes.
-
-        This is the only place that says why prefill did not advance while
-        the edge held the gate open and the rows were already here. Each
-        term names a different culprit: `queued` far above `admitted` with a
-        high `no_arrival` points upstream (the edge is not sending), a high
-        `partial` means long prompts are being refused a partial window, and
-        `collected` above `admitted` means the drafting slots cut the batch.
-        Reported on change, not per step -- a step is milliseconds.
-        """
-        no_arrival, partial = self._lwd_window_skips
-        queued = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
-        # Keyed on the shape, not on the counts: queue depths move almost
-        # every step, and this runs on the cloud's hot path. Bucketing the
-        # counts to powers of two keeps a real change loggable while a
-        # busy steady state stays quiet.
-        shape = (
-            len(windows),
-            collected,
-            no_arrival.bit_length(),
-            partial.bit_length(),
-            len(decode_ids),
-            queued.bit_length(),
-        )
-        if shape == self._lwd_last_admission:
-            return
-        self._lwd_last_admission = shape
-        lwd_logger.info(
-            "[cloud-sched] admit prefill=%d/%d rows=%d room=%d "
-            "(no_arrival=%d partial=%d) decode=%d queued=%d",
-            len(windows),
-            collected,
-            sum(window.num_rows for window in windows),
-            room,
-            no_arrival,
-            partial,
-            len(decode_ids),
-            queued,
-        )
-
     def _lwd_collect_prefill_windows(self, room: int) -> list[_LwdPrefillWindow]:
         windows: list[_LwdPrefillWindow] = []
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
-        # Why a candidate yielded no window, for the admission report: the
-        # counts separate "nothing has arrived yet" from "arrivals exist but
-        # the partial window was refused".
-        no_arrival = 0
-        partial = 0
         for request in itertools.chain(
             self.running, self.waiting, self.skipped_waiting
         ):
@@ -390,15 +293,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
             arrived = recv_rows - start
             if arrived <= 0:
-                no_arrival += 1
                 continue
             num_rows = min(arrived, room)
             if num_rows < room and recv_rows < request.num_prompt_tokens:
-                partial += 1
                 continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
-        self._lwd_window_skips = (no_arrival, partial)
         return windows
 
     def _lwd_dispatch_windows(

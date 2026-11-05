@@ -217,12 +217,17 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_audit_accounts(self) -> None:
         """Audit every engine's books while the gate holds everything shut.
 
-        Two ways this state becomes permanent, both silent at the point
+        Three ways this state becomes permanent, all silent at the point
         they happen: a slot charged to a request that no longer exists is
-        never returned, and a gate slot held by a request the cloud is not
+        never returned; a gate slot held by a request the cloud is not
         working on can only be released by sending that request -- which
-        the gate refuses. Check both invariants rather than trusting the
-        increments that maintain them."""
+        the gate refuses; and a slot held by a request that is already
+        decoding was simply never handed over, since `note_prefill_done` is
+        what moves a seat from dispatched to decode and it runs only on
+        first-token delivery. The last one is invisible to the other two
+        checks: that request is live and in the books, just counted twice.
+        Check the invariants rather than trusting the increments that
+        maintain them."""
         for account in self._lwd_accounts:
             charged = [
                 request_id
@@ -241,7 +246,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 for request_id in account.dispatched_requests
                 if request_id not in self.requests
             ]
-            if not missing and not stuck and len(charged) == account.load:
+            # A seat still charged as dispatched for a request that already
+            # reached decode: the handover never ran, so the seat is held
+            # twice over and nothing later releases it.
+            doubled = [
+                request_id
+                for request_id in account.dispatched_requests
+                if request_id in self.requests
+                and request_id not in account.prefill_requests
+            ]
+            if (
+                not missing
+                and not stuck
+                and not doubled
+                and len(charged) == account.load
+            ):
                 self._lwd_drift_seen.discard(account.dp_idx)
                 continue
             # Drift grows one leak at a time; report the engine once and
@@ -251,7 +270,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_drift_seen.add(account.dp_idx)
             lwd_logger.warning(
                 "[edge-sched] account drift dp%d: load=%d inflight=%d "
-                "charged=%d missing=%d (%s) stuck=%d (%s) "
+                "charged=%d missing=%d (%s) stuck=%d (%s) doubled=%d (%s) "
                 "prefill=%d decode=%d dispatched=%d",
                 account.dp_idx,
                 account.load,
@@ -261,6 +280,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 sorted(missing)[:5],
                 len(stuck),
                 sorted(stuck)[:5],
+                len(doubled),
+                sorted(doubled)[:5],
                 account.prefill_load,
                 account.decode_load,
                 len(account.dispatched_requests),
@@ -360,11 +381,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         for account in pending:
             self._lwd_log_gate_transition(account)
+        # inflight is split into its two terms: the seats are shared between
+        # requests the cloud has been told about but has not answered yet
+        # (dispatched) and requests it is decoding, and only the split says
+        # which of the two is holding the gate shut. Steady state is this
+        # branch, not empty-batch, so a split printed only there is a split
+        # never seen.
         self._lwd_note_dispatch_stall(
             "all-gated: "
             + " ".join(
                 f"dp{account.dp_idx}("
-                f"inflight={account.inflight}/{self.max_num_running_reqs},"
+                f"inflight={account.inflight}/{self.max_num_running_reqs}"
+                f"[dispatched={len(account.dispatched_requests)},"
+                f"decode={account.decode_load}],"
                 f"routed={account.load},"
                 f"chunks={account.pending_chunks()}/{account.max_pending_chunks},"
                 f"resume={self._lwd_has_prefill_chunk_inflight(account.dp_idx)})"
