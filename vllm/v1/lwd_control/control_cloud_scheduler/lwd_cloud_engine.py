@@ -233,7 +233,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 cloud_id=self.lwd_config.instance_id,
             )
         self.scheduler.lwd_prefix_hits = self._lwd_prefix_hits
-        self.scheduler.lwd_refill_sender = self._lwd_send_refill
         self._lwd_coord_pending: queue.Queue[dict[str, Any]] = queue.Queue()
         self._lwd_control_processor = None
         self.cloud_control_event_queue = getattr(

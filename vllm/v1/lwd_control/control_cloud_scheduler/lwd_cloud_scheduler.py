@@ -120,8 +120,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
-        self._lwd_refill_gate: set[str] = set()
-        self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_conc_last_log = 0.0
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
