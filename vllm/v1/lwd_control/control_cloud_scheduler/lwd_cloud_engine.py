@@ -431,6 +431,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
         num_tokens = sum(item.num_tokens for item in items)
         self._lwd_arrival_meter.note_hint(notify.seqno, num_tokens)
+        for request_id in request_ids:
+            self.scheduler.lwd_ttft_meter.note_hint(request_id)
         lwd_logger.info(
             "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
             notify.seqno,
@@ -506,6 +508,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
+        # Start of the cloud's share of TTFT: everything from here to the
+        # token going back down is on this side of the link.
+        self.scheduler.lwd_ttft_meter.note_notify(request_id)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
             "[cloud] request added req=%s tokens=%d nonce=%d",
@@ -804,6 +809,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             # Rows a window can open over exist only from here: time the
             # hop against the hint that started it.
             self._lwd_arrival_meter.note_arrival(seqno)
+            for request_id, _previous, _rows in touched:
+                self.scheduler.lwd_ttft_meter.note_arrival(request_id)
             lwd_logger.info("[cloud] arrival high watermarks updated: %s", touched)
 
     def post_step(self, model_executed: bool) -> None:
@@ -813,6 +820,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             assert self._lwd_edge is not None, "c2e produced before any edge"
             for notify in self.scheduler.pending_c2e:
                 self._lwd_send_until_queued(self._lwd_edge, notify)
+                # Last hop the cloud can see, stamped after the send so a
+                # full outbound queue shows up as the wait it is.
+                for request_id in notify.req_ids:
+                    self.scheduler.lwd_ttft_meter.note_sent(request_id)
             self.scheduler.pending_c2e.clear()
         super().post_step(model_executed)
 

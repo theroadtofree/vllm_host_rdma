@@ -20,17 +20,9 @@ meter answers exactly one:
     term stopped them? A gate that holds on seats is a cloud that is
     full; one that holds on chunks is a data plane that is behind.
 
-Counters are resident and reported on a fixed interval, so a meter costs
-a few adds per step on the scheduling thread. Reporting is edge
-triggered by the interval rather than scheduled, so an idle deployment
-stops logging instead of printing zeros.
-
-These lines go to the native logger, not `lwd_logger`: measuring an
-admission rate requires a run whose per-step LWD logging is off
-(VLLM_LWD_LOG_LEVEL=disable), and a meter silenced by the very switch
-the measurement needs would have nothing to report. The native logger
-adds no prefix of its own, so the "[lwd]" tag is written into each
-format string to keep these few lines greppable among the native ones.
+Where the resulting latency lands, rather than which gate refused it, is
+`lwd_ttft_meter`; the interval gate and reporting conventions both share
+are in `lwd_meter_base`.
 """
 
 from __future__ import annotations
@@ -38,41 +30,12 @@ from __future__ import annotations
 import time
 
 from vllm.logger import init_logger
+from vllm.v1.lwd_control.lwd_control_diag.lwd_meter_base import LwdIntervalMeter
 
 logger = init_logger(__name__)
 
-# One line per meter per interval. Long enough that a loaded second
-# cannot flood the log, short enough to see a phase change within a run.
-_LWD_METER_INTERVAL_S = 10.0
 
-
-class _LwdMeter:
-    """Interval gate shared by the meters: accumulate freely, report at
-    most once per interval, then start the next window from zero."""
-
-    def __init__(self) -> None:
-        self._last_report = time.monotonic()
-        self._reset()
-
-    def _reset(self) -> None:
-        """Clear this window's counters. Subclasses define the fields."""
-        raise NotImplementedError
-
-    def _report(self) -> None:
-        """Emit one line for the window just closed."""
-        raise NotImplementedError
-
-    def _roll(self) -> None:
-        """Close the window if the interval elapsed."""
-        now = time.monotonic()
-        if now - self._last_report < _LWD_METER_INTERVAL_S:
-            return
-        self._last_report = now
-        self._report()
-        self._reset()
-
-
-class LwdCloudAdmissionMeter(_LwdMeter):
+class LwdCloudAdmissionMeter(LwdIntervalMeter):
     """Cloud prefill admission: budget offered, budget taken, and what
     stood between them.
 
@@ -158,7 +121,7 @@ class LwdCloudAdmissionMeter(_LwdMeter):
         )
 
 
-class LwdCloudArrivalMeter(_LwdMeter):
+class LwdCloudArrivalMeter(LwdIntervalMeter):
     """Hint-to-arrival latency of the staging hop.
 
     The edge announces a range, the worker posts the receive, the rows
@@ -219,7 +182,7 @@ class LwdCloudArrivalMeter(_LwdMeter):
         )
 
 
-class LwdEdgeDispatchMeter(_LwdMeter):
+class LwdEdgeDispatchMeter(LwdIntervalMeter):
     """Edge steps that produced no EMBED batch, split by the gate term
     that stopped them.
 
