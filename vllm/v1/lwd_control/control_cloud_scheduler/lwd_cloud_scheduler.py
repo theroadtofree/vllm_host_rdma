@@ -39,7 +39,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdCloudAdmissionMeter,
+    LwdControlDiag,
+)
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
@@ -88,6 +91,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
+        self._lwd_admission_meter = LwdCloudAdmissionMeter()
+        # Per-step terms the meter reads, set by the step that computes
+        # them: the drafting reservation and the queue it was charged
+        # against, and the two reasons a candidate yielded no window.
+        self._lwd_reserved = 0
+        self._lwd_queue_depth = 0
+        self._lwd_blocked: tuple[int, int] = (0, 0)
         self.pending_c2e: list[LwdC2eNotify] = []
         # Input slots the native step charges per scheduled request for
         # parallel drafting, on top of its tokens; the sole home of the
@@ -114,9 +124,32 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
+        self._lwd_meter_admission(out, windows, room)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
         return out
+
+    def _lwd_meter_admission(
+        self, out: SchedulerOutput, windows: list[_LwdPrefillWindow], room: int
+    ) -> None:
+        """Feed the admission meter what this step offered and took.
+
+        The admitted count comes from the scheduler output, not from the
+        windows: the native step can cut a window short, and a window
+        asked for is not a row run.
+        """
+        admitted = sum(
+            out.num_scheduled_tokens.get(window.request.request_id, 0)
+            for window in windows
+        )
+        self._lwd_admission_meter.note_step(
+            room=room,
+            admitted=admitted,
+            num_windows=len(windows),
+            blocked=self._lwd_blocked,
+            queue_depth=self._lwd_queue_depth,
+            reserved=self._lwd_reserved,
+        )
 
     def _lwd_prefill_room(self, decode_ids: list[str], decode_exact: int) -> int:
         """Prefill rows this step may admit, after the drafting slots.
@@ -131,8 +164,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         of requests that could still take one. That over-reserves when fewer
         of them have arrivals ready, which only defers rows to the next step;
         under-reserving is what causes the native truncation.
+
+        The charge counts the queues, so it grows with backlog rather than
+        with what the step can run: `_lwd_reserved` and `_lwd_queue_depth`
+        record the two terms for the admission meter, which is what tells a
+        budget that is merely small from one the backlog ate.
         """
         room = self.max_num_scheduled_tokens - decode_exact
+        self._lwd_reserved = 0
+        self._lwd_queue_depth = 0
         if not self._lwd_draft_slots:
             return room
         decoding = set(decode_ids)
@@ -144,7 +184,9 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if request.request_id not in decoding
             and request.request_id not in self._lwd_dropped
         )
-        return room - (len(decode_ids) + num_prefill) * self._lwd_draft_slots
+        self._lwd_queue_depth = num_prefill
+        self._lwd_reserved = (len(decode_ids) + num_prefill) * self._lwd_draft_slots
+        return room - self._lwd_reserved
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [
@@ -265,6 +307,12 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def _lwd_collect_prefill_windows(self, room: int) -> list[_LwdPrefillWindow]:
         windows: list[_LwdPrefillWindow] = []
+        # (partial window, no arrival): the two ways a candidate that
+        # still owes prompt rows yields no window this step. Their cure
+        # is opposite -- a partial window waits on more rows of a prompt
+        # already arriving, no arrival waits on the transfer starting --
+        # so the meter keeps them apart.
+        self._lwd_blocked = (0, 0)
         reservations = getattr(self, "lwd_prefix_reservations", None)
         prefix_enabled = getattr(self, "_lwd_prefix_enabled", False)
         for request in itertools.chain(
@@ -293,9 +341,13 @@ class LwdCloudScheduler(LwdBaseScheduler):
             recv_rows = self.lwd_recv_rows.get(request_id, 0)
             arrived = recv_rows - start
             if arrived <= 0:
+                partial, no_arrival = self._lwd_blocked
+                self._lwd_blocked = (partial, no_arrival + 1)
                 continue
             num_rows = min(arrived, room)
             if num_rows < room and recv_rows < request.num_prompt_tokens:
+                partial, no_arrival = self._lwd_blocked
+                self._lwd_blocked = (partial + 1, no_arrival)
                 continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows

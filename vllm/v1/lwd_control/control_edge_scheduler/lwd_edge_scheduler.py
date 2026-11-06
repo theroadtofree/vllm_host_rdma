@@ -62,7 +62,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRangeNotify,
     LwdRefillNotify,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdControlDiag,
+    LwdEdgeDispatchMeter,
+)
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdModelFamily,
     lwd_select_model_family,
@@ -138,6 +141,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         """Engines already reported as having drifted books."""
         self._lwd_last_fleet_seats: tuple[int, ...] | None = None
         """Last reported per-engine seat ledger; transition logging only."""
+        self._lwd_dispatch_meter = LwdEdgeDispatchMeter()
+        """Share of steps lost to each gate term; the stall log says a
+        stall happened, this says what it cost."""
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -378,7 +384,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if self._lwd_has_prefill_work(account.dp_idx)
         ]
         if not pending:
+            self._lwd_dispatch_meter.note_idle()
             return
+        # Which term each gated engine held on. Seats held means the cloud
+        # is full and waiting is correct; chunks held means the pending-send
+        # window is the limit, which is a number we can raise.
+        self._lwd_dispatch_meter.note_gated(
+            sum(account.inflight >= self.max_num_running_reqs for account in pending),
+            sum(
+                account.pending_chunks() >= account.max_pending_chunks
+                for account in pending
+            ),
+        )
         for account in pending:
             self._lwd_log_gate_transition(account)
         reported = self._lwd_note_dispatch_stall(
@@ -511,12 +528,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # every routed request already sent its prompt (the engine is
             # simply decode-saturated); a real stall when prefill work is
             # routed here and still never reaches the picker.
+            self._lwd_dispatch_meter.note_empty_batch()
             self._lwd_note_dispatch_stall(
                 f"empty-batch-{dp_idx}",
                 lambda: f"empty-batch dp{dp_idx}: "
                 f"{self._lwd_describe_candidates(dp_idx)}",
             )
             return self._lwd_schedule_abort_notice()
+        self._lwd_dispatch_meter.note_dispatch()
         self._lwd_note_dispatch_stall(None)
         self.lwd_edge_notify_range(dp_idx, out)
         return out
