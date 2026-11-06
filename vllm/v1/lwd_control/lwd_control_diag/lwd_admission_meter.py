@@ -234,6 +234,7 @@ class LwdEdgeDispatchMeter(_LwdMeter):
         self._steps = 0
         self._dispatched = 0
         self._idle = 0
+        self._idle_unsent = 0
         self._gated = 0
         self._gated_seats = 0
         self._gated_chunks = 0
@@ -249,11 +250,18 @@ class LwdEdgeDispatchMeter(_LwdMeter):
         self._empty_batch += 1
         self._roll()
 
-    def note_idle(self) -> None:
+    def note_idle(self, unsent: bool = False) -> None:
         """No engine held prefill work: a decode steady state, not a
-        stall. Counted so the gated share has a denominator."""
+        stall. Counted so the gated share has a denominator.
+
+        `unsent` splits off the case that is not a steady state at all:
+        requests exist that still owe prompt rows, yet the work predicate
+        reports none. Those steps are the edge parking on prompts it
+        holds, and the two are indistinguishable without this flag.
+        """
         self._steps += 1
         self._idle += 1
+        self._idle_unsent += unsent
         self._roll()
 
     def note_gated(self, seats_held: int, chunks_held: int) -> None:
@@ -272,12 +280,13 @@ class LwdEdgeDispatchMeter(_LwdMeter):
         steps = self._steps
         logger.info(
             "[lwd][edge-sched] dispatch over %d steps: dispatched=%d (%.1f%%) "
-            "idle=%d gated=%d (%.1f%%) empty=%d; "
+            "idle=%d (unsent=%d) gated=%d (%.1f%%) empty=%d; "
             "gated engine-steps on seats=%d chunks=%d",
             steps,
             self._dispatched,
             self._dispatched / steps * 100,
             self._idle,
+            self._idle_unsent,
             self._gated,
             self._gated / steps * 100,
             self._empty_batch,
