@@ -229,16 +229,37 @@ class LwdProbeQueryAdapter:
         alignment_tokens: int,
         instance_id: str,
         cloud_id: int,
+        *,
+        prefix_caching: bool = True,
     ) -> None:
         self._manager = manager
         self._hash_block_size = hash_block_size
         self._alignment_tokens = alignment_tokens
         self._instance_id = instance_id
         self._cloud_id = cloud_id
+        self._prefix_caching = prefix_caching
 
     def _query(self, manifest) -> Any:
         from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
 
+        if not self._prefix_caching:
+            # Placement-only probe: the cloud runs no prefix cache, so the
+            # coordinator can only answer "zero hit". The edge has no way to
+            # know this cloud's hash granularity (prefix hashing is disabled
+            # on both sides), so the block-size contract below must not gate
+            # the reply: enforcing it turns every probe into a 503 and drops
+            # the placement/health signal. Echo the manifest granularity so
+            # the edge neither learns a size it cannot hash with nor rebuilds
+            # its chain for a hit that is always zero.
+            return LwdProbeResult(
+                request_id=manifest.request_id,
+                instance_id=self._instance_id,
+                block_size=manifest.block_size,
+                hit_blocks=0,
+                hit_tokens=0,
+                alignment_tokens=self._alignment_tokens,
+                cloud_id=self._cloud_id,
+            )
         if manifest.block_size != self._hash_block_size:
             raise ValueError(
                 "LWD manifest block size must match the cloud hash block size "

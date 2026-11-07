@@ -10,8 +10,13 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     LwdPrefixReservations,
+    LwdProbeQueryAdapter,
     init_lwd_prefix_cache,
     prefix_start,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
+    DIGEST_SIZE,
+    LwdPrefixManifest,
 )
 
 
@@ -172,3 +177,63 @@ def test_init_builds_reservations_and_alignment(monkeypatch):
     assert state.alignment_tokens == 32
     assert state.use_eagle
     assert manager.lwd_prefix_reservations is state.reservations
+
+
+def _manifest(block_size: int = 16, prompt_tokens: int = 64) -> LwdPrefixManifest:
+    return LwdPrefixManifest(
+        request_id="r",
+        prompt_tokens=prompt_tokens,
+        block_size=block_size,
+        full_block_hashes=(b"h" * DIGEST_SIZE,) * (prompt_tokens // block_size),
+    )
+
+
+def test_probe_query_without_prefix_caching_skips_block_size_contract():
+    """Placement-only clouds answer zero hits at the manifest granularity.
+
+    The edge cannot know this cloud's hash block size when prefix caching is
+    disabled on both sides; gating on it turned every probe into a 503.
+    """
+    manager = _manager()
+    adapter = LwdProbeQueryAdapter(
+        manager,
+        hash_block_size=128,
+        alignment_tokens=0,
+        instance_id="cloud-0",
+        cloud_id=0,
+        prefix_caching=False,
+    )
+
+    result = adapter.probe(_manifest(block_size=16))
+
+    assert (result.block_size, result.hit_blocks, result.hit_tokens) == (16, 0, 0)
+    assert result.cloud_id == 0
+    manager.coordinator.find_longest_cache_hit.assert_not_called()
+
+
+def test_probe_query_with_prefix_caching_enforces_block_size():
+    adapter = LwdProbeQueryAdapter(
+        _manager(),
+        hash_block_size=128,
+        alignment_tokens=0,
+        instance_id="cloud-0",
+        cloud_id=0,
+    )
+
+    with pytest.raises(ValueError, match="must match the cloud hash block size"):
+        adapter.probe(_manifest(block_size=16))
+
+
+def test_probe_query_with_prefix_caching_reports_cloud_hit():
+    manager = _manager(hit=32)
+    adapter = LwdProbeQueryAdapter(
+        manager,
+        hash_block_size=16,
+        alignment_tokens=0,
+        instance_id="cloud-0",
+        cloud_id=1,
+    )
+
+    result = adapter.probe(_manifest(block_size=16))
+
+    assert (result.block_size, result.hit_tokens, result.cloud_id) == (16, 32, 1)

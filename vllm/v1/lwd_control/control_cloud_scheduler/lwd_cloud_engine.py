@@ -231,6 +231,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 alignment_tokens=self._lwd_prefix_state.alignment_tokens,
                 instance_id=f"cloud-{self.lwd_config.instance_id}",
                 cloud_id=self.lwd_config.instance_id,
+                # With caching off the query only carries placement/health;
+                # the manifest chain is built at the edge's own granularity,
+                # so the cloud hash-block-size contract does not apply.
+                prefix_caching=self._lwd_prefix_enabled,
             )
         self.scheduler.lwd_prefix_hits = self._lwd_prefix_hits
         self._lwd_coord_pending: queue.Queue[dict[str, Any]] = queue.Queue()

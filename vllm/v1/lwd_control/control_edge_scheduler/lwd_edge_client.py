@@ -364,7 +364,11 @@ class LwdEdgePrefixClient:
     async def _read_error_body(response: Any, limit: int = 512) -> str:
         """非 200 时读错误体(截断 + 折叠空白:网关常回整页 HTML)。"""
         try:
-            raw = await response.read(limit)
+            # aiohttp's ClientResponse.read() takes no size argument; the
+            # capped read lives on the content stream. Passing the limit to
+            # read() raises TypeError and hides every non-200 body (including
+            # the cloud's own error text) behind "<unreadable: TypeError>".
+            raw = await response.content.read(limit)
             return " ".join(raw.decode("utf-8", "replace").split())
         except Exception as exc:  # noqa: BLE001  诊断路径不再抛
             return f"<unreadable: {type(exc).__name__}>"
