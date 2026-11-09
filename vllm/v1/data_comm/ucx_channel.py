@@ -58,10 +58,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from vllm.logger import init_logger
-from vllm.v1.lwd_comm import sock as _sock
-from vllm.v1.lwd_comm.ucx_pool import Block as _Block
-from vllm.v1.lwd_comm.ucx_pool import BlockPool
-from vllm.v1.lwd_comm.ucx_ucp import (
+from vllm.v1.data_comm import sock as _sock
+from vllm.v1.data_comm.ucx_pool import Block as _Block
+from vllm.v1.data_comm.ucx_pool import BlockPool
+from vllm.v1.data_comm.ucx_ucp import (
     _RecvCb,
     _SendCb,
     _UCS_OK,
@@ -70,7 +70,7 @@ from vllm.v1.lwd_comm.ucx_ucp import (
     _req_param,
     _ucp,
 )
-from vllm.v1.lwd_comm.ucx_link import (
+from vllm.v1.data_comm.ucx_link import (
     _UcxLink,
     _hs_pack_caps,
     _hs_unpack_caps,

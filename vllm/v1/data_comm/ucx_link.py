@@ -17,7 +17,7 @@ import struct
 import threading
 from typing import Any
 
-from vllm.v1.lwd_comm.ucx_ucp import (
+from vllm.v1.data_comm.ucx_ucp import (
     _ErrCb,
     _MemhBufReleaseParams,
     _MemhPackParams,

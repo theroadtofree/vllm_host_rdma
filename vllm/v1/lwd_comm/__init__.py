@@ -1,9 +1,8 @@
-"""LWD 数据面(vllm 仓):host-host 传输库与数据面关停注册表。
+"""LWD 数据面(vllm 仓):数据面关停注册表。
 
-现行 UCX 传输为 ucx_channel.py(UHC1 协议族,带 tag 的字节管道);
-ucx_link.py 承载 UCP 链路生命周期,ucx_ucp.py/ucx_pool.py/sock.py 为
-共享底层。设备拷贝(D2H/H2D)编排属调用方——NPU 实现在 vllm_ascend
-(ucx_npu_channel.py),GPU/CPU 边侧按同接口在各自插件仓实现。
+host-host 传输库已迁至 ``vllm/v1/data_comm``(UCX 实现:ucx_channel
+等;设备拷贝 D2H/H2D 编排属调用方,NPU 实现在 vllm_ascend 的
+lwd_data_plane/ucx 包);本包仅保留引擎侧关停钩子。
 """
 
 from __future__ import annotations
