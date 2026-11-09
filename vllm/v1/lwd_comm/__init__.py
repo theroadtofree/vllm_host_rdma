@@ -1,6 +1,6 @@
 """LWD 数据面(vllm 仓):数据面关停注册表。
 
-host-host 传输库已迁至 ``vllm/v1/data_comm``(UCX 实现:ucx_channel
+host-host 传输库已迁至 ``vllm/v1/lwd_comm/data_comm``(UCX 实现:ucx_channel
 等;设备拷贝 D2H/H2D 编排属调用方,NPU 实现在 vllm_ascend 的
 lwd_data_plane/host 包);本包仅保留引擎侧关停钩子。
 """

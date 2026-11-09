@@ -32,8 +32,8 @@ import time
 from typing import Any, Protocol
 
 from vllm.logger import init_logger
-from vllm.v1.data_comm import ucx_shm as _shm
-from vllm.v1.data_comm.ucx_channel import UcxChannel, UcxCfg
+from vllm.v1.lwd_comm.data_comm import ucx_shm as _shm
+from vllm.v1.lwd_comm.data_comm.ucx_channel import UcxChannel, UcxCfg
 
 logger = init_logger(__name__)
 
@@ -186,7 +186,7 @@ def _ctl_connect_or_spawn(ctl_sock: str) -> _pysocket.socket:
             log_f = open(log_path, "ab", buffering=0)
             try:
                 subprocess.Popen(  # noqa: S603
-                    [sys.executable, "-m", "vllm.v1.data_comm.ucx_daemon",
+                    [sys.executable, "-m", "vllm.v1.lwd_comm.data_comm.ucx_daemon",
                      "--ctl", ctl_sock],
                     env=os.environ.copy(), start_new_session=True,
                     stdin=subprocess.DEVNULL,

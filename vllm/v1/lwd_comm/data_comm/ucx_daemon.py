@@ -2,7 +2,7 @@
 """UCX 传输守护进程(daemon 模式执行体;engine 侧对应 ucx_port.DaemonPort)。
 
 部署形态:与 engine 同容器、由首个 daemon 模式引擎进程按需 spawn
-(``python -m vllm.v1.data_comm.ucx_daemon --ctl <sock>``);UCX env
+(``python -m vllm.v1.lwd_comm.data_comm.ucx_daemon --ctl <sock>``);UCX env
 (LD_LIBRARY_PATH/UCX_TLS/UCX_NET_DEVICES)从引擎进程原样继承。
 
 职责:持有全部 UcxChannel/UcxListener(线上协议 UHC1、握手、token
@@ -35,8 +35,8 @@ import traceback
 from collections import deque
 
 from vllm.logger import init_logger
-from vllm.v1.data_comm import ucx_shm as shm
-from vllm.v1.data_comm.ucx_channel import UcxChannel, UcxCfg, UcxListener
+from vllm.v1.lwd_comm.data_comm import ucx_shm as shm
+from vllm.v1.lwd_comm.data_comm.ucx_channel import UcxChannel, UcxCfg, UcxListener
 
 logger = init_logger("lwd_host_comm")
 
