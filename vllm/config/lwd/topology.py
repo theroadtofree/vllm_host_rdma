@@ -62,6 +62,8 @@ class LwdDeployment:
     YAML parsing is key-based, so the class field order is invisible to the config file."""
     hccl_world_size: LwdCount | None = None
     data_plane_comm: Literal["device", "host"] = "device"
+    data_plane_comm_up_buffersize: LwdCount | None = None
+    data_plane_comm_down_buffersize: LwdCount | None = None
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -273,6 +275,16 @@ class LwdTopology:
                 "separate worlds; their sizes come from their own "
                 "launches)"
             )
+        for name in (
+            "data_plane_comm_up_buffersize",
+            "data_plane_comm_down_buffersize",
+        ):
+            if getattr(self.deployment, name) is None:
+                raise ValueError(
+                    f"[LWD] {name} is required when data_plane_comm=host "
+                    "(per-direction block size in MB, identical on both "
+                    "peers)"
+                )
         for instance in self.edges:
             if any(dp.data_port is not None for dp in instance.dp):
                 raise ValueError(
@@ -298,6 +310,15 @@ class LwdTopology:
                 )
 
     def _validate_ranks(self) -> None:
+        for name in (
+            "data_plane_comm_up_buffersize",
+            "data_plane_comm_down_buffersize",
+        ):
+            if getattr(self.deployment, name) is not None:
+                raise ValueError(
+                    f"[LWD] {name} is host-comm-only and must be omitted "
+                    "when data_plane_comm=device"
+                )
         for edge in self.edges:
             if len({(dp.addr, dp.ranks) for dp in edge.dp}) != 1:
                 raise ValueError(
