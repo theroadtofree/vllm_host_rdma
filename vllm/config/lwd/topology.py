@@ -59,6 +59,12 @@ class LwdDeployment:
     hccl_world_size: LwdCount
     edges_num: LwdCount
     clouds_num: LwdCount
+    data_plane_comm: Literal["device", "host"] = "device"
+    """Cross-node transport of the LWD data plane: "device" = HCCL P2P
+    over the shared torch world (default); "host" = UCX host-RoCE links
+    (vllm's ``vllm/v1/data_comm`` + vllm-ascend's ``lwd_data_plane/ucx``).
+    Both peers of a link must select the same comm. Configured only in
+    this YAML — there is no env override."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -122,7 +128,13 @@ class LwdCoordination:
 class LwdDP:
     dp_idx: LwdId
     addr: Annotated[StrictStr, AfterValidator(_address)]
-    ranks: Annotated[tuple[LwdId, ...], Field(min_length=1)]
+    ranks: Annotated[tuple[LwdId, ...], Field(min_length=1)] | None = None
+    """Global ranks this DP occupies in the SHARED HCCL world. Required
+    on every DP when ``data_plane_comm: device`` (and validated to cover
+    [0, hccl_world_size) without gaps); must be omitted when
+    ``data_plane_comm: host`` — there is no global comm domain in host
+    mode (edge and cloud are separate worlds; links are established from
+    role/instance identity + addr/data_port, not ranks)."""
     ctrl_port: LwdPort | None = None
     """Control-plane (ZMQ) port of this DP; not used by the data plane."""
     data_port: LwdPort | None = None
@@ -167,6 +179,12 @@ class LwdDPConnection:
 
     @property
     def cloud_leader_rank(self) -> int:
+        # Device-comm only: host comm has no ranks (see LwdDP.ranks).
+        if not self.cloud.ranks:
+            raise ValueError(
+                "cloud_leader_rank requires data_plane_comm=device "
+                "(no ranks in host comm)"
+            )
         return self.cloud.ranks[0]
 
 
@@ -177,12 +195,6 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
-    data_plane_comm: Literal["device", "host"] = "device"
-    """Cross-node transport of the LWD data plane: "device" = HCCL P2P
-    over the shared torch world (default); "host" = UCX host-RoCE links
-    (vllm's ``vllm/v1/data_comm`` + vllm-ascend's ``lwd_data_plane/ucx``).
-    Both peers of a link must select the same comm. Configured only in
-    this YAML — there is no env override."""
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the source file digest; empty for from_dict."""
@@ -244,6 +256,16 @@ class LwdTopology:
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
         if self.deployment.data_plane_comm == "host":
+            # No global comm domain: ranks are meaningless and must be
+            # omitted everywhere; the world-coverage and allocation rules
+            # below assume a shared HCCL world and are skipped entirely.
+            for instance in (*self.edges, *self.clouds):
+                if any(dp.ranks for dp in instance.dp):
+                    raise ValueError(
+                        "[LWD] ranks must be omitted when "
+                        "data_plane_comm=host (no global comm domain; "
+                        "links are established from addr/data_port)"
+                    )
             # Only cloud DPs listen (one shared listener per DP; edges
             # connect out), mirroring the ctrl_port placement rule.
             for instance in self.edges:
@@ -269,7 +291,15 @@ class LwdTopology:
                     raise ValueError(
                         f"[LWD] duplicate data_port on {addr}"
                     )
-        self._validate_ranks()
+        if self.deployment.data_plane_comm == "device":
+            # The shared HCCL world requires the rank allocation declared.
+            for instance in (*self.edges, *self.clouds):
+                if any(not dp.ranks for dp in instance.dp):
+                    raise ValueError(
+                        "[LWD] ranks are required on every DP when "
+                        "data_plane_comm=device"
+                    )
+            self._validate_ranks()
         self._validate_control_ports()
 
     def _validate_ranks(self) -> None:
