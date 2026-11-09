@@ -62,8 +62,27 @@ class LwdDeployment:
     YAML parsing is key-based, so the class field order is invisible to the config file."""
     hccl_world_size: LwdCount | None = None
     data_plane_comm: Literal["device", "host"] = "device"
-    data_plane_comm_up_buffersize: LwdCount | None = None
-    data_plane_comm_down_buffersize: LwdCount | None = None
+    data_plane_host: LwdHostDataPlane | None = None
+    """Host-comm settings block, required when ``data_plane_comm: host``
+    and omitted otherwise — the extension point for future host-plane
+    properties."""
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdHostDataPlane:
+    up_buffersize: LwdCount
+    """UP (edge->cloud) block size in MB: one block must cover the
+    largest single UP frame (init warns if the model needs more);
+    identical on both peers."""
+
+    down_buffersize: LwdCount
+    """DOWN (cloud->edge) block size in MB; identical on both peers."""
+
+    deployment: Literal["in_process", "sidecar"] = "in_process"
+    """"in_process" = transport runs inside each engine process;
+    "sidecar" = one dedicated transport daemon per host (listeners owned
+    by the daemon, engines attach via ctl socket + shm). Both peers of
+    a link must match."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -275,16 +294,12 @@ class LwdTopology:
                 "separate worlds; their sizes come from their own "
                 "launches)"
             )
-        for name in (
-            "data_plane_comm_up_buffersize",
-            "data_plane_comm_down_buffersize",
-        ):
-            if getattr(self.deployment, name) is None:
-                raise ValueError(
-                    f"[LWD] {name} is required when data_plane_comm=host "
-                    "(per-direction block size in MB, identical on both "
-                    "peers)"
-                )
+        if self.deployment.data_plane_host is None:
+            raise ValueError(
+                "[LWD] data_plane_host is required when "
+                "data_plane_comm=host (up/down buffersize in MB; the "
+                "extension block for host-plane settings)"
+            )
         for instance in self.edges:
             if any(dp.data_port is not None for dp in instance.dp):
                 raise ValueError(
@@ -310,15 +325,11 @@ class LwdTopology:
                 )
 
     def _validate_ranks(self) -> None:
-        for name in (
-            "data_plane_comm_up_buffersize",
-            "data_plane_comm_down_buffersize",
-        ):
-            if getattr(self.deployment, name) is not None:
-                raise ValueError(
-                    f"[LWD] {name} is host-comm-only and must be omitted "
-                    "when data_plane_comm=device"
-                )
+        if self.deployment.data_plane_host is not None:
+            raise ValueError(
+                "[LWD] data_plane_host is host-comm-only and must be "
+                "omitted when data_plane_comm=device"
+            )
         for edge in self.edges:
             if len({(dp.addr, dp.ranks) for dp in edge.dp}) != 1:
                 raise ValueError(
