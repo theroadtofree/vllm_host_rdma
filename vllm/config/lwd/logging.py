@@ -14,9 +14,7 @@ def log_lwd_config(logger: logging.Logger, config: LwdConfig) -> None:
     # Rank-derived fields exist only in device comm (shared HCCL world);
     # host comm declares no ranks, so they are logged as None instead of
     # being derived.
-    is_device = (
-        config.topology.deployment.data_plane_comm == "device"
-    )
+    is_device = not config.topology.is_host_comm
     snapshot = {
         "metadata_only": True,
         "lwd_config": asdict(config),

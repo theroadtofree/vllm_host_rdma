@@ -201,6 +201,11 @@ class LwdTopology:
         topology.validate_layout()
         return topology
 
+    @property
+    def is_host_comm(self) -> bool:
+        """data_plane_comm == 'host': the edge and cloud run as separate torch worlds."""
+        return self.deployment.data_plane_comm == "host"
+
     @field_validator("edges", "clouds")
     @classmethod
     def order_instances(
@@ -239,7 +244,7 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
-        if self.deployment.data_plane_comm == "host":
+        if self.is_host_comm:
             # No shared HCCL world: the host-specific layout rules apply
             # instead of the rank-allocation ones.
             self._validate_host_layout()
