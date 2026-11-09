@@ -67,6 +67,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 from vllm.v1.lwd_control.lwd_control_diag import (
     LwdControlDiag,
     LwdEdgeDispatchMeter,
+    LwdEdgeTtftMeter,
 )
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdModelFamily,
@@ -153,6 +154,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_dispatch_meter = LwdEdgeDispatchMeter()
         """Share of steps lost to each gate term; the stall log says a
         stall happened, this says what it cost."""
+        self.lwd_ttft_meter = LwdEdgeTtftMeter()
+        """Hop stamps of the edge's share of TTFT. Public because the
+        first two hops are seen by the engine's request entry, not here."""
         self._lwd_unseen_since: float | None = None
         """When the edge first went idle holding requests that still owe
         prompt rows; None whenever it holds none."""
@@ -619,6 +623,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         advanced num_computed_tokens, so a dropped chunk would never be
         embedded and the next offset would not match the cloud. A notify
         that cannot be sent raises instead."""
+        # Runs on every step and returns from three places; the meter's
+        # interval is rolled here so a window that dispatches nothing --
+        # the one worth reading -- still reports.
+        self.lwd_ttft_meter.tick()
         dp_idx = self._lwd_servable_engine()
         if dp_idx is None:
             self._lwd_note_embed_stall()
@@ -1072,6 +1080,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.register_batch(seqno, set(req_ids))
         for request_id in req_ids:
             account.note_dispatched(request_id)
+            # First rows of a request leaving closes its edge timeline;
+            # the cloud times the same span from the other end as `hold`.
+            self.lwd_ttft_meter.note_dispatch(request_id)
         # On successful send, assemble the EMBED batch and attach it to SO:
         # seqno is the pairing key of the data-plane tensor sent to the
         # cloud (same value as registered by the cloud-side RangeNotify);
@@ -1302,6 +1313,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def _lwd_settle_request(self, request_id: str, first_token: bool = False) -> None:
         """Move load on delivery, or drop all request state on finish/abort.
         Send watermarks alone release pending batches after first token."""
+        if not first_token:
+            # Finish or abort. A request dropped before any rows went out
+            # would keep its timeline forever, and the meter's per-request
+            # state outlives the scheduler's own.
+            self.lwd_ttft_meter.forget(request_id)
         account = self._lwd_account_of(request_id)
         if account is None:
             return

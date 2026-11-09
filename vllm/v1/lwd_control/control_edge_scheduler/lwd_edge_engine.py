@@ -264,6 +264,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
+        # Start of the edge's share of TTFT, and the close of the frontend
+        # segment: everything before this ran off the engine thread.
+        self.scheduler.lwd_ttft_meter.note_add_request(
+            request.request_id, request.arrival_time
+        )
         lwd_logger.info(
             "[edge] request received req=%s tokens=%d (admit + announce)",
             request.request_id,
@@ -368,3 +373,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 **values,
             ),
         )
+        # Stamped after the send: a full outbound queue retries for about
+        # three seconds, and that is admission time, not dispatch time.
+        self.scheduler.lwd_ttft_meter.note_notify(request.request_id)
