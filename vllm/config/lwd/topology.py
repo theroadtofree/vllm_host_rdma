@@ -127,10 +127,11 @@ class LwdDP:
     """Control-plane (ZMQ) port of this DP; not used by the data plane."""
     data_port: LwdPort | None = None
     """UCX data-plane listener port of this DP (family=ucx only), used
-    exactly as configured — each DP serves exactly one link (its own
-    direction's recv: a cloud DP serves UP, an edge DP serves DOWN).
-    Required on every DP when ``data_plane_family: ucx``; unused by
-    hccl."""
+    exactly as configured. Only CLOUD DPs listen: each cloud DP binds
+    one shared listener (both its UP/DOWN links attach to it, routed by
+    handshake token); edges connect out and never listen. Required on
+    every cloud DP when ``data_plane_family: ucx``, omitted on edges;
+    unused by hccl."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -242,18 +243,25 @@ class LwdTopology:
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
         if self.data_plane_family == "ucx":
-            # Every DP serves the recv link of its own direction, so every
-            # DP needs a data_port (the listener port itself, no offset);
-            # DPs sharing an address must not share the port.
-            by_addr: dict[str, list[int]] = {}
-            for instance in (*self.edges, *self.clouds):
+            # Only cloud DPs listen (one shared listener per DP; edges
+            # connect out), mirroring the ctrl_port placement rule.
+            for instance in self.edges:
+                if any(dp.data_port is not None for dp in instance.dp):
+                    raise ValueError(
+                        "[LWD] data_port is cloud-only (edges connect out "
+                        "and never listen)"
+                    )
+            for instance in self.clouds:
                 for dp in instance.dp:
                     if dp.data_port is None:
                         raise ValueError(
-                            "[LWD] data_port is required on every DP when "
-                            "data_plane_family=ucx (ctrl_port is control-plane"
-                            " only)"
+                            "[LWD] data_port is required on every cloud DP "
+                            "when data_plane_family=ucx (ctrl_port is "
+                            "control-plane only)"
                         )
+            by_addr: dict[str, list[int]] = {}
+            for instance in self.clouds:
+                for dp in instance.dp:
                     by_addr.setdefault(dp.addr, []).append(dp.data_port)
             for addr, ports in by_addr.items():
                 if len(ports) != len(set(ports)):
