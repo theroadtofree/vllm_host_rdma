@@ -124,6 +124,13 @@ class LwdDP:
     addr: Annotated[StrictStr, AfterValidator(_address)]
     ranks: Annotated[tuple[LwdId, ...], Field(min_length=1)]
     ctrl_port: LwdPort | None = None
+    """Control-plane (ZMQ) port of this DP; not used by the data plane."""
+    data_port: LwdPort | None = None
+    """UCX data-plane listener port of this DP (family=ucx only), used
+    exactly as configured — each DP serves exactly one link (its own
+    direction's recv: a cloud DP serves UP, an edge DP serves DOWN).
+    Required on every DP when ``data_plane_family: ucx``; unused by
+    hccl."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -234,6 +241,25 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
+        if self.data_plane_family == "ucx":
+            # Every DP serves the recv link of its own direction, so every
+            # DP needs a data_port (the listener port itself, no offset);
+            # DPs sharing an address must not share the port.
+            by_addr: dict[str, list[int]] = {}
+            for instance in (*self.edges, *self.clouds):
+                for dp in instance.dp:
+                    if dp.data_port is None:
+                        raise ValueError(
+                            "[LWD] data_port is required on every DP when "
+                            "data_plane_family=ucx (ctrl_port is control-plane"
+                            " only)"
+                        )
+                    by_addr.setdefault(dp.addr, []).append(dp.data_port)
+            for addr, ports in by_addr.items():
+                if len(ports) != len(set(ports)):
+                    raise ValueError(
+                        f"[LWD] duplicate data_port on {addr}"
+                    )
         self._validate_ranks()
         self._validate_control_ports()
 
