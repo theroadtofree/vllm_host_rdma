@@ -1063,10 +1063,24 @@ class Scheduler(SchedulerInterface):
                             <= self.max_model_len
                         ):
                             if padded_num_tokens > request_token_budget:
-                                # Prefer to not schedule than schedule un-padded.
-                                break
-                            num_new_tokens = padded_num_tokens
-                            pad_spec_decode = True
+                                lwd_window_cap = getattr(
+                                    request, "lwd_window_cap", None
+                                )
+                                if (
+                                    lwd_window_cap is None
+                                    or lwd_window_cap >= padded_num_tokens
+                                ):
+                                    # Prefer to not schedule than schedule
+                                    # un-padded.
+                                    break
+                                # The LWD prefill window itself cannot hold
+                                # the padded size and cannot grow: fall
+                                # through un-padded (the window clamp below
+                                # keeps the raw size) instead of retrying the
+                                # same 1-row window forever.
+                            else:
+                                num_new_tokens = padded_num_tokens
+                                pad_spec_decode = True
 
                     # [Lwd] prefill token accounting debug log: routed via
                     # lwd_logger (VLLM_LWD_LOG_LEVEL, default silent) so it
