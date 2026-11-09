@@ -56,7 +56,11 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
     scene: Literal["single_instance", "edge_share", "cloud_share", "lwd_cluster"]
-    hccl_world_size: LwdCount
+    hccl_world_size: LwdCount | None = None
+    """Size of the SHARED HCCL world spanning the edge and cloud. Required
+    when ``data_plane_comm: device``; meaningless and must be omitted
+    when ``data_plane_comm: host`` (no global comm domain — the edge and
+    cloud are separate worlds whose sizes come from their own launches)."""
     edges_num: LwdCount
     clouds_num: LwdCount
     data_plane_comm: Literal["device", "host"] = "device"
@@ -266,6 +270,13 @@ class LwdTopology:
                         "data_plane_comm=host (no global comm domain; "
                         "links are established from addr/data_port)"
                     )
+            if self.deployment.hccl_world_size is not None:
+                raise ValueError(
+                    "[LWD] hccl_world_size must be omitted when "
+                    "data_plane_comm=host (the edge and cloud are "
+                    "separate worlds; their sizes come from their own "
+                    "launches)"
+                )
             # Only cloud DPs listen (one shared listener per DP; edges
             # connect out), mirroring the ctrl_port placement rule.
             for instance in self.edges:
@@ -292,7 +303,13 @@ class LwdTopology:
                         f"[LWD] duplicate data_port on {addr}"
                     )
         if self.deployment.data_plane_comm == "device":
-            # The shared HCCL world requires the rank allocation declared.
+            # The shared HCCL world requires its size and the rank
+            # allocation declared.
+            if self.deployment.hccl_world_size is None:
+                raise ValueError(
+                    "[LWD] hccl_world_size is required when "
+                    "data_plane_comm=device"
+                )
             for instance in (*self.edges, *self.clouds):
                 if any(not dp.ranks for dp in instance.dp):
                     raise ValueError(

@@ -1793,8 +1793,21 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
-    if config is not None and config.lwd_config is not None:
+    if (
+        config is not None
+        and config.lwd_config is not None
+        # Host comm has no shared LWD world: the edge and cloud are
+        # separate launches and use the native (per-instance) world args.
+        and getattr(
+            config.lwd_config.topology.deployment,
+            "data_plane_comm",
+            "device",
+        )
+        != "host"
+    ):
         world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
+    elif config is not None and config.lwd_config is not None:
+        pass  # host comm: keep the native world args computed above
     elif (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -2022,9 +2035,15 @@ def initialize_model_parallel(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
-    if config.lwd_config is not None:
+    if config.lwd_config is not None and getattr(
+        config.lwd_config.topology.deployment, "data_plane_comm", "device"
+    ) != "host":
         _lwd_initialize_model_parallel(config, tensor_model_parallel_size, backend)
         return
+    # Host comm (data_plane_comm=host): no shared cross-side world, so the
+    # topology-derived groups do not apply; fall through to the native
+    # init path (each instance builds its own TP/DP groups like a plain
+    # vLLM deployment).
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
