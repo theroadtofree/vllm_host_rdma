@@ -130,7 +130,7 @@ class LwdDP:
     exactly as configured. Only CLOUD DPs listen: each cloud DP binds
     one shared listener (both its UP/DOWN links attach to it, routed by
     handshake token); edges connect out and never listen. Required on
-    every cloud DP when ``data_plane_family: ucx``, omitted on edges;
+    every cloud DP when ``data_plane_comm: host``, omitted on edges;
     unused by hccl."""
 
 
@@ -177,11 +177,12 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
-    data_plane_family: Literal["hccl", "ucx"] = "hccl"
-    """Cross-node transport of the LWD data plane: HCCL P2P over the
-    shared torch world (default) or UCX host-RoCE links (vllm's
-    ``vllm/v1/lwd_comm`` + vllm-ascend's ``lwd_data_plane/ucx``). Both
-    peers of a link must select the same family."""
+    data_plane_comm: Literal["device", "host"] = "device"
+    """Cross-node transport of the LWD data plane: "device" = HCCL P2P
+    over the shared torch world (default); "host" = UCX host-RoCE links
+    (vllm's ``vllm/v1/data_comm`` + vllm-ascend's ``lwd_data_plane/ucx``).
+    Both peers of a link must select the same comm. Configured only in
+    this YAML — there is no env override."""
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the source file digest; empty for from_dict."""
@@ -242,7 +243,7 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
-        if self.data_plane_family == "ucx":
+        if self.deployment.data_plane_comm == "host":
             # Only cloud DPs listen (one shared listener per DP; edges
             # connect out), mirroring the ctrl_port placement rule.
             for instance in self.edges:
@@ -256,7 +257,7 @@ class LwdTopology:
                     if dp.data_port is None:
                         raise ValueError(
                             "[LWD] data_port is required on every cloud DP "
-                            "when data_plane_family=ucx (ctrl_port is "
+                            "when data_plane_comm=host (ctrl_port is "
                             "control-plane only)"
                         )
             by_addr: dict[str, list[int]] = {}
