@@ -208,6 +208,24 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             f"[LWD] not supported in edge-cloud mode: {', '.join(unsupported)}"
         )
+    if (
+        getattr(
+            lwd_config.topology.deployment, "data_plane_comm", "device"
+        )
+        == "host"
+    ):
+        # Host comm has no shared HCCL world and no topology ranks; the
+        # rank-allocation checks below are device-only. Each DP is an
+        # independent engine launch, so the parallel sizes must match the
+        # local instance's DP count instead.
+        if parallel_config.data_parallel_size != len(lwd_config.instance.dp):
+            raise ValueError(
+                f"[LWD] data parallel size {parallel_config.data_parallel_size} "
+                f"!= {len(lwd_config.instance.dp)} DPs of {lwd_config.role} "
+                f"instance {lwd_config.instance_id} (host comm: one engine "
+                "launch per DP)"
+            )
+        return
     # Raises for topologies the shared HCCL world cannot host.
     LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     # The topology gives every DP of an instance the same rank count.
