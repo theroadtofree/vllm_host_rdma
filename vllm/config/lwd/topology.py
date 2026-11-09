@@ -240,64 +240,57 @@ class LwdTopology:
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
         if self.deployment.data_plane_comm == "host":
-            # No global comm domain: ranks are meaningless and must be
-            # omitted everywhere; the world-coverage and allocation rules
-            # below assume a shared HCCL world and are skipped entirely.
-            for instance in (*self.edges, *self.clouds):
-                if any(dp.ranks for dp in instance.dp):
-                    raise ValueError(
-                        "[LWD] ranks must be omitted when "
-                        "data_plane_comm=host (no global comm domain; "
-                        "links are established from addr/data_port)"
-                    )
-            if self.deployment.hccl_world_size is not None:
-                raise ValueError(
-                    "[LWD] hccl_world_size must be omitted when "
-                    "data_plane_comm=host (the edge and cloud are "
-                    "separate worlds; their sizes come from their own "
-                    "launches)"
-                )
-            # Only cloud DPs listen (one shared listener per DP; edges
-            # connect out), mirroring the ctrl_port placement rule.
-            for instance in self.edges:
-                if any(dp.data_port is not None for dp in instance.dp):
-                    raise ValueError(
-                        "[LWD] data_port is cloud-only (edges connect out "
-                        "and never listen)"
-                    )
-            for instance in self.clouds:
-                for dp in instance.dp:
-                    if dp.data_port is None:
-                        raise ValueError(
-                            "[LWD] data_port is required on every cloud DP "
-                            "when data_plane_comm=host (ctrl_port is "
-                            "control-plane only)"
-                        )
-            by_addr: dict[str, list[int]] = {}
-            for instance in self.clouds:
-                for dp in instance.dp:
-                    by_addr.setdefault(dp.addr, []).append(dp.data_port)
-            for addr, ports in by_addr.items():
-                if len(ports) != len(set(ports)):
-                    raise ValueError(
-                        f"[LWD] duplicate data_port on {addr}"
-                    )
-        if self.deployment.data_plane_comm == "device":
-            # The shared HCCL world requires its size and the rank
-            # allocation declared.
-            if self.deployment.hccl_world_size is None:
-                raise ValueError(
-                    "[LWD] hccl_world_size is required when "
-                    "data_plane_comm=device"
-                )
-            for instance in (*self.edges, *self.clouds):
-                if any(not dp.ranks for dp in instance.dp):
-                    raise ValueError(
-                        "[LWD] ranks are required on every DP when "
-                        "data_plane_comm=device"
-                    )
+            # No shared HCCL world: the host-specific layout rules apply
+            # instead of the rank-allocation ones.
+            self._validate_host_layout()
+        else:
             self._validate_ranks()
         self._validate_control_ports()
+
+    def _validate_host_layout(self) -> None:
+        """Layout rules of data_plane_comm=host (no global comm domain).
+
+        Ranks are meaningless and must be omitted everywhere; the cloud
+        is the only listener (one shared listener per cloud DP, edges
+        connect out), so data_port is cloud-only.
+        """
+        for instance in (*self.edges, *self.clouds):
+            if any(dp.ranks for dp in instance.dp):
+                raise ValueError(
+                    "[LWD] ranks must be omitted when "
+                    "data_plane_comm=host (no global comm domain; "
+                    "links are established from addr/data_port)"
+                )
+        if self.deployment.hccl_world_size is not None:
+            raise ValueError(
+                "[LWD] hccl_world_size must be omitted when "
+                "data_plane_comm=host (the edge and cloud are "
+                "separate worlds; their sizes come from their own "
+                "launches)"
+            )
+        for instance in self.edges:
+            if any(dp.data_port is not None for dp in instance.dp):
+                raise ValueError(
+                    "[LWD] data_port is cloud-only (edges connect out "
+                    "and never listen)"
+                )
+        for instance in self.clouds:
+            for dp in instance.dp:
+                if dp.data_port is None:
+                    raise ValueError(
+                        "[LWD] data_port is required on every cloud DP "
+                        "when data_plane_comm=host (ctrl_port is "
+                        "control-plane only)"
+                    )
+        by_addr: dict[str, list[int]] = {}
+        for instance in self.clouds:
+            for dp in instance.dp:
+                by_addr.setdefault(dp.addr, []).append(dp.data_port)
+        for addr, ports in by_addr.items():
+            if len(ports) != len(set(ports)):
+                raise ValueError(
+                    f"[LWD] duplicate data_port on {addr}"
+                )
 
     def _validate_ranks(self) -> None:
         for edge in self.edges:
