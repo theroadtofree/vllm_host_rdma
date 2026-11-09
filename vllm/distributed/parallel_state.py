@@ -1793,14 +1793,11 @@ def init_distributed_environment(
 
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
-    if (
-        config is not None
-        and config.lwd_config is not None
-        and not config.lwd_config.topology.is_host_comm
-    ):
-        world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
-    elif config is not None and config.lwd_config is not None:
-        pass  # host comm: keep the native world args computed above
+    if config is not None and config.lwd_config is not None:
+        if not config.lwd_config.topology.is_host_comm:
+            world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
+        # Host comm: keep the native world args computed above (the edge
+        # and cloud are separate launches with no shared LWD world).
     elif (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
