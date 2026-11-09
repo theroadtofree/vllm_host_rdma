@@ -2531,3 +2531,125 @@ def test_boundary_states_offered_past_prompt_for_resumed_prefill():
     offered = [b for _, _, b in drain_boundary_state_offloads(manager).get("0", [])]
     assert 2 * block_size in offered
     assert req0.num_prompt_tokens < 2 * block_size
+
+
+def test_full_attention_partial_hit_with_alignment_multiple_of_hash_unit():
+    """Compressed-MLA style hits (DeepSeek-V4): the hit alignment is a
+    multiple of ``hash_block_size`` (e.g. 128 with hash unit 8), finer than
+    the group's block. Every alignment boundary inside a block must be
+    reachable: the hit lands mid-block and the tail block is CoW'd."""
+    hash_block_size = 2
+    alignment = 4
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["fine"],
+                FullAttentionSpec(
+                    block_size=alignment,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["coarse"],
+                FullAttentionSpec(
+                    block_size=4 * alignment,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+    )
+    coordinator = manager.coordinator
+    # Emulate the compressed-MLA fine-grained regime (Ascend DSV4 gating):
+    # partial hits on, hit alignment = a multiple of hash_block_size.
+    coordinator.enable_partial_hash_hits = True
+    monkeypatch_ok = type(coordinator)._cache_hit_alignment_tokens
+    try:
+        type(coordinator)._cache_hit_alignment_tokens = property(
+            lambda self: alignment
+        )
+        for mgr in coordinator.single_type_managers:
+            mgr.cache_hit_alignment_tokens = alignment
+
+        producer = make_request(
+            "p", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5], hash_block_size, sha256
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(producer)
+        assert num_computed == 0
+        # Register in chunks: the second call extends the tail block's
+        # coverage, and estimate_cached_tokens (which aggregates on
+        # block_hash_num_tokens) must follow the longest registered boundary.
+        assert manager.allocate_slots(producer, 4, 0, blocks) is not None
+        producer.num_computed_tokens = 4
+        assert manager.allocate_slots(producer, 4) is not None
+        assert manager.estimate_cached_tokens(producer) == 8
+        producer.num_computed_tokens = 8
+        assert manager.allocate_slots(producer, 4) is not None
+
+        # Registration: full keys at block ends, partial keys at every
+        # alignment boundary interior to a block (4 and 12 for the coarse
+        # group; 4 for the fine group is a full-block end).
+        coarse_blocks = producer.block_hashes[12 // hash_block_size - 1]
+        assert manager.block_pool.get_cached_block(coarse_blocks, [1]) is not None
+        mid_block_hash = producer.block_hashes[4 // hash_block_size - 1]
+        assert manager.block_pool.get_cached_block(mid_block_hash, [0]) is not None
+        assert manager.block_pool.get_cached_block(mid_block_hash, [1]) is not None
+
+        # Full-prefill reuse: both groups reach 12 via one full block plus a
+        # mid-block partial on the coarse group.
+        consumer = make_request(
+            "c", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 7, 7], hash_block_size, sha256
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(consumer)
+        assert num_computed == 12
+        # The mid-block tail block is covered (kept) for the coarse group.
+        assert [len(group) for group in blocks.blocks] == [3, 1]
+
+        new_blocks = manager.allocate_slots(consumer, 2, 12, blocks)
+        assert new_blocks is not None
+        copies, _ = manager.take_kv_cache_block_copies()
+        assert copies, "the shared mid-block tail must be CoW'd"
+
+        # Partial-prefix reuse: a request sharing only the first 4 tokens
+        # hits the interior boundary of the first coarse block.
+        short = make_request("s", [0, 0, 1, 1, 6, 6], hash_block_size, sha256)
+        blocks, num_computed, _ = manager.get_computed_blocks(short)
+        assert num_computed == 4
+        assert [len(group) for group in blocks.blocks] == [1, 1]
+        new_blocks = manager.allocate_slots(short, 2, 4, blocks)
+        assert new_blocks is not None
+        copies, _ = manager.take_kv_cache_block_copies()
+        assert copies, "the 4-token partial tail must be CoW'd"
+
+        # The producer keeps writing: the coarse block holding the 12-token
+        # boundary becomes full, and the partial-to-full promotion drops its
+        # keys. The boundary must survive via the promotion repair.
+        producer.num_computed_tokens = 12
+        producer.append_output_token_ids([8, 8, 8, 8, 8, 8])
+        assert manager.allocate_slots(producer, 6) is not None
+
+        late = make_request(
+            "l", [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 9, 9], hash_block_size, sha256
+        )
+        blocks, num_computed, _ = manager.get_computed_blocks(late)
+        assert num_computed == 12, (
+            "the 12-token partial boundary must survive the "
+            "partial-to-full promotion of its block"
+        )
+    finally:
+        type(coordinator)._cache_hit_alignment_tokens = monkeypatch_ok
+        for mgr in coordinator.single_type_managers:
+            mgr.cache_hit_alignment_tokens = (
+                coordinator.scheduler_block_size or 1
+            )

@@ -2870,12 +2870,14 @@ def resolve_block_hashes(
         assert block_hashes.scale_factor == block_size // hash_block_size
         return block_hashes
     # Fine-grained partial hits keep the raw hashes. The caller passes
-    # alignment_tokens = hash_block_size to enable them, else >= block_size.
+    # alignment_tokens equal to hash_block_size, or a multiple of it finer
+    # than block_size; else >= block_size.
     if (
         supports_fine_grained_hash_lookup
         and alignment_tokens is not None
         and alignment_tokens < block_size
         and block_size % alignment_tokens == 0
+        and alignment_tokens % hash_block_size == 0
     ):
         return block_hashes
     assert block_size % hash_block_size == 0
