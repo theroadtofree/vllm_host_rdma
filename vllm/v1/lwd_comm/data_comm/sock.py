@@ -22,6 +22,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _SOL_SOCKET = _socket.SOL_SOCKET
+_SO_REUSEADDR = _socket.SO_REUSEADDR  # ucx_channel's listener sets it directly
 _SO_RCVTIMEO = getattr(_socket, "SO_RCVTIMEO", 20)
 _SO_SNDTIMEO = getattr(_socket, "SO_SNDTIMEO", 21)
 _MSG_NOSIGNAL = getattr(_socket, "MSG_NOSIGNAL", 0)
