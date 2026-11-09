@@ -1796,8 +1796,6 @@ def init_distributed_environment(
     if (
         config is not None
         and config.lwd_config is not None
-        # Host comm has no shared LWD world: the edge and cloud are
-        # separate launches and use the native (per-instance) world args.
         and not config.lwd_config.topology.is_host_comm
     ):
         world_size, rank, distributed_init_method = _lwd_world_args(config, rank)

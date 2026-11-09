@@ -53,6 +53,24 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdHostDataPlane:
+    up_buffersize: LwdCount = 128
+    """UP (edge->cloud) block size in MB: one block must cover the
+    largest single UP frame (init warns if the model needs more);
+    identical on both peers."""
+
+    down_buffersize: LwdCount = 32
+    """DOWN (cloud->edge) block size in MB; identical on both peers."""
+
+    deployment: Literal["in_process", "sidecar"] = "in_process"
+    """"in_process" = transport runs inside each engine process;
+    "sidecar" = one dedicated transport daemon per host (listeners owned
+    by the daemon, engines attach via ctl socket + shm). Both peers of
+    a link must match."""
+
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
     scene: Literal["single_instance", "edge_share", "cloud_share", "lwd_cluster"]
@@ -66,23 +84,6 @@ class LwdDeployment:
     """Host-comm settings block, required when ``data_plane_comm: host``
     and omitted otherwise — the extension point for future host-plane
     properties."""
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class LwdHostDataPlane:
-    up_buffersize: LwdCount
-    """UP (edge->cloud) block size in MB: one block must cover the
-    largest single UP frame (init warns if the model needs more);
-    identical on both peers."""
-
-    down_buffersize: LwdCount
-    """DOWN (cloud->edge) block size in MB; identical on both peers."""
-
-    deployment: Literal["in_process", "sidecar"] = "in_process"
-    """"in_process" = transport runs inside each engine process;
-    "sidecar" = one dedicated transport daemon per host (listeners owned
-    by the daemon, engines attach via ctl socket + shm). Both peers of
-    a link must match."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -293,12 +294,6 @@ class LwdTopology:
                 "data_plane_comm=host (the edge and cloud are "
                 "separate worlds; their sizes come from their own "
                 "launches)"
-            )
-        if self.deployment.data_plane_host is None:
-            raise ValueError(
-                "[LWD] data_plane_host is required when "
-                "data_plane_comm=host (up/down buffersize in MB; the "
-                "extension block for host-plane settings)"
             )
         for instance in self.edges:
             if any(dp.data_port is not None for dp in instance.dp):
