@@ -673,7 +673,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             notify.num_prompt_tokens,
             notify.prefix_nonce,
         )
-        if not self.engines_running:
+        # A coordinated MoE DP engine must let the native ADD path observe the
+        # paused state and emit start_wave. Waking only this rank here suppresses
+        # that notification and can leave its peers asleep for the next collective.
+        native_dp_wake = isinstance(self, DPEngineCoreProc) and self.has_coordinator
+        if not self.engines_running and not native_dp_wake:
             self.engines_running = True
             lwd_logger.info(
                 "[cloud] first request wakes a paused wave (local fallback)"
