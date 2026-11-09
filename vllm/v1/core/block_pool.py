@@ -457,6 +457,7 @@ class BlockPool:
         kv_cache_group_id: int,
         block_size: int,
         replace_existing_hashes: bool = False,
+        preserve_existing_hashes: bool = False,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -487,6 +488,15 @@ class BlockPool:
             replace_existing_hashes: Whether the block contents were replaced
                 and all existing cache entries must be removed before the new
                 entry is registered.
+            preserve_existing_hashes: Keep the block's existing keys when the
+                new entry covers a longer prefix than the primary hash. The
+                content under a partial key is append-only, so the shorter
+                keys stay valid: the old primary is moved to the extra set and
+                the new (longest) boundary becomes the primary, keeping
+                ``block_hash_num_tokens`` tracking the deepest registered
+                prefix (see ``KVCacheManager.estimate_cached_tokens``). Use
+                this for incremental multi-boundary registration where
+                superseding would drop boundaries registered by earlier calls.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -519,8 +529,17 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
-            removed_hashes = self._remove_cached_block_hashes(block)
-            self._emit_block_removed_events(removed_hashes)
+            if preserve_existing_hashes:
+                # Append-only content: the shorter keys stay valid. Move the
+                # current primary into the extra set and re-primary under the
+                # longest boundary instead of dropping every key.
+                self.cached_block_hashes_by_block.setdefault(
+                    block.block_id, set()
+                ).add(block.block_hash)
+                block.reset_hash()
+            else:
+                removed_hashes = self._remove_cached_block_hashes(block)
+                self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
             block_hash_with_group_id,
             block,

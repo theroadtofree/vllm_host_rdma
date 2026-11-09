@@ -95,7 +95,10 @@ class LwdPrefixReservations:
         """Truncate each cache group to the blocks covered by hit."""
         managers = self.manager.coordinator.single_type_managers
         return tuple(
-            list(group[: hit // manager.block_size])
+            # Keep the block covering the hit endpoint: with fine-grained
+            # partial hits the endpoint can land inside a block, and that
+            # block holds the hit tokens.
+            list(group[: (hit + manager.block_size - 1) // manager.block_size])
             for group, manager in zip(groups, managers, strict=True)
         )
 
@@ -201,9 +204,19 @@ def init_lwd_prefix_cache(
         )
 
     coordinator = manager.coordinator
-    alignment_tokens = lcm(
-        coordinator.scheduler_block_size,
-        getattr(coordinator, "lcm_block_size", coordinator.scheduler_block_size),
+    # The coordinator's hit alignment is authoritative: fine-grained partial
+    # hits align to the compressed-state unit (e.g. 128 tokens per C128
+    # state), not the scheduler LCM block, and the edge rounds the probe hit
+    # down to this value. Fall back to the LCM formula for coordinators that
+    # do not expose it.
+    hit_alignment = getattr(coordinator, "_cache_hit_alignment_tokens", None)
+    alignment_tokens = (
+        hit_alignment
+        if isinstance(hit_alignment, int) and hit_alignment > 0
+        else lcm(
+            coordinator.scheduler_block_size,
+            getattr(coordinator, "lcm_block_size", coordinator.scheduler_block_size),
+        )
     )
     alignment_required = any(
         isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"

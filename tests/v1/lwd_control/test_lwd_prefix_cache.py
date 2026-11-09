@@ -237,3 +237,31 @@ def test_probe_query_with_prefix_caching_reports_cloud_hit():
     result = adapter.probe(_manifest(block_size=16))
 
     assert (result.block_size, result.hit_tokens, result.cloud_id) == (16, 32, 1)
+
+
+def test_init_alignment_follows_coordinator_hit_alignment(monkeypatch):
+    """The coordinator's hit alignment wins over the scheduler LCM: fine
+    hits land on compressed-state boundaries (e.g. 128), and the edge rounds
+    the probe hit down to this value."""
+    manager = _manager()
+    manager.enable_caching = True
+    manager.coordinator.scheduler_block_size = 16384
+    manager.coordinator.lcm_block_size = 16384
+    manager.coordinator._cache_hit_alignment_tokens = 128
+    spec = object.__new__(FullAttentionSpec)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+    )
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+    )
+    monkeypatch.setattr(
+        "vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes",
+        lambda config, vllm_config: (8, 8),
+    )
+
+    state = init_lwd_prefix_cache(vllm_config, kv_cache_config, manager)
+
+    assert state.hash_block_size == 8
+    assert state.alignment_tokens == 128

@@ -146,6 +146,10 @@ class SingleTypeKVCacheManager(ABC):
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
+        # Highest alignment boundary registered so far per request, so
+        # partial-entry registration only walks new boundaries instead of
+        # re-walking the whole prefix on every cache_blocks call.
+        self._partial_boundary_watermark: dict[str, int] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
@@ -568,6 +572,7 @@ class SingleTypeKVCacheManager(ABC):
         req_blocks = self.req_to_blocks.pop(request_id, [])
         self.num_cached_block.pop(request_id, None)
         self._partial_hit_reqs.pop(request_id, None)
+        self._partial_boundary_watermark.pop(request_id, None)
         return req_blocks
 
     def free(self, request_id: str) -> None:
@@ -769,17 +774,22 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             alignment_tokens=alignment_tokens,
         )
 
-        # Fine-grained mode (alignment_tokens == hash_block_size <
-        # block_size): resolve_block_hashes kept the raw hash-granularity
-        # list so interior boundaries can be probed.
+        # Fine-grained mode (``alignment_tokens`` is a multiple of
+        # ``hash_block_size`` and finer than ``block_size``):
+        # resolve_block_hashes kept the raw hash-granularity list so interior
+        # boundaries can be probed. Indices below are raw hash units; a hit is
+        # only valid at alignment boundaries, i.e. raw index ``k * step - 1``.
+        hash_unit = block_pool.hash_block_size
         fine_grained = (
-            alignment_tokens < block_size and block_size % alignment_tokens == 0
+            alignment_tokens < block_size
+            and block_size % alignment_tokens == 0
+            and alignment_tokens % hash_unit == 0
         )
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
             full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
-                block_hashes, alignment_tokens, block_size
+                block_hashes, hash_unit, block_size
             )
         else:
             full_block_hashes = block_hashes
@@ -798,18 +808,24 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hit_length = len(computed_blocks[0]) * block_size
 
         # Phase 2 (fine-grained only): extend into the first non-full block by
-        # probing its interior hash boundaries high-to-low (longest hit first).
+        # probing its interior alignment boundaries high-to-low (longest hit
+        # first). Raw index ``k * step - 1`` is the chain hash covering
+        # ``k * alignment_tokens`` tokens.
         if fine_grained:
             # list or lazy BlobBlockHashes view
             assert isinstance(block_hashes, Sequence)
-            scale_factor = block_size // alignment_tokens
+            step = alignment_tokens // hash_unit
+            scale_factor = block_size // hash_unit
             first_partial_idx = len(computed_blocks[0]) * scale_factor
-            max_partial_idx = min(
+            end_idx = min(
                 first_partial_idx + scale_factor - 1,
-                max_length // alignment_tokens,
+                max_length // hash_unit,
                 len(block_hashes),
             )
-            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+            k_hi = end_idx // step
+            k_lo = (first_partial_idx + step) // step
+            for k in range(k_hi, k_lo - 1, -1):
+                fine_idx = k * step - 1
                 cached_tail = block_pool.get_cached_block(
                     block_hashes[fine_idx], kv_cache_group_ids
                 )
@@ -817,7 +833,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     continue
                 for computed, cached in zip(computed_blocks, cached_tail):
                     computed.append(cached)
-                hit_length = (fine_idx + 1) * alignment_tokens
+                hit_length = (fine_idx + 1) * hash_unit
                 break
 
         # Eagle needs the tokens right before the generation point recomputed:
@@ -843,6 +859,10 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         *,
         replay_boundaries: Sequence[int],
     ) -> None:
+        # Blocks registered as full before this call: any block promoted to
+        # full during it had its partial-entry keys dropped and needs them
+        # re-registered.
+        prev_full_blocks = self.num_cached_block.get(request.request_id, 0)
         super().cache_blocks(
             request,
             num_tokens,
@@ -852,20 +872,37 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
             return
-        self._cache_partial_tail_block(request, num_tokens)
+        self._cache_partial_tail_block(request, num_tokens, prev_full_blocks)
 
     def _cache_partial_tail_block(
         self,
         request: Request,
         num_tokens: int,
+        prev_full_blocks: int,
     ) -> None:
-        """Cache the prompt tail when it ends inside a cache block.
+        """Register partial prefix-cache entries for fine-grained hits.
 
-        Only the final prompt hash boundary is registered as a partial
-        prefix-cache entry; intermediate hash boundaries inside the same cache
-        block are intentionally skipped.
+        Fine-grained regime (``alignment_tokens`` a multiple of
+        ``hash_block_size`` and finer than the group's block): every
+        alignment boundary interior to a covered block is registered so the
+        ``find_longest_cache_hit`` phase 2 probe can find it.
         """
         hash_block_size = self.block_pool.hash_block_size
+        alignment = self.cache_hit_alignment_tokens
+        if (
+            alignment > hash_block_size
+            and alignment < self.block_size
+            and self.block_size % alignment == 0
+        ):
+            self._cache_partial_boundaries(
+                request, num_tokens, alignment, prev_full_blocks
+            )
+            return
+
+        # Single-entry regime (alignment == hash_block_size): only the final
+        # prompt hash boundary is registered as a partial prefix-cache entry;
+        # intermediate hash boundaries inside the same cache block are
+        # intentionally skipped.
         boundary_tokens = request.num_prompt_tokens // hash_block_size * hash_block_size
         if boundary_tokens == 0 or boundary_tokens > num_tokens:
             return
@@ -883,6 +920,58 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
         )
+
+    def _cache_partial_boundaries(
+        self,
+        request: Request,
+        num_tokens: int,
+        alignment: int,
+        prev_full_blocks: int,
+    ) -> None:
+        """Register every ``alignment`` boundary interior to a covered block.
+
+        Full-block ends are already registered by ``cache_blocks``, so
+        boundaries that land on a block end are skipped. Only boundaries above
+        the per-request watermark are walked (high-to-low); blocks that just
+        became full are re-registered once because the partial-to-full
+        promotion in ``cache_full_blocks`` drops their earlier keys. Entries
+        are registered with ``preserve_existing_hashes`` so extending a
+        block's coverage never drops the shorter boundaries.
+        """
+        top = num_tokens // alignment * alignment
+        if top == 0:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        watermark = self._partial_boundary_watermark.get(request.request_id, 0)
+
+        def _register(boundary: int) -> None:
+            if boundary % self.block_size == 0:
+                return
+            block_idx = boundary // self.block_size
+            if block_idx >= len(blocks):
+                return
+            self.block_pool.cache_partial_block(
+                request=request,
+                block=blocks[block_idx],
+                num_tokens=boundary,
+                kv_cache_group_id=self.kv_cache_group_id,
+                block_size=self.block_size,
+                preserve_existing_hashes=True,
+            )
+
+        # Re-register interiors of blocks that just became full.
+        for block_idx in range(prev_full_blocks, num_tokens // self.block_size):
+            lo = block_idx * self.block_size
+            hi = min((block_idx + 1) * self.block_size, top)
+            for boundary in range(hi - hi % alignment, lo, -alignment):
+                _register(boundary)
+
+        # New boundaries above the watermark.
+        for boundary in range(top, watermark, -alignment):
+            _register(boundary)
+
+        if top > watermark:
+            self._partial_boundary_watermark[request.request_id] = top
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
