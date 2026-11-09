@@ -56,17 +56,20 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
     scene: Literal["single_instance", "edge_share", "cloud_share", "lwd_cluster"]
+    edges_num: LwdCount
+    clouds_num: LwdCount
+    # Optional fields must follow the required ones (dataclass rule);
+    # YAML parsing is key-based, so the class field order is invisible
+    # to the config file.
     hccl_world_size: LwdCount | None = None
     """Size of the SHARED HCCL world spanning the edge and cloud. Required
     when ``data_plane_comm: device``; meaningless and must be omitted
     when ``data_plane_comm: host`` (no global comm domain — the edge and
     cloud are separate worlds whose sizes come from their own launches)."""
-    edges_num: LwdCount
-    clouds_num: LwdCount
     data_plane_comm: Literal["device", "host"] = "device"
     """Cross-node transport of the LWD data plane: "device" = HCCL P2P
     over the shared torch world (default); "host" = UCX host-RoCE links
-    (vllm's ``vllm/v1/data_comm`` + vllm-ascend's ``lwd_data_plane/ucx``).
+    (vllm's ``vllm/v1/data_comm`` + vllm-ascend's ``lwd_data_plane/host``).
     Both peers of a link must select the same comm. Configured only in
     this YAML — there is no env override."""
 
