@@ -126,21 +126,8 @@ class LwdDP:
     dp_idx: LwdId
     addr: Annotated[StrictStr, AfterValidator(_address)]
     ranks: Annotated[tuple[LwdId, ...], Field(min_length=1)] | None = None
-    """Global ranks this DP occupies in the SHARED HCCL world. Required
-    on every DP when ``data_plane_comm: device`` (and validated to cover
-    [0, hccl_world_size) without gaps); must be omitted when
-    ``data_plane_comm: host`` — there is no global comm domain in host
-    mode (edge and cloud are separate worlds; links are established from
-    role/instance identity + addr/data_port, not ranks)."""
     ctrl_port: LwdPort | None = None
-    """Control-plane (ZMQ) port of this DP; not used by the data plane."""
     data_port: LwdPort | None = None
-    """UCX data-plane listener port of this DP (family=ucx only), used
-    exactly as configured. Only CLOUD DPs listen: each cloud DP binds
-    one shared listener (both its UP/DOWN links attach to it, routed by
-    handshake token); edges connect out and never listen. Required on
-    every cloud DP when ``data_plane_comm: host``, omitted on edges;
-    unused by hccl."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
