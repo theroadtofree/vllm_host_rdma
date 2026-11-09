@@ -169,6 +169,11 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
+    data_plane_family: Literal["hccl", "ucx"] = "hccl"
+    """Cross-node transport of the LWD data plane: HCCL P2P over the
+    shared torch world (default) or UCX host-RoCE links (vllm's
+    ``vllm/v1/lwd_comm`` + vllm-ascend's ``lwd_data_plane/ucx``). Both
+    peers of a link must select the same family."""
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the source file digest; empty for from_dict."""
