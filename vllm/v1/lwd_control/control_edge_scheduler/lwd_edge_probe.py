@@ -85,7 +85,7 @@ class LwdEdgeProbeManager:
         lwd_config = vllm_config.lwd_config
         coordination = lwd_config.coordination
         cloud_ids = tuple(coordination.control_url_map) if coordination else ()
-        self._health = LwdCloudHealthTracker(cloud_ids, edge_id=lwd_config.instance_id)
+        self._health = LwdCloudHealthTracker(cloud_ids)
 
     @property
     def enabled(self) -> bool:

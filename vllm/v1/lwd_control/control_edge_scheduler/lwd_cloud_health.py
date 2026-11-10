@@ -10,15 +10,11 @@ import time
 class LwdCloudHealthTracker:
     """Track probe health without changing existing request bindings."""
 
-    def __init__(
-        self, cloud_ids: list[int] | tuple[int, ...], *, edge_id: int = 0
-    ) -> None:
+    def __init__(self, cloud_ids: list[int] | tuple[int, ...]) -> None:
         self._cloud_ids = tuple(sorted(cloud_ids))
         self._failures = dict.fromkeys(self._cloud_ids, 0)
         self._cooldown_until: dict[int, float] = {}
-        # Stagger independent edges without changing the subsequent
-        # round-robin order or health-based candidate filtering.
-        self._cursor = edge_id
+        self._cursor = 0
 
     def candidates(self, now: float | None = None) -> tuple[int, ...]:
         now = time.monotonic() if now is None else now

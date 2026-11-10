@@ -221,24 +221,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         elif len(candidates) == 1:
             best = next(iter(candidates.values()))
         else:
-            route_anchor = self._lwd_last_engine
-            if route_anchor < 0:
-                # Before the serving cursor is established, stagger edges by
-                # cloud rather than letting every edge tie-break to cloud 0.
-                # Include all DP links of the selected first cloud.
-                cloud_ids = tuple(dict.fromkeys(c.cloud_id for c in candidates))
-                first_cloud = cloud_ids[edge_id % len(cloud_ids)]
-                first_connection = next(
-                    c for c in candidates if c.cloud_id == first_cloud
-                )
-                route_anchor = self._lwd_connections.index(first_connection) - 1
             best = min(
                 candidates.values(),
                 key=lambda account: (
                     account.score(),
                     (
                         self._lwd_connections.index(account.connection_id)
-                        - route_anchor
+                        - self._lwd_last_engine
                         - 1
                     )
                     % len(self._lwd_connections),
