@@ -217,6 +217,19 @@ def _bind_ucp() -> None:
                          ctypes.byref(rel))
     _ucp._ucp_init_major = maj.value or 1
     _ucp._ucp_init_minor = mnr.value
+    # ucp_config_*:代码级改写 UCX 配置(键不带 UCX_ 前缀;未识别键
+    # 经 UCP 空前缀透传子表缓存,资源打开时下发 UCT,如 IB_TRAFFIC_CLASS)
+    _ucp.ucp_config_read.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _ucp.ucp_config_read.restype = ctypes.c_int
+    _ucp.ucp_config_modify.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p,
+    ]
+    _ucp.ucp_config_modify.restype = ctypes.c_int
+    _ucp.ucp_config_release.argtypes = [ctypes.c_void_p]
+    _ucp.ucp_config_release.restype = None
     _ucp.ucp_cleanup.argtypes = [ctypes.c_void_p]
     _ucp.ucp_worker_create.argtypes = [
         ctypes.c_void_p, ctypes.POINTER(_UcpWorkerParams),

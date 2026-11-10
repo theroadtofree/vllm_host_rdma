@@ -131,6 +131,11 @@ class UcxCfg:
     token:      通道标识(握手互验,防误连到别人的端口;默认 0 不校验
                 语义,仅要求两端同值)
     early_max:  早到帧暂存上界(条数;0 = n_blocks)
+    traffic_class: IB Traffic Class / RoCEv2 DSCP(None=UCX 默认 auto:
+                RoCEv2 取端口全局 TC 否则 106);两端同值
+    sl:         IB Service Level / RoCEv2 以太网优先级 PCP(None=默认 0);
+                交换机 PFC/ETS 按 DSCP+PCP 联合分流,通常与
+                traffic_class 配套配置;两端同值
     """
 
     block_mb: int = 64
@@ -139,6 +144,8 @@ class UcxCfg:
     hs_timeout_s: float = 5.0
     token: int = 0
     early_max: int = 0   # 早到暂存总条数上界(0 = n_blocks)
+    traffic_class: int | None = None
+    sl: int | None = None
     pool_staging: bool = False  # True:本通道池块仅作发送 D2H 暂存
                                 # (acquire_staging/release_staging 周转),
                                 # 不挂 wildcard——单向"只发"通道用
@@ -365,6 +372,14 @@ class UcxChannel:
         self._block_bytes = max(1, int(c.block_mb)) << 20
         self._n_blocks = max(2, int(c.n_blocks))
         self._put_thresh = max(0, int(c.put_thresh))
+        # UCT 级配置注入(见 _ChanLink:read→modify→init):键为 UCX 配置
+        # 名(不带 UCX_ 前缀),值由 ucp_config_modify 在 init 前写入。
+        self._cfg_traffic_class = c.traffic_class
+        self._uct_config: dict[str, str] = {}
+        if c.traffic_class is not None:
+            self._uct_config["IB_TRAFFIC_CLASS"] = str(int(c.traffic_class))
+        if c.sl is not None:
+            self._uct_config["IB_SL"] = str(int(c.sl))
         self._hs_timeout_s = max(1.0, float(c.hs_timeout_s))
         self._token = int(c.token)
         self._early_max = c.early_max or self._n_blocks
@@ -466,6 +481,9 @@ class UcxChannel:
         ch = cls(cfg, name=f"srv:{port}")
         ch._role = "serve"
         ch._srv_fd = _sock.c_open()
+        if ch._cfg_traffic_class is not None:
+            # bind 前设置:accept 出的连接继承 listening socket 的 TOS
+            _sock.c_set_tos(ch._srv_fd, ch._cfg_traffic_class << 2)
         _sock.c_setsockopt_int(
             ch._srv_fd, _sock._SOL_SOCKET, _sock._SO_REUSEADDR, 1,
             what="SO_REUSEADDR",
@@ -774,6 +792,8 @@ class UcxChannel:
             mine = link.my_address()
             fd = _sock.c_open()
             try:
+                if self._cfg_traffic_class is not None:
+                    _sock.c_set_tos(fd, self._cfg_traffic_class << 2)
                 _sock.c_connect_timeout(fd, host, port, self._hs_timeout_s)
                 _sock.c_set_sock_timeouts(fd, self._hs_timeout_s)
                 _hs_send(fd, mine, self._block_bytes, self._token,
@@ -1320,6 +1340,7 @@ class UcxListener:
         self._thread: threading.Thread | None = None
         self._routes: dict[int, UcxChannel] = {}
         self._lock = threading.Lock()
+        self._traffic_class: int | None = None
         _sock.c_setsockopt_int(
             self._fd, _sock._SOL_SOCKET, _sock._SO_REUSEADDR, 1,
             what="SO_REUSEADDR",
@@ -1327,8 +1348,18 @@ class UcxListener:
         _sock.c_bind(self._fd, host, self.port)
         _sock.c_listen(self._fd, 16)
 
+    def set_traffic_class(self, traffic_class: int | None) -> None:
+        """Mark the handshake listener's TOS (accepted connections inherit
+        it). Called at channel-register time, before the accept loop
+        starts; channels sharing one listener must share one tc."""
+        if traffic_class is None or self._traffic_class is not None:
+            return
+        self._traffic_class = traffic_class
+        _sock.c_set_tos(self._fd, int(traffic_class) << 2)
+
     def register(self, token: int, channel: UcxChannel, *,
                  name: str = "") -> None:
+        self.set_traffic_class(channel._cfg_traffic_class)
         token = int(token)
         with self._lock:
             if token in self._routes:

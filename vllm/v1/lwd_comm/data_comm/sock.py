@@ -126,6 +126,21 @@ def c_accept(srv_fd: int) -> tuple[int, str]:
     return conn.detach(), f"{addr[0]}:{addr[1]}"
 
 
+def c_set_tos(fd: int, tos: int) -> None:
+    """IP_TOS(建链 TCP 与 RDMA 数据帧同 DSCP:tos = traffic_class << 2)。
+    服务端在 bind 前设置可继承给 accept 出的连接(Linux 继承
+    listening socket 的 TOS);客户端在 connect 前设置。失败不致命
+    (内核/平台不支持时仅告警)。"""
+    s = _socket.socket(fileno=fd)
+    try:
+        s.setsockopt(_socket.IPPROTO_IP, _socket.IP_TOS, tos)
+    except OSError as exc:
+        logger.warning("[lwd-sock] setsockopt IP_TOS=%d failed: %s",
+                       tos, exc)
+    finally:
+        s.detach()
+
+
 def c_close(fd: int) -> None:
     with contextlib.suppress(OSError):
         os.close(fd)

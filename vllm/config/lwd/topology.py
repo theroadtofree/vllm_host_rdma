@@ -87,6 +87,40 @@ class LwdDeployment:
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdQosDataPlane:
+    """QoS of the LWD data plane (host comm: injected into UCX at link
+    init, code-level, no env; device comm ignores these)."""
+
+    traffic_class: Annotated[int, Field(strict=True, ge=0, le=255)] | None = (
+        None
+    )
+    """RoCEv2 DSCP / IB Traffic Class; None = UCX default (auto -> 106
+    for RoCEv2). Effective QoS needs matching switch PFC/ETS policy,
+    usually paired with ``sl``; identical on both peers."""
+
+    sl: Annotated[int, Field(strict=True, ge=0, le=15)] | None = None
+    """RoCEv2 Ethernet priority (PCP) / IB Service Level; None = UCX
+    default (0). Pair with ``traffic_class``; identical on both peers."""
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdQosCtrlPlane:
+    """QoS of the LWD control plane (ZMQ links, DSCP-marked sockets)."""
+
+    dscp: Annotated[int, Field(strict=True, ge=0, le=63)] | None = None
+    """DSCP mark for control-plane traffic; None = leave sockets
+    unmarked (OS default). Identical on both peers."""
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdQoS:
+    """Cross-plane QoS policy of the deployment (top-level ``qos`` block)."""
+
+    data_plane: LwdQosDataPlane | None = None
+    ctrl_plane: LwdQosCtrlPlane | None = None
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdScramble:
     enable: StrictBool = False
     device_id: LwdString | None = None
@@ -201,6 +235,7 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
+    qos: LwdQoS | None = None
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the source file digest; empty for from_dict."""

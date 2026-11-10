@@ -36,6 +36,12 @@ class LwdCoordClient:
         # short slices so a FIRST_REQ waits at most one poll period.
         self._lock = threading.Lock()
         self._socket = zmq.Context.instance().socket(zmq.XSUB)
+        # Inter-node control link: carry the topology's ctrl-plane DSCP.
+        from vllm.v1.lwd_control.lwd_comm.lwd_transport import (
+            _apply_ctrl_qos,
+        )
+
+        _apply_ctrl_qos(self._socket)
         self._socket.connect(stats_addr)
         with self._lock:
             self._socket.send(b"\x01")  # subscribe to everything

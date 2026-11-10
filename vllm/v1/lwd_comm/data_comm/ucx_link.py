@@ -103,13 +103,31 @@ class _UcxLink:
         params.features = (_UCP_FEATURE_TAG
                            | (getattr(owner, "_put_thresh", 0) > 0
                               and _UCP_FEATURE_RMA or 0))
-        ctx = ctypes.c_void_p(0)
-        rc = _ucp.ucp_init_version(
-            _ucp._ucp_init_major, _ucp._ucp_init_minor,
-            ctypes.byref(params), None, ctypes.byref(ctx))
+        # UCT 级配置(如 IB_TRAFFIC_CLASS/IB_SL)代码注入:read(含 env
+        # 默认)→逐项 modify→init 后 release。键不带 UCX_ 前缀;未在
+        # UCP 表中的键由空前缀透传子表缓存,资源打开时下发 UCT。
+        uct_cfg = getattr(owner, "_uct_config", None) or {}
+        uconfig = ctypes.c_void_p(0)
+        rc = _ucp.ucp_config_read(None, None, ctypes.byref(uconfig))
         if rc != _UCS_OK:
-            raise RuntimeError(f"ucp_init_version failed status={rc}"
-                               "(检查 UCX_TLS/UCX_NET_DEVICES 配置)")
+            raise RuntimeError(f"ucp_config_read failed status={rc}")
+        try:
+            for name, value in uct_cfg.items():
+                rc = _ucp.ucp_config_modify(
+                    uconfig, str(name).encode(), str(value).encode())
+                if rc != _UCS_OK:
+                    raise RuntimeError(
+                        f"ucp_config_modify({name}={value}) failed "
+                        f"status={rc}")
+            ctx = ctypes.c_void_p(0)
+            rc = _ucp.ucp_init_version(
+                _ucp._ucp_init_major, _ucp._ucp_init_minor,
+                ctypes.byref(params), uconfig, ctypes.byref(ctx))
+            if rc != _UCS_OK:
+                raise RuntimeError(f"ucp_init_version failed status={rc}"
+                                   "(检查 UCX_TLS/UCX_NET_DEVICES 配置)")
+        finally:
+            _ucp.ucp_config_release(uconfig)
         self._ctx = ctx.value
         try:
             wparams = _UcpWorkerParams()
