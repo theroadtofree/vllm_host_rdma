@@ -263,7 +263,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             )
 
         recv_rows = self.lwd_recv_rows.get(request.request_id, 0)
-        alignment = self.kv_cache_manager.coordinator.scheduler_block_size
+        # Same alignment the probe path lands hits on (compressed-state
+        # boundaries on fine-grained deployments), not the scheduling block:
+        # clamping to the latter would discard a fine hit whenever recv_rows
+        # is below one scheduler block.
+        alignment = self.kv_cache_manager.coordinator.cache_hit_alignment_tokens
         clamped_hit = min(h_prime, recv_rows // alignment * alignment)
         if clamped_hit < h_prime:
             groups = reservations.truncate(groups, clamped_hit)

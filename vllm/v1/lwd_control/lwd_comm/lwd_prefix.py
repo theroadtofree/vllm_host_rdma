@@ -378,7 +378,8 @@ class LwdProbeResult:
     block_size: int
     hit_blocks: int
     hit_tokens: int
-    # 云侧对齐网格(scheduler_block_size,各 KV 组块大小 LCM):边侧按它
+    # 云侧命中对齐(coordinator.cache_hit_alignment_tokens:细粒度部署为压缩
+    # state 边界,如 128;否则 scheduler LCM):边侧按它对 probe 命中取整、
     # 对 chunk 做 mamba 对齐重切。0 = 未公告(旧版云/降级),边侧不重切
     alignment_tokens: int = 0
     # 路由回执的云 id:多云选路时由中央调度器/网关填;None=单云或未启用选路

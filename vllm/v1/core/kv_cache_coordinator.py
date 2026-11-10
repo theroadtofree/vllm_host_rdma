@@ -168,6 +168,23 @@ class KVCacheCoordinator(ABC):
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
 
+    @property
+    def cache_hit_alignment_tokens(self) -> int:
+        """Token alignment of prefix-cache hits.
+
+        The single source shared by every consumer that must agree on hit
+        boundaries: the coordinator's own lookups, the LWD probe path,
+        preemption re-admission clamping, and the edge-side rounding of
+        probe hits. Coordinators may refine it via
+        ``_cache_hit_alignment_tokens`` (e.g. fine-grained hits on
+        compressed-state boundaries); the scheduling block size is the
+        conservative fallback.
+        """
+        alignment = getattr(self, "_cache_hit_alignment_tokens", None)
+        if isinstance(alignment, int) and alignment > 0:
+            return alignment
+        return self.scheduler_block_size
+
     def get_num_blocks_to_allocate(
         self,
         request_id: str,

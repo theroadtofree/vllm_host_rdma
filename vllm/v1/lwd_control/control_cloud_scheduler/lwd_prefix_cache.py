@@ -209,7 +209,7 @@ def init_lwd_prefix_cache(
     # state), not the scheduler LCM block, and the edge rounds the probe hit
     # down to this value. Fall back to the LCM formula for coordinators that
     # do not expose it.
-    hit_alignment = getattr(coordinator, "_cache_hit_alignment_tokens", None)
+    hit_alignment = getattr(coordinator, "cache_hit_alignment_tokens", None)
     alignment_tokens = (
         hit_alignment
         if isinstance(hit_alignment, int) and hit_alignment > 0

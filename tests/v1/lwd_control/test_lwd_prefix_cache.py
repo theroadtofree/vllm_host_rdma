@@ -247,7 +247,7 @@ def test_init_alignment_follows_coordinator_hit_alignment(monkeypatch):
     manager.enable_caching = True
     manager.coordinator.scheduler_block_size = 16384
     manager.coordinator.lcm_block_size = 16384
-    manager.coordinator._cache_hit_alignment_tokens = 128
+    manager.coordinator.cache_hit_alignment_tokens = 128
     spec = object.__new__(FullAttentionSpec)
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(enable_prefix_caching=True),
@@ -265,3 +265,64 @@ def test_init_alignment_follows_coordinator_hit_alignment(monkeypatch):
 
     assert state.hash_block_size == 8
     assert state.alignment_tokens == 128
+
+
+def test_cache_hit_alignment_property_prefers_coordinator_refinement():
+    from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
+
+    fake = SimpleNamespace(scheduler_block_size=16384)
+    assert KVCacheCoordinator.cache_hit_alignment_tokens.fget(fake) == 16384
+    fake._cache_hit_alignment_tokens = 128
+    assert KVCacheCoordinator.cache_hit_alignment_tokens.fget(fake) == 128
+
+
+def test_readmission_clamp_uses_fine_grained_alignment():
+    """Preemption re-admission must clamp recv_rows at the coordinator's hit
+    alignment (e.g. 128), not the scheduler LCM block: with the coarse clamp
+    a fine hit like 6656 is discarded whenever recv_rows < 16384, silently
+    turning a resume into a full recompute or a full-prefill refill."""
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
+        LwdCloudScheduler,
+    )
+
+    groups = ([SimpleNamespace(is_null=False) for _ in range(500)],)
+    reservations = LwdPrefixReservations(_manager())
+    coordinator = SimpleNamespace(
+        scheduler_block_size=16384,
+        cache_hit_alignment_tokens=128,
+    )
+    coordinator.find_longest_cache_hit = Mock(return_value=(groups, 6656, 0))
+
+    refill_calls = []
+    state = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator),
+        lwd_prefix_reservations=reservations,
+        lwd_prefix_hits={},
+        lwd_recv_rows={"r": 6715},
+        _lwd_refill_gate=set(),
+        _lwd_refill_pending={},
+        lwd_refill_sender=lambda *args: refill_calls.append(args),
+    )
+    request = SimpleNamespace(
+        request_id="r",
+        block_hashes=["a", "b"],
+        num_prompt_tokens=6715,
+        skip_reading_prefix_cache=False,
+        lwd_resume_cap_tokens=6656,
+    )
+
+    # All rows arrived: the fine hit survives in full, no refill is armed.
+    assert LwdCloudScheduler._lwd_prep_prefix_readmission(state, request) is True
+    assert reservations.hit_of("r") == 6656
+    assert refill_calls == []
+    assert "r" not in state._lwd_refill_gate
+
+    # Only part of the rows arrived: clamp at the fine boundary (not 0 / 16K)
+    # and refill just the missing range.
+    reservations.release("r")
+    state.lwd_recv_rows["r"] = 3000
+    assert LwdCloudScheduler._lwd_prep_prefix_readmission(state, request) is False
+    assert reservations.hit_of("r") == 2944
+    assert refill_calls == [("r", 2944, 6656, 0)]
+    assert "r" in state._lwd_refill_gate
+    assert state._lwd_refill_pending["r"].hit_tokens == 2944
