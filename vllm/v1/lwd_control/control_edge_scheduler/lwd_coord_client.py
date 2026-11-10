@@ -20,6 +20,7 @@ import msgspec
 import zmq
 
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_control.lwd_comm.lwd_transport import lwd_apply_ctrl_qos
 
 _LWD_STATS_POLL_MS = 50
 _LWD_SHUTDOWN_JOIN_S = 1.0
@@ -36,6 +37,8 @@ class LwdCoordClient:
         # short slices so a FIRST_REQ waits at most one poll period.
         self._lock = threading.Lock()
         self._socket = zmq.Context.instance().socket(zmq.XSUB)
+        # Inter-node control link: carry the topology's ctrl-plane DSCP.
+        lwd_apply_ctrl_qos(self._socket)
         self._socket.connect(stats_addr)
         with self._lock:
             self._socket.send(b"\x01")  # subscribe to everything
