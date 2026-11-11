@@ -48,15 +48,15 @@ qos:
 | `dp[].data_port` | Cloud-only, required on every cloud DP in host mode; the edge never listens |
 | `deployment.hccl_world_size`, `dp[].ranks` | Must be omitted in host mode |
 
-`LwdTopology.validate_layout` dispatches to `_validate_host_layout`, which fails startup when ranks or `hccl_world_size` are present, when an edge declares `data_port`, when a cloud DP lacks it, or when one address repeats a `data_port`. `lwd_check_parallel_config` then requires `parallel_config.data_parallel_size == len(instance.dp)`: each DP is its own engine launch.
+`LwdTopology.validate_layout` dispatches to `_validate_host_layout`, which fails startup when ranks or `hccl_world_size` are present, when an edge declares `data_port`, when a cloud DP lacks it, or when one address repeats a `data_port`. `lwd_check_parallel_config` then requires `parallel_config.data_parallel_size == len(instance.dp)`: each DP is its own engine launch. In host mode it also rejects an edge with `tensor_parallel_size > 1`, because only edge TP rank 0 holds the host links and there is no cross-TP aggregation path: the failure lands at startup instead of a later missing-IO error. Cloud tensor parallelism is unaffected.
 
 ## Link model
 
 Every DP connection owns **two** UHC1 links, one per direction, each an independent `LwdUcxChannel` with its own UCP endpoint, IO thread and block pool.
 
-- The cloud DP binds one shared `LwdUcxListener` on its `data_port`; both links attach through `serve_via`.
+- The cloud DP binds one shared `LwdUcxListener` on its `data_port`; both links attach through `serve_via`. The listener is created once per cloud DP and reused by every edge connected to that DP; the handshake token routes each incoming connection to its own channel. See [lwd_host_multi_edge_cloud.md](lwd_host_multi_edge_cloud.md).
 - The edge connects out for both links: UHC1 is full-duplex, so which side binds the handshake socket is independent of the data direction.
-- Endpoint process of a connection: `dp_rank == dp_idx` and TP rank 0. Other ranks hold no link objects.
+- Endpoint process of a connection: `dp_rank == dp_idx` and TP rank 0. Other ranks hold no link objects. An edge is a single-rank world in host mode (`tensor_parallel_size=1`); only the cloud may use tensor parallelism.
 
 ```mermaid
 flowchart LR
@@ -148,13 +148,25 @@ Both peers must carry the same values; effective QoS needs matching switch PFC/E
 | --- | --- |
 | `tests/v1/lwd_comm/test_sock.py` | TCP helpers: handshake round-trip, fd ownership across wrap/detach, bounded connect timeout, peer-close return |
 | `tests/config/lwd/test_topology.py` | Host layout validation errors and `data_plane_host` misuse |
+| `tests/distributed/test_lwd_parallel_groups.py` | Group derivation, plus the host parallel checks: edge TP>1 rejected, edge TP=1 and cloud TP>1 accepted |
+| `tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py` | One shared listener per cloud DP, reused by every edge of that DP; edges and sidecar engines build none |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_block_policy.py` | Block derivation, explicit override, fallback, invalid inputs |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_frame_guard.py` | Submit-time rejection of an oversized frame |
 
 Anything that needs libucp, RoCE hardware or an NPU is verified on the real deployment; see the runbooks in the RFC issue.
 
+## Multi-edge and multi-cloud
+
+`cloud_share` (several edges share one cloud DP), `lwd_cluster` (one edge reaches every cloud) and `edge_share` are supported in host mode. Constraints:
+
+- one listener per cloud DP, shared by every edge connected to it;
+- edge `tensor_parallel_size=1`; cloud TP is unrestricted;
+- the fixed 12 GiB host memory budget, which covers the current specifications;
+- the host endpoint fixed at each cloud DP's TP0, with no rotation across TP ranks.
+
+See [lwd_host_multi_edge_cloud.md](lwd_host_multi_edge_cloud.md) for the design, its acceptance criteria and the failure paths.
+
 ## Out of scope
 
-- Multiple edge instances per cloud DP and shared-rank layouts: the current topology validation rejects them in host mode.
 - Peer-restart recovery, seqno replay and dynamic link re-planning.
 - GPU-side and CPU-side assemblies of the same transport.
