@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from vllm.config.lwd import LwdConnectionId, LwdTopology
-from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
+from vllm.config.lwd import LwdConfig, LwdConnectionId, LwdTopology
+from vllm.distributed.lwd import (
+    LwdChannelEndpoints,
+    LwdParallelGroupsSpec,
+    lwd_check_parallel_config,
+)
 
 
 def _instance(
@@ -206,3 +211,63 @@ def test_rank_outside_the_world_has_no_tp_group() -> None:
 
     with pytest.raises(ValueError, match="not in"):
         spec.tp_group_of(2)
+
+
+def _host_config(role: str, tensor_parallel_size: int) -> Any:
+    """Host layout of one edge and one cloud DP: no ranks, cloud listens."""
+    topology = LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "single_instance",
+                "edges_num": 1,
+                "clouds_num": 1,
+                "data_plane_comm": "host",
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [{"id": 0, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]}],
+            "clouds": [
+                {
+                    "id": 0,
+                    "dp": [
+                        {
+                            "dp_idx": 0,
+                            "addr": "10.1.0.1",
+                            "ctrl_port": 5550,
+                            "data_port": 7000,
+                        }
+                    ],
+                }
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}],
+        }
+    )
+    return SimpleNamespace(
+        lwd_config=LwdConfig.from_topology("host_topology.yaml", role, 0, topology),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_elastic_ep=False,
+            data_parallel_size=1,
+            tensor_parallel_size=tensor_parallel_size,
+        ),
+        engram_config=None,
+    )
+
+
+def test_host_edge_rejects_tensor_parallelism() -> None:
+    """Only edge TP0 holds the host links; TP>1 has no aggregation path."""
+    with pytest.raises(
+        ValueError, match="host edge supports only tensor_parallel_size=1"
+    ):
+        lwd_check_parallel_config(_host_config("edge", 2))
+
+
+@pytest.mark.parametrize(("role", "tensor_parallel_size"), [("edge", 1), ("cloud", 4)])
+def test_host_mode_accepts_edge_tp1_and_cloud_tensor_parallelism(
+    role: str, tensor_parallel_size: int
+) -> None:
+    """The rejection is edge-only: a single-rank edge stays valid, and the
+    cloud keeps its TP group for the prompt broadcast."""
+    lwd_check_parallel_config(_host_config(role, tensor_parallel_size))

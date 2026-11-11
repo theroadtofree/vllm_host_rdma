@@ -167,7 +167,7 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
     Raises:
         NotImplementedError: A parallel feature or the topology is unsupported.
         ValueError: The tensor parallel size differs from the ranks of each DP
-            of the local instance.
+            of the local instance, or a host edge enables tensor parallelism.
     """
     lwd_config = vllm_config.lwd_config
     assert lwd_config is not None
@@ -204,6 +204,16 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
                 f"!= {len(lwd_config.instance.dp)} DPs of {lwd_config.role} "
                 f"instance {lwd_config.instance_id} (host comm: one engine "
                 "launch per DP)"
+            )
+        # Only TP rank 0 of an edge holds the host links and there is no
+        # path that gathers the TP shards into its UP payload, so a TP>1 edge
+        # would silently run without a data plane: reject it at startup.
+        if lwd_config.role == "edge" and parallel_config.tensor_parallel_size > 1:
+            raise ValueError(
+                "[LWD] host edge supports only tensor_parallel_size=1, got "
+                f"{parallel_config.tensor_parallel_size}: the edge host "
+                "endpoint has no cross-TP aggregation path, so do not enable "
+                "tensor parallelism on the edge (cloud TP is unaffected)"
             )
         return
     # Raises for topologies the shared HCCL world cannot host.
