@@ -62,6 +62,11 @@ _USAGE_WAIT_TIMEOUT = 600.0
 # 先作答(200 或 503),否则边侧超时放弃时云侧可能仍在等子进程,那笔预留与
 # 计费流都成了白挂。503 时边侧按 fail-open 走全量,行为与今天一致。
 _CLOUD_PROBE_HEADROOM_S = 5.0
+# 扇出放置的溢出门限(在途请求数差):命中最大的引擎比最闲引擎多挂不超
+# 过该值时仍按命中放置(保住前缀复用);超过才溢出到更闲的引擎——锁步
+# DP 下空闲引擎本在陪跑 dummy,溢出那单全量 prefill 近乎免费,且算完就
+# 缓存上该前缀,自愈回"命中并列、按负载摊匀"的稳态。
+_PLACEMENT_SPILL_SLACK = 1
 
 
 class LwdCloudControlBridge:
@@ -100,8 +105,15 @@ class LwdCloudControlBridge:
         # 扇出应答收集:键为 reply_key("<rid>#probe")，与单引擎
         # future 命名空间隔离，迟到的扇出应答找不到 waiter 即丢弃
         self._fanout_waiters: dict[str, queue.Queue] = {}
-        # 并列轮转计数器(命中并列时依次轮换赢家引擎,防热点钉死)
-        self._rr_counter = 0
+        # 负载感知放置的引擎在途计数:fanout 放置时 +1,引擎 usage 事件
+        # 到达时 -1。命中最大的引擎超载(比最闲引擎多挂超过溢出门限)时
+        # 溢出到更闲的引擎——纯 argmax 会把多边共享长前缀的流量钉死在
+        # 缓存最热的那台引擎(缓存只长在赢家上,自增强),另一台全程
+        # dummy 陪跑、总吞吐折半;溢出自愈后命中并列、按负载持续摊匀。
+        self._engine_live: dict[int, int] = {}
+        # request_id -> 已放置引擎:usage 事件按它精确减回;同 req_id 重投
+        # (边侧重试)时放置路径先摘旧记录,避免计数重复累计。
+        self._placements: dict[str, int] = {}
         self._lock = threading.Lock()
         self._closed = False
         self._dispatch_thread = threading.Thread(
@@ -124,6 +136,7 @@ class LwdCloudControlBridge:
             ]
             self._probe_futures.clear()
             self._usage_futures.clear()
+            self._placements.clear()
             loop = self._loop
         alive = [future for future in pending if not future.done()]
         if loop is None or not alive:
@@ -235,10 +248,13 @@ class LwdCloudControlBridge:
         """云内 DP probe 扇出与放置(仅 dp>1 路径)。
 
         两段式:① 只读求命中命令(reserve=False)广播到全部引擎的
-        Processor,逐引擎聚合命中;② 按 (命中长度降序, 并列轮转) 选定
-        赢家引擎,只向赢家发正式 probe(reserve=True)落预留——跨引擎
-        预留是虚假命中,预留必须与后续数据面同引擎。响应命中值取赢家
-        引擎的命中,engine_index=赢家。
+        Processor,逐引擎聚合命中;② 按 (在途负载升序, 命中长度降序)
+        选定赢家引擎——命中最大的引擎超载(比最闲引擎多挂超过
+        ``_PLACEMENT_SPILL_SLACK``)时溢出到更闲的引擎,防止多边共享
+        前缀把流量钉死在缓存最热引擎;放置计入在途计数,引擎 usage
+        事件到达时减回(见 ``_dispatch_events``)。响应命中值取赢家
+        引擎的命中,engine_index=赢家——预留必须与后续数据面同引擎
+        (跨引擎预留是虚假命中)。
 
         应答经共享 event_queue 上行,命令携带 engine_index/reply_key
         由引擎侧原样回显(见 Processor.poll),Bridge 按 reply_key 分发
@@ -298,23 +314,38 @@ class LwdCloudControlBridge:
             if not results:
                 raise TimeoutError(
                     f"prefix probe fanout timed out after {timeout}s")
-        # 放置:argmax(命中 token),并列按进程内单调计数器轮转。
-        # 候选只含已应答引擎:missing(死/慢)引擎按 0 命中参与 hits
-        # 展示,但绝不入候选——冷缓存全场 0 命中时若把它们算进并列,
-        # 轮转会把请求钉到死引擎上(UP 通道楔死)。
+        # 放置:命中最大的引擎只要没比最闲引擎多挂超过 _PLACEMENT_SPILL_SLACK
+        # 个在途请求就赢(保住前缀复用);超了则沿(命中降序, 负载升序)取
+        # 第一个不过载的引擎。纯 argmax 会把多边共享长前缀的流量钉死在
+        # 缓存最热的那台引擎(自增强:缓存只长在赢家上,差距=整条前缀,
+        # 单看命中永远翻不了盘),另一台全程 dummy 陪跑、总吞吐折半;锁步
+        # DP 下空闲引擎反正要陪跑 dummy,溢出的那单全量 prefill 近乎免费,
+        # 且算完就把该前缀缓存上,回到命中并列、按负载摊匀的稳态。候选只
+        # 含已应答引擎:missing(死/慢)引擎按 0 命中参与 hits 展示,但绝不
+        # 入候选——负载键恒 0 的平局会把请求钉到死引擎上(UP 通道楔死)。
+        # 同 req_id 重投先摘旧放置再记账,重试不叠加计数。
         hits = [
             results[i].hit_tokens if i in results else 0 for i in range(n)
         ]
-        top = max(hits[i] for i in results) if results else 0
-        candidates = [i for i in results if hits[i] == top]
-        if len(candidates) > 1:
-            winner = candidates[self._rr_counter % len(candidates)]
-            self._rr_counter += 1
-        else:
-            winner = candidates[0]
+        candidates = list(results)
+        with self._lock:
+            live = {i: self._engine_live.get(i, 0) for i in candidates}
+            min_live = min(live.values())
+            ordered = sorted(candidates, key=lambda i: (-hits[i], live[i], i))
+            winner = next(
+                i for i in ordered if live[i] <= min_live + _PLACEMENT_SPILL_SLACK
+            )
+            previous = self._placements.pop(manifest.request_id, None)
+            if previous is not None:
+                self._engine_live[previous] = max(
+                    0, self._engine_live.get(previous, 1) - 1
+                )
+            self._placements[manifest.request_id] = winner
+            self._engine_live[winner] = self._engine_live.get(winner, 0) + 1
+            live_counts = [self._engine_live.get(i, 0) for i in range(n)]
         logger.info(
-            "[Lwd][ctrl] fanout placement req=%s hits=%s winner=%d",
-            manifest.request_id, hits, winner,
+            "[Lwd][ctrl] fanout placement req=%s hits=%s winner=%d live=%s",
+            manifest.request_id, hits, winner, live_counts,
         )
         return dataclass_replace(results[winner], engine_index=winner)
 
@@ -351,6 +382,18 @@ class LwdCloudControlBridge:
                 continue
             kind = event.get("type")
             request_id = event.get("request_id")
+            if kind == "usage":
+                # 引擎完结信号在 future 结算路径之前处理:dp>1 的 usage
+                # 事件不走 future 命名空间(扇出路径不注册),却必须在此
+                # 减回放置计数——这是"请求已在该引擎跑完"的唯一权威信号
+                # (流结束不可作依据:扇出路径的 SSE 流在探针应答后即收,
+                # 早于请求完结)。pop 幂等,dp=1 无放置时为 no-op。
+                with self._lock:
+                    engine = self._placements.pop(request_id, None)
+                    if engine is not None:
+                        self._engine_live[engine] = max(
+                            0, self._engine_live.get(engine, 1) - 1
+                        )
             with self._lock:
                 table = (self._probe_futures if kind == "probe"
                          else self._usage_futures)
