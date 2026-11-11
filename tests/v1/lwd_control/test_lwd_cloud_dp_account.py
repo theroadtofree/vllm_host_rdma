@@ -78,20 +78,20 @@ def test_pending_batches_release_on_watermark_and_request_settlement() -> None:
 
 def test_gate_blocks_on_slots_and_pending_chunks_but_not_resumes() -> None:
     account = LwdCloudDpAccount(0)
-    assert not account.is_gated(max_num_running_reqs=2, has_resume_inflight=False)
+    assert not account.is_gated(2, has_resume_inflight=False, num_running_reqs=0)
 
     # Slots full.
     account.note_prefill_admitted("a")
     account.note_prefill_admitted("b")
-    assert account.is_gated(2, has_resume_inflight=False)
+    assert account.is_gated(2, has_resume_inflight=False, num_running_reqs=2)
     # A resume in flight is exempt: finish in-flight chunks first.
-    assert not account.is_gated(2, has_resume_inflight=True)
+    assert not account.is_gated(2, has_resume_inflight=True, num_running_reqs=2)
 
     # Pending chunks at the cap gate the engine even with free slots.
     other = LwdCloudDpAccount(1)
     for seqno in range(LWD_MAX_PENDING_CHUNKS):
         other.register_batch(seqno, {f"r{seqno}"})
-    assert other.is_gated(max_num_running_reqs=100, has_resume_inflight=False)
+    assert other.is_gated(100, has_resume_inflight=False, num_running_reqs=0)
 
 
 def test_gate_uses_account_pending_chunk_limit() -> None:
@@ -99,7 +99,7 @@ def test_gate_uses_account_pending_chunk_limit() -> None:
     account.register_batch(0, {"r"})
 
     assert account.max_pending_chunks == 1
-    assert account.is_gated(max_num_running_reqs=100, has_resume_inflight=False)
+    assert account.is_gated(100, has_resume_inflight=False, num_running_reqs=0)
 
 
 def test_score_matches_native_dp_balancer_weights() -> None:
@@ -110,19 +110,15 @@ def test_score_matches_native_dp_balancer_weights() -> None:
 
 
 def test_finished_requests_release_their_slot_under_load() -> None:
-    """The 180-concurrency deadlock shape: requests finish, their route
-    entry and decode_load must be released, or the load creeps up to
-    max_num_seqs, the gate holds every engine forever and both sides idle
-    (seen live: loads=[(11, 79), (11, 79)] with the cloud spinning dummies).
-    """
+    """Finished requests must release routing load as native slots drain."""
     account = LwdCloudDpAccount(0)
     for i in range(90):
         account.note_prefill_admitted(f"r{i}")
         account.note_prefill_done(f"r{i}")  # first token
     assert account.load == 90
-    assert account.is_gated(90, has_resume_inflight=False)
+    assert account.is_gated(90, has_resume_inflight=False, num_running_reqs=90)
 
     for i in range(90):
         account.note_request_settled(f"r{i}", was_awaiting=True)
     assert account.load == 0
-    assert not account.is_gated(90, has_resume_inflight=False)
+    assert not account.is_gated(90, has_resume_inflight=False, num_running_reqs=0)

@@ -15,7 +15,7 @@ table-driven testable.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 
 class LwdPrefillCandidate(NamedTuple):
@@ -25,6 +25,29 @@ class LwdPrefillCandidate(NamedTuple):
     request_id: str
     num_prompt_tokens: int
     num_computed_tokens: int
+
+
+def lwd_grammar_ready(request: Any, blocked_status: object) -> bool:
+    """Picker filter: is the request selectable despite grammar blocking?
+
+    The cloud's native scheduler defers a request whose status is
+    WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR until its grammar finishes
+    compiling; the edge picker must not select such a request either, or the
+    two sides disagree on the execution set (this repo has no post-step
+    reconciliation, the pre-filter is the guarantee). `blocked_status` is
+    passed by the caller (the scheduler owns the RequestStatus enum), which
+    keeps this module import-free of vllm.
+
+    Reading `grammar` is side-effect free with respect to promotion: it only
+    folds a completed future into its result, and a compile failure stays
+    visible as an exception (truthy) which the native error path finishes;
+    the status promotion itself stays with
+    `_try_promote_blocked_waiting_request`.
+    """
+    if request.status is not blocked_status:
+        return True
+    structured_request = request.structured_output_request
+    return bool(structured_request and structured_request.grammar)
 
 
 def lwd_pick_prefill_batch(

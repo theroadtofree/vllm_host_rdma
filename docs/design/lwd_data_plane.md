@@ -15,7 +15,7 @@ The data plane spans two repositories:
 
 ## Communication domains
 
-HCCL builds a communicator from a world that every rank joins, so the edge and cloud instances form one HCCL world whose ranks are the global ranks in the topology (`hccl_world_size`, `dp[].ranks`). Inside that world:
+With the default `device` transport, HCCL builds a communicator from a world that every rank joins, so the edge and cloud instances form one HCCL world whose ranks are the global ranks in the topology (`hccl_world_size`, `dp[].ranks`). Inside that world:
 
 - each edge instance DP and each cloud instance DP runs like a centralized pp=1 deployment: its ranks are one TP group, and the PP, DCP, PCP and DP groups are singletons;
 - the EP and MC2 groups equal the TP groups;
@@ -79,6 +79,10 @@ HCCL P2P has no tags: ops on one communicator pair up in posting order. `LwdData
 Every channel op is issued on its channel's NPU stream and followed by an event; `LwdTransferFuture.done()` queries that event without blocking. Both channels are warmed up at initialization in a fixed order (UP, then DOWN), so the first real message cannot rendezvous on different channels on the two sides.
 
 UP takes two hops on the cloud: the channel delivers to the cloud endpoint rank, and the cloud worker broadcasts the rows within its TP group on the compute stream.
+
+## Host transport
+
+`deployment.data_plane_comm: host` replaces HCCL with a host-host RoCE transport (UCX/UHC1). The edge and the cloud become separate torch worlds, so the groups described above are not built, no topology ranks are required, and each cloud DP listens on its own `data_port`. Block sizing, memory budget, sidecar daemon and QoS rules are covered in [lwd_host_data_plane.md](lwd_host_data_plane.md).
 
 ## Out of scope
 

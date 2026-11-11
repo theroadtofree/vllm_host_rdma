@@ -219,3 +219,95 @@ def test_edge_share_uses_explicit_one_to_one_links() -> None:
     topology = LwdTopology.from_dict(raw)
     assert [c.cloud_id for c in topology.connections("edge", 0)] == [1]
     assert [c.edge_id for c in topology.connections("cloud", 0)] == [1]
+
+
+HOST_SAMPLES = [name for name in sorted(PAYLOADS) if not name.startswith("s3")]
+
+
+def host_payload(name: str = "s2_edge_share_2dp.yaml") -> dict:
+    """Adapt a device-comm layout to the host data plane: no ranks, no
+    hccl_world_size, and one data_port per cloud DP (clouds listen, edges
+    connect out)."""
+    raw = topology_payload(name)
+    deployment = raw["deployment"]
+    deployment["data_plane_comm"] = "host"
+    deployment["data_plane_host"] = {"up_buffer_size": 64, "down_buffer_size": 32}
+    deployment.pop("hccl_world_size", None)
+    for instance in raw["edges"] + raw["clouds"]:
+        for dp in instance["dp"]:
+            dp.pop("ranks", None)
+    port = 7000
+    for cloud in raw["clouds"]:
+        for dp in cloud["dp"]:
+            dp["data_port"] = port
+            port += 1
+    return raw
+
+
+@pytest.mark.parametrize("name", HOST_SAMPLES)
+def test_host_layout_accepts_rank_free_topologies(name: str) -> None:
+    """Host comm has no global world: every DP drops ranks and clouds listen."""
+    topology = LwdTopology.from_dict(host_payload(name))
+    assert topology.deployment.data_plane_comm == "host"
+    for instance in (*topology.edges, *topology.clouds):
+        assert all(dp.ranks == () for dp in instance.dp)
+    for cloud in topology.clouds:
+        assert all(dp.data_port is not None for dp in cloud.dp)
+    for edge in topology.edges:
+        assert all(dp.data_port is None for dp in edge.dp)
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ("edge_ranks", "ranks must be omitted"),
+        ("cloud_ranks", "ranks must be omitted"),
+        ("world_size", "hccl_world_size must be omitted"),
+        ("edge_port", "data_port is cloud-only"),
+        ("missing_port", "data_port is required"),
+        ("duplicate_port", "duplicate data_port"),
+    ],
+)
+def test_host_layout_rejects_ranks_world_size_and_port_violations(
+    fault: str, match: str
+) -> None:
+    """Host layouts keep device-only fields out and need one port per cloud DP."""
+    raw = host_payload()
+    if fault in {"edge_ranks", "cloud_ranks"}:
+        instances = raw["edges"] if fault == "edge_ranks" else raw["clouds"]
+        instances[0]["dp"][0]["ranks"] = [0]
+    elif fault == "world_size":
+        raw["deployment"]["hccl_world_size"] = 8
+    elif fault == "edge_port":
+        raw["edges"][0]["dp"][0]["data_port"] = 7099
+    elif fault == "missing_port":
+        raw["clouds"][0]["dp"][0].pop("data_port")
+    else:
+        reusing = raw["clouds"][0]["dp"]
+        reusing[1]["addr"] = reusing[0]["addr"]
+        reusing[1]["data_port"] = reusing[0]["data_port"]
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ("host_block", "data_plane_host is host-comm-only"),
+        ("no_ranks", "ranks are required"),
+        ("no_world_size", "hccl_world_size is required"),
+    ],
+)
+def test_device_layout_requires_ranks_and_world_size(fault: str, match: str) -> None:
+    """Device comm must not be left half-configured after switching planes."""
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    if fault == "host_block":
+        raw["deployment"]["data_plane_host"] = {"up_buffer_size": 32}
+    elif fault == "no_ranks":
+        for instance in raw["edges"] + raw["clouds"]:
+            for dp in instance["dp"]:
+                dp.pop("ranks")
+    else:
+        raw["deployment"].pop("hccl_world_size")
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)

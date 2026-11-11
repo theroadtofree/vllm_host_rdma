@@ -852,10 +852,72 @@ def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
     return pp.world_size > 1 and pp.is_last_rank
 
 
-def lwd_skips_module(vllm_config: VllmConfig, path: str) -> bool:
-    """Return whether the active LWD role omits this model component."""
+LwdRole = Literal["edge", "cloud"]
+
+#: Module dot-path suffix -> owning roles. Single source of truth shared by
+#: three consumers (docs/design/lwd_role_module_skip.md):
+#:   1. Build time: make_layers LWD branch + model construction guards
+#:   2. Load time: model_loader/lwd_weight_filter.py skip keys
+#:   3. Offline split: scripts/lwd/split_lwd_checkpoint.py ROLE_RULES
+_LWD_BOTH: frozenset[LwdRole] = frozenset(("edge", "cloud"))
+
+LWD_MODULE_OWNERSHIP: dict[str, frozenset[LwdRole]] = {
+    "model.embed_tokens": _LWD_BOTH,
+    "lm_head": _LWD_BOTH,
+    # Built by the make_layers LWD branch (edge: start_layer = end_layer = 0);
+    # listed here so load-time and offline-split rules derive from one table.
+    "model.layers": frozenset(("cloud",)),
+    # Cloud applies the final norm before sending hidden states DOWN; the
+    # edge feeds them straight into compute_logits (no norm there).
+    "model.norm": frozenset(("cloud",)),
+    "visual": frozenset(("edge",)),
+    "model.mtp": frozenset(("cloud",)),
+}
+
+
+def lwd_skips_module(module_path: str, role: str | None) -> bool:
+    """Whether ``role`` must not build the module at ``module_path``.
+
+    Suffix match on dot boundaries: ``path == suffix`` or
+    ``path.endswith("." + suffix)``. This keeps ``visual.merger.norm`` away
+    from the ``model.norm`` rule (the merger norm dies with the visual tree),
+    while the ``visual`` suffix covers the whole ``visual.*`` tree. Never
+    degrade to bare-attribute equality (``path == "norm"``) — that would cut
+    tower-internal norms as well.
+
+    Returns False for non-LWD processes (``role is None``) so guards keep
+    the pre-LWD behavior.
+    """
+    if role is None:
+        return False
+    for suffix, owners in LWD_MODULE_OWNERSHIP.items():
+        if module_path == suffix or module_path.endswith("." + suffix):
+            return role not in owners
+    return False
+
+
+def lwd_role_of(vllm_config: Any) -> str | None:
+    """LWD role recorded on ``vllm_config``; None for non-LWD deployments.
+
+    Holders of a persistent VllmConfig (e.g. the model runner) must use this
+    instead of :func:`lwd_role`: the process-global config is only set during
+    model initialization and reads as None from later worker RPCs such as
+    profile_run, which would silently defeat role-aware guards there.
+    """
     lwd_config = getattr(vllm_config, "lwd_config", None)
-    return lwd_config is not None and lwd_config.skips_module(path)
+    return lwd_config.role if lwd_config is not None else None
+
+
+def lwd_role() -> str | None:
+    """LWD role of the current process; None for non-LWD deployments.
+
+    Reads the process-global config, which is only set during model
+    initialization (``set_current_vllm_config``); callers outside that
+    window must use :func:`lwd_role_of` with their own VllmConfig.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    return lwd_role_of(get_current_vllm_config_or_none())
 
 
 def make_layers(

@@ -43,6 +43,34 @@ class LwdPeerUnreachableError(RuntimeError):
     """The peer has no live connection to deliver a frame to."""
 
 
+def lwd_ctrl_tos() -> int | None:
+    """IP TOS byte of the control plane, or None when no DSCP is configured.
+
+    ZMQ's TOS option maps straight to the socket's IP_TOS; the YAML carries a
+    6-bit DSCP, so the wire field is ``dscp << 2``. Read once per socket open:
+    control sockets outlive the config context, and the topology file is
+    immutable per deployment.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    lwd_config = config.lwd_config if config is not None else None
+    topology = lwd_config.topology if lwd_config is not None else None
+    qos = topology.qos if topology is not None else None
+    ctrl_plane = qos.ctrl_plane if qos is not None else None
+    if ctrl_plane is None or ctrl_plane.dscp is None:
+        return None
+    return (int(ctrl_plane.dscp) & 63) << 2
+
+
+def lwd_apply_ctrl_qos(sock: zmq.Socket) -> None:
+    """Mark a control socket with the configured DSCP (no-op when unset)."""
+    tos = lwd_ctrl_tos()
+    if tos is None or not hasattr(zmq, "TOS"):
+        return
+    sock.setsockopt(zmq.TOS, tos)
+
+
 @dataclass(frozen=True)
 class LwdInboundFrame:
     identity: bytes | None
@@ -81,6 +109,7 @@ class LwdControlTransport(ABC):
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
+            lwd_apply_ctrl_qos(sock)
             _, host, _ = split_zmq_path(self.endpoint)
             if is_valid_ipv6_address(host):
                 sock.setsockopt(zmq.IPV6, 1)
@@ -244,6 +273,7 @@ class LwdEdgeTransport(LwdControlTransport):
                 link.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
                 link.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
                 link.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
+                lwd_apply_ctrl_qos(link)
                 _, host, _ = split_zmq_path(endpoint)
                 if is_valid_ipv6_address(host):
                     link.setsockopt(zmq.IPV6, 1)

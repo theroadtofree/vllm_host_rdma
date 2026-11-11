@@ -1,222 +1,409 @@
 #!/usr/bin/env python3
-"""把一个完整的 HF safetensors checkpoint 按 LWD 角色(edge/cloud)切成两个子集。
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Split a complete HF safetensors checkpoint into per-role LWD directories.
 
-背景:边云 LWD 的每一侧只运行一部分模块(配套 model_load_update 分支里的
-``LwdConfig.skips_module`` + ``lwd_skips_module()``(模型侧不构建本角色永不执行的
-模块)与 ``lwd_weight_filter``(装载期丢弃占位模块的权重)),所以每侧的模型目录
-只需要放自己会用到的张量。但 HF 的分片是**按张量交错打包**的,不能"整片给某一
-侧",必须按张量名拆分。
+LWD runs one model in two cooperating processes (see
+``docs/design/lwd_migration_overview.md``): the edge keeps embeddings /
+lm_head / the vision tower and serves the multimodal front-end, the cloud
+owns the decoder layers, the final norm and the MTP weights. F1 already
+prunes the unowned modules at build and load time; this script additionally
+splits the checkpoint *on disk* so each side only ships its own weights.
 
-实现要点(为大体量 checkpoint 优化):
+Why tensor level: shards of a single checkpoint interleave tensor names, so
+file-level copy cannot produce clean role directories. The script streams
+each source shard once, writes new shards containing only the tensors the
+role owns, and rebuilds the index.
 
-* **零拷贝字节直写**:张量内容原样搬运,不做 dtype/device 转换,也不 materialize
-  torch 张量。只解析 safetensors 头部(纯标准库),重算新头部,再按字节区间拷贝数据
-  (同文件系统优先 ``os.copy_file_range``,否则大 buffer 读写)。
-* **多进程**:``--jobs N`` 按"输出分片"并行;父进程规划分片并汇总进度,worker 之间
-  没有共享状态。``--jobs 1`` 时完全不走多进程。
-* **索引名自动识别**:源目录的索引可能叫 ``quant_model_weights.safetensors.index.json``
-  之类的非标准名;没有索引时逐分片读头部建映射(不依赖 safetensors 包)。
-* **伴随 safetensors**:``rot.safetensors`` / ``optional/quarot.safetensors`` 这类
-  不是权重分片、但运行时会被**按路径直接读取**的文件(QuaRot/EAGLE3 旋转矩阵),按
-  角色规则拷给对应的一侧;并且只要目标目录里存在这种文件,**即使只有一个分片也一定
-  写索引** —— 否则 vLLM 会把它们当权重文件读入。
-* **源目录只读校验(默认开启)**:运行前后对 ``--src`` 下所有文件做 stat 快照比对,
-  一旦有任何变化立即报错退出。脚本从不写 ``--src``,也拒绝 ``--dst`` 等于/包含
-  ``--src``。
+Rules (mirror discipline, ``docs/design/lwd_weight_split.md``):
 
-用法(先 dry-run 看清单,再真拆)::
+* Keep/drop decisions derive from ``LWD_MODULE_OWNERSHIP`` in
+  ``vllm/model_executor/models/utils.py`` (F1) -- the same single source of
+  truth the load-time filter uses. On hosts without a vllm install the
+  script falls back to a vendored snapshot of the table;
+  ``tests/scripts/lwd/test_split_lwd_checkpoint.py`` asserts the two never
+  drift.
+* Native DeepSeek layout aliases (``layers.`` / ``embed.`` / ``head.`` /
+  ``norm.`` / ``mtp.`` without the leading ``model.``) are explicitly
+  registered per ownership row.
+* ``tid2eid`` (Hash MoE routing tables) is an edge-keep tensor-level
+  special case: it lives under the cloud-owned layers subtree, but
+  vllm-ascend reads it directly from the shard files by path, so the edge
+  slice must keep it even though the load-time filter would drop it.
+* ``hc_head_{fn,base,scale}`` (DeepSeek-V4's hyper-connection head) is a
+  both-roles-keep tensor-level special case: the three tensors are FLAT
+  parameters on the model (no dot boundary), so no ownership-table row --
+  whose matching is all on dot boundaries -- can cover them, and the
+  load-time filter never skips them either. Both roles construct the
+  parameters (there is no module to prune at build time), so both slices
+  keep them; only the cloud actually runs the kernel.
+* The source shard ``__metadata__`` (e.g. ``{"format": "pt"}``) is
+  preserved in the output shards, keeping the split directories loadable
+  by stock HF tooling and not only vLLM.
+* Non-weight files follow per-role metadata rules (fnmatch wildcards).
+  Directories are NOT copied by default -- only when a rule other than
+  ``*`` names one explicitly (e.g. QuaRot's ``optional/``), or with
+  ``--metadata all``.
+* Tensors matched by NO rule fail fast (exit code 3): classify them
+  explicitly via ``--keep-prefix`` / ``--keep-name-regex`` or extend
+  ``LWD_MODULE_OWNERSHIP``. Nothing is silently dropped.
 
-    # 只看规则会保留什么(不写文件)
-    python split_lwd_checkpoint.py --src /weight/GLM-5.2-w4a8c8 --role edge --dry-run
+Engineering discipline (same as the migrated original):
 
-    # 真正拆分(默认按 CPU 数小并行)
-    python split_lwd_checkpoint.py --src /weight/GLM-5.2-w4a8c8 \
-        --dst /weight/GLM-5.2-w4a8c8-cloud --role cloud --max-shard-gb 8 --jobs 8
+* Deterministic: all iteration is sorted; two runs over the same source
+  produce byte-identical output directories.
+* Atomic-ish: shards are written under ``-of-XXXXX`` temp names and renamed
+  to ``-of-YYYYY`` only after every write succeeded; the index is written
+  last, so a half-written output never looks complete.
+* Read-only guard: stat snapshot of ``--src`` before/after; any change
+  aborts with exit code 6.
+* Index trap: a single-shard output normally drops the index file, but a
+  copied companion safetensors (e.g. QuaRot ``rot.safetensors``) makes one
+  mandatory -- the index is always rebuilt whenever any tensor file was
+  written.
 
-规则(可用 --keep-prefix / --keep-name-regex 追加)。默认同时覆盖三种命名布局:
-VL 包装(model.language_model.*)、model.* 布局(Qwen3.5/GLM-5.x 等)、以及 DeepSeek
-原生布局(layers./norm./embed./head./hc_head/mtp.,无 model. 前缀)。
+Usage::
 
-  edge  : head.* / lm_head.* / model.head.*        (unembed:rank-replay)
-          + embed.* / embed_tokens.* / model.embed*.(embed:PP first rank)
-          + hc_head*(V4 顶层无条件创建的真参数,边侧也要)
-          + model.visual.*(多模态塔)
-          + 按名匹配 <*>.layers.<i>.mlp|ffn.gate.tid2eid
-            (DeepSeek-V4 的 Hash MoE 路由表:边侧不构建层,但会直接从
-             checkpoint 分片里读这些表,漏了会报 "Missing tid2eid tables")
-          (边侧只做 embed / unembed;transformer 层与 final norm 都不建)
-  cloud : layers.* / model.layers.* / model.language_model.*(全部层)
-          + norm.* + embed* + head.*/lm_head.* + hc_head*
-          + mtp.* / model.mtp.*(开启投机解码时;MTP 若表现为层号续接的额外层,
-            同样被 layers./model.layers. 覆盖)
-          (云侧不建视觉塔 visual)
+    # dry-run first: only print the keep/drop plan, write nothing
+    python scripts/lwd/split_lwd_checkpoint.py \\
+        --src /hf/Qwen3.5-8B --role edge --dry-run
 
-非权重条目按角色拷贝(--metadata auto,默认;规则支持 * 通配)。目录默认不拷,只有
-规则里显式点名(例如 "optional")或 --metadata all 才整目录拷贝。边侧对外服务,
-tokenizer/processor/chat_template 等文件全拷;云侧配套 vllm 的 LWD 改动(强制
-skip_tokenizer_init + mm_encoder_remote),只拷 config.json、configuration.json、
-量化描述(*quant*description*.json)与 chat_template.jinja;QuaRot 旋转矩阵
-(rot.safetensors / optional)两侧都拷。
+    # real split (defaults: shards <= 5 GiB, small process pool)
+    python scripts/lwd/split_lwd_checkpoint.py \\
+        --src /hf/Qwen3.5-8B --dst /hf/Qwen3.5-8B-edge \\
+        --role edge --max-shard-gb 8 --jobs 8
 
-输出:按 --max-shard-gb 切成若干 model-XXXXX-of-YYYYY.safetensors;多于一个分片、
-或目录里存在伴随 safetensors 时,写 model.safetensors.index.json。
-
-写盘期间显示进度(百分比/已写 GiB/速率/ETA + 已完成分片数):终端上原地刷新一行,
-重定向到日志文件时每 10 秒一行;用 --no-progress 关闭。进度只写 stderr,stdout
-仍然只有报告本身,方便 grep 与重定向。
+Exit codes: 0 success, 1 unexpected error (bug), 2 usage / unusable
+source, 3 rule coverage failure, 4 output verification failure, 5 write
+failure, 6 source changed during the split.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import multiprocessing as mp
 import os
-import re
 import shutil
 import struct
 import sys
 import time
-from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
-# vLLM 只认这个索引名(vllm/model_executor/model_loader/default_loader.py:
-# SAFE_WEIGHTS_INDEX_NAME);本地目录会用它过滤掉不在索引里的 *.safetensors。
+import regex as re
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 INDEX_NAME = "model.safetensors.index.json"
-# 源目录里的索引可能是任意前缀(例如 quant_model_weights.safetensors.index.json)。
 INDEX_SUFFIX = ".safetensors.index.json"
 
-# 每侧必须保留的 checkpoint 名前缀。默认同时覆盖三种常见命名布局:
-#   1) VL 包装布局      model.language_model.*      (Qwen3-VL / GLM-4.1V 等)
-#   2) model.* 布局     model.layers./norm./embed_tokens. (Qwen3.5 / GLM-5.x 等)
-#   3) DeepSeek 原生布局 layers./norm./embed./head./hc_head/mtp.
-#      (见 vllm 的 _make_deepseek_v4_weights_mapper:
-#       layers.->model.layers.、embed.->model.embed.、norm.->model.norm.、
-#       head.weight->lm_head.weight、hc_head->model.hc_head、mtp.->model.mtp.)
-ROLE_RULES: dict[str, tuple[str, ...]] = {
-    "edge": (
-        # --- 文本嵌入:边侧是 PP first rank,必须自己建 ---
-        "model.language_model.embed_tokens.",
-        "model.embed_tokens.",
-        "model.embed.",
-        "embed_tokens.",
-        "embed.",  # DeepSeek 原生:embed.weight -> embed_tokens.weight
-        # --- 输出头:边侧 rank-replay 还原 token,必须自己建 ---
-        "lm_head.",
-        "model.head.",
-        "head.",  # DeepSeek 原生:head.weight -> lm_head.weight
-        # --- DeepSeek-V4 顶层的 hc_head 参数:模型里**无条件**创建
-        # (vllm/models/deepseek_v4/*/model.py 与 vllm_ascend/models/deepseek_v4.py),
-        # 边侧也必须拿到,否则报缺权重 ---
-        "hc_head",
-        "model.hc_head",
-        # --- 视觉塔:多模态必须(边侧自己跑编码) ---
-        "model.visual.",
-        # 其它命名的塔(vision_tower / vision_model / mm_projector 等)用
-        # --keep-prefix 追加
-    ),
-    "cloud": (
-        # --- 全部 transformer 层 + 尾部 norm ---
-        "model.language_model.",  # VL 包装布局(含 embed/layers/norm)
-        "model.layers.",
-        "layers.",  # DeepSeek 原生布局
-        "model.norm.",
-        "norm.",
-        # --- 文本嵌入:decode 行需要本地嵌入 ---
-        "model.embed_tokens.",
-        "model.embed.",
-        "embed_tokens.",
-        "embed.",
-        # --- 采样头 + hc_head ---
-        "lm_head.",  # 云侧采样 + 算秩
-        "model.head.",
-        "head.",
-        "hc_head",
-        "model.hc_head",
-        # --- MTP(若开投机解码) ---
-        "mtp.",  # DeepSeek 原生布局
-        "model.mtp.",
-    ),
-}
-
-# DeepSeek-V4 的 Hash MoE 路由表。边侧虽然不构建任何层,但会直接从 checkpoint
-# 分片里读这些表(vllm-ascend 的 worker/lwd_edge_worker.py:load_model ->
-# worker/lwd_hash/lwd_hash_tables.py),因此必须随边侧一起保留,否则边侧启动会报
-# "Missing tid2eid tables for Hash MoE layers [...]"。
-# 云侧不需要该特例:它构建全部层,这些表就是普通参数,由 layers./model.layers. 覆盖。
-_TID2EID_PATTERN = re.compile(
-    r"^(?:model\.)?layers\.\d+\.(?:ffn|mlp)\.gate\.tid2eid(?:\.weight)?$"
+# Known non-weight safetensors companions: files the runtime reads by path
+# instead of through the index (QuaRot rotation matrices, loaded from the
+# quant description's rotation map when an EAGLE3 drafter is enabled).
+# With an index, any *.safetensors the weight_map does not reference is a
+# companion; without one these patterns are the fallback.
+COMPANION_SAFETENSORS = (
+    "rot.safetensors",
+    "*quarot*.safetensors",
+    "*rotation*.safetensors",
 )
 
-# 前缀规则表达不了的"按整个张量名匹配"的保留项。
-ROLE_NAME_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
-    "edge": (_TID2EID_PATTERN,),
-    "cloud": (),
-}
+# Never copied as metadata: docs / VCS noise are useless in a serving
+# directory, and the output index is rebuilt anyway.
+SKIP_FILE_EXACT = ("README.md", "LICENSE", ".gitattributes", "gitattributes")
 
-# 已知的"伴随 safetensors":不是模型权重分片,但运行时会被按路径直接读取。
-#   rot.safetensors / optional/quarot.safetensors —— QuaRot 旋转矩阵,由
-#   vllm-ascend 的 patch_draft_quarot.py 从 quant_model_description.json 的
-#   optional.quarot.rotation_map.global_rotation 取相对路径后 load_file() 读取
-#   (只在带 EAGLE3 drafter 时用到)。有索引时"不在索引里的 *.safetensors"会被自动
-#   识别为伴随文件;没有索引时用下面这些模式兜底。
-COMPANION_SAFETENSORS = ("rot.safetensors", "*quarot*.safetensors", "*rotation*.safetensors")
-
-SKIP_FILE_EXACT = {"README.md", "LICENSE", ".gitattributes", "gitattributes"}
+# Never copied as metadata: name prefixes.
 SKIP_FILE_PREFIX = (".git", "__pycache__", INDEX_NAME)
 
-# 每侧需要拷贝的非权重条目("auto" 策略),支持 * 通配(用 fnmatch 匹配);
-# 文件与"伴随 safetensors"按规则拷;**目录默认不拷**,只有规则里显式点名某个目录
-# (例如 "optional")时才整目录递归拷贝,或者用 --metadata all 全拷。
+# Non-weight entries per role (fnmatch patterns):
+#   * edge is the serving front-end: copy every file, plus the ``optional``
+#     directory (QuaRot) which the "*" rule deliberately does not cover;
+#   * cloud is a pure decoding engine: only the config (the model graph
+#     needs it), the tokenizer family (hard prerequisite for the structured
+#     output migration, F3 -- grammar compilation lives on the cloud side
+#     and needs the vocab files) and checkpoint companions. Multi-modal
+#     processor files are deliberately NOT shipped to the cloud: the cloud
+#     never sees raw multi-modal inputs.
+# Directories are copied only when a rule other than "*" names them, so
+# "optional" is listed explicitly for both roles.
 METADATA_RULES: dict[str, tuple[str, ...]] = {
-    # 边侧对外服务:文件全拷;目录默认不拷,所以 QuaRot 的 optional/ 需要显式点名。
     "edge": ("*", "optional"),
     "cloud": (
         "config.json",
         "configuration.json",
         "*quant*description*.json",
-        # 仅为兼容启动脚本里 "--chat-template <模型目录>/chat_template.jinja" 的写法;
-        # 云侧不渲染模板(请求都在边侧),启动命令里没传 --chat-template 时可以去掉。
-        "chat_template.jinja",
-        # QuaRot 旋转矩阵(EAGLE3 drafter 用;drafter 在云侧)。
+        "chat_template*",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "vocab.json",
+        "merges.txt",
+        "vocab.*",
+        "tokenizer.model",
         "rot.safetensors",
         "optional",
     ),
 }
 
-COPY_CHUNK = 8 * 2**20  # 兜底拷贝的 buffer
-PROGRESS_STEP = 32 * 2**20  # worker 每搬这么多字节汇报一次进度
+ROLES = ("cloud", "edge")
+
+# I/O tuning: fallback copy chunk (8 MiB) and the per-worker progress
+# report granularity (32 MiB).
+COPY_CHUNK = 8 * 1024 * 1024
+PROGRESS_STEP = 32 * 1024 * 1024
+PROGRESS_INTERVAL = 0.2
+
+# ---------------------------------------------------------------------------
+# Role rules: ownership table + aliases + tensor-level special cases
+# ---------------------------------------------------------------------------
+
+# Vendored snapshot of vllm.model_executor.models.utils.LWD_MODULE_OWNERSHIP
+# for hosts without a vllm install (this script is stdlib-only).
+# tests/scripts/lwd/test_split_lwd_checkpoint.py asserts the snapshot equals
+# the live table -- update both together, never let them drift silently.
+_VENDORED_MODULE_OWNERSHIP: dict[str, frozenset[str]] = {
+    "model.embed_tokens": frozenset({"edge", "cloud"}),
+    "lm_head": frozenset({"edge", "cloud"}),
+    "model.layers": frozenset({"cloud"}),
+    "model.norm": frozenset({"cloud"}),
+    "visual": frozenset({"edge"}),
+    "model.mtp": frozenset({"cloud"}),
+}
+
+# Tensor-level special cases per role: explicitly registered keeps that
+# cannot be expressed as ownership-table rows.
+# DeepSeek-V4 Hash MoE routing tables: the edge builds no layers, but
+# vllm-ascend reads these tensors straight from the shard files by path
+# (vllm_ascend/worker/lwd_hash/lwd_hash_tables.py), so the edge slice must
+# keep them even though the load-time filter would drop them.
+_EDGE_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:model\.)?layers\.\d+\.(?:ffn|mlp)\.gate\.tid2eid(?:\.weight)?$"),
+)
+
+# Tensor-level special case for BOTH roles: DeepSeek-V4's hyper-connection
+# head collapses the hc multi-stream residual at the top of the trunk
+# forward, right before the final norm. Its three tensors are FLAT
+# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary),
+# so no ownership-table row can express them and the load-time filter never
+# skips them. Both roles construct the parameters (there is no module to
+# prune at build time), so both slices keep them; only the cloud runs the
+# kernel.
+_BOTH_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^(?:model\.)?hc_head_(?:fn|base|scale)(?:\.weight)?$"),
+)
+
+# Checkpoint-layout aliases for ownership rows: tensor-name prefixes that
+# denote the same module in other naming layouts (native DeepSeek
+# checkpoints drop the leading ``model.`` and rename embed/head, cf. the
+# weights mapper in vllm/model_executor/models/utils.py). The matcher below
+# already covers the canonical layouts (flat ``model.*``, VL
+# ``model.language_model.*`` nesting, bare last components); these aliases
+# extend coverage so native names do not land in the fail-fast bucket.
+_ROW_PREFIX_ALIASES: dict[str, tuple[str, ...]] = {
+    "model.embed_tokens": ("embed_tokens.", "embed.", "model.embed."),
+    "lm_head": ("lm_head.", "head.", "model.head."),
+    "model.layers": ("layers.",),
+    "model.norm": ("norm.",),
+    "model.mtp": ("mtp.",),
+}
+
+
+def load_module_ownership() -> tuple[dict[str, frozenset[str]], bool]:
+    """Return the module ownership table.
+
+    Prefers the live ``vllm.model_executor.models.utils.LWD_MODULE_OWNERSHIP``
+    (single source of truth, F1) and falls back to the vendored snapshot on
+    hosts where vllm is not importable.
+
+    Returns:
+        (table, live_import) -- ``live_import`` is True when the table was
+        imported from the vllm package.
+    """
+    try:
+        from vllm.model_executor.models.utils import LWD_MODULE_OWNERSHIP
+    except ImportError:
+        return dict(_VENDORED_MODULE_OWNERSHIP), False
+    return {str(k): frozenset(v) for k, v in LWD_MODULE_OWNERSHIP.items()}, True
+
+
+def _matches_module_suffix(name: str, key: str) -> bool:
+    """True when a module prefix of ``name`` equals or ends with ``key``.
+
+    Mirrors the load-time filter (``lwd_weight_filter``): matches the module
+    subtree of a pruned tree anywhere in the name, e.g. key ``visual`` owns
+    ``model.visual.merger.ln_q.weight`` and key ``model.norm`` owns
+    ``model.language_model.model.norm.weight`` (after VL unwrap).
+    """
+    parts = name.split(".")
+    for i in range(1, len(parts)):
+        path = ".".join(parts[:i])
+        if path == key or path.endswith("." + key):
+            return True
+    return False
+
+
+def _unwrap_vl_text_prefix(name: str) -> str:
+    """Strip the VL text-model nesting: ``model.language_model.X`` -> ``model.X``."""
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model.") :]
+    return name
+
+
+def _tensor_matches_module(name: str, key: str) -> bool:
+    """Mirror of the load-time filter's per-key match (dot-boundary suffix)."""
+    name = _unwrap_vl_text_prefix(name)
+    bare = key.rsplit(".", 1)[-1]
+    return (
+        name == key
+        or name.startswith(key + ".")
+        or _matches_module_suffix(name, key)
+        or name.startswith(bare + ".")
+    )
+
+
+def matched_ownership_rows(name: str, table: Mapping[str, frozenset[str]]) -> set[str]:
+    """Ownership rows that own this tensor name (canonical match + aliases)."""
+    rows = {key for key in table if _tensor_matches_module(name, key)}
+    rows |= {
+        row
+        for row, aliases in _ROW_PREFIX_ALIASES.items()
+        if row in table and any(name.startswith(alias) for alias in aliases)
+    }
+    return rows
+
+
+def classify_all(
+    weight_map: Mapping[str, str],
+    role: str,
+    table: Mapping[str, frozenset[str]],
+    cli_prefixes: Iterable[str] = (),
+    cli_patterns: Iterable[re.Pattern[str]] = (),
+) -> tuple[set[str], set[str], list[str], dict[str, list[str]]]:
+    """Classify every checkpoint tensor for one role.
+
+    Decision order (first match wins for attribution): CLI overrides ->
+    tensor-level special cases -> ownership table. A role keeps a table
+    tensor only when it owns EVERY row the name matches, mirroring
+    ``lwd_should_skip_weight`` in the load-time filter.
+
+    Returns:
+        (keep, drop, uncovered, attribution): ``uncovered`` lists tensors
+        matched by no rule at all (the caller must fail fast on them);
+        ``attribution`` maps a rule label to its tensor names.
+    """
+    keep: set[str] = set()
+    drop: set[str] = set()
+    uncovered: list[str] = []
+    attribution: dict[str, list[str]] = {}
+    cli_prefixes = tuple(cli_prefixes)
+    cli_patterns = tuple(cli_patterns)
+
+    def _attribute(label: str, name: str) -> None:
+        attribution.setdefault(label, []).append(name)
+
+    for name in sorted(weight_map):
+        matched_prefix = next(
+            (prefix for prefix in cli_prefixes if name.startswith(prefix)), None
+        )
+        if matched_prefix is not None:
+            keep.add(name)
+            _attribute(f"cli-prefix:{matched_prefix}", name)
+            continue
+        matched_regex = next((p for p in cli_patterns if p.match(name)), None)
+        if matched_regex is not None:
+            keep.add(name)
+            _attribute(f"cli-regex:{matched_regex.pattern}", name)
+            continue
+        # Tensor-level special case for BOTH roles: DeepSeek-V4's flat
+        # hyper-connection head parameters (no dot boundary -- no ownership
+        # row can match them; the load-time filter keeps them for both
+        # roles too).
+        if any(p.match(_unwrap_vl_text_prefix(name)) for p in _BOTH_KEEP_PATTERNS):
+            keep.add(name)
+            _attribute("special:hc_head", name)
+            continue
+        if role == "edge" and any(p.match(name) for p in _EDGE_KEEP_PATTERNS):
+            keep.add(name)
+            _attribute("special:tid2eid", name)
+            continue
+        rows = matched_ownership_rows(name, table)
+        if not rows:
+            uncovered.append(name)
+            continue
+        label = f"table:{sorted(rows)[0]}"
+        if all(role in table[row] for row in rows):
+            keep.add(name)
+        else:
+            drop.add(name)
+        _attribute(label, name)
+    return keep, drop, uncovered, attribution
+
+
+# ---------------------------------------------------------------------------
+# Error types: expected failures map to process exit codes (see docstring)
+# ---------------------------------------------------------------------------
+
+
+class LwdSplitError(Exception):
+    """Expected split failure; ``exit_code`` is the process exit code."""
+
+    exit_code = 1
+
+
+class SourceError(LwdSplitError):
+    exit_code = 2
+
+
+class RuleCoverageError(LwdSplitError):
+    exit_code = 3
+
+
+class OutputVerifyError(LwdSplitError):
+    exit_code = 4
+
+
+class WriteError(LwdSplitError):
+    exit_code = 5
+
+
+class SourceModifiedError(LwdSplitError):
+    exit_code = 6
+
+
+# ---------------------------------------------------------------------------
+# safetensors header parsing (stdlib only, never reads the payload)
+# ---------------------------------------------------------------------------
 
 
 class TensorInfo:
-    """safetensors 头部里一个张量的元信息(offsets 相对数据区起点)。"""
-
     __slots__ = ("dtype", "shape", "start", "end")
 
-    def __init__(self, dtype: str, shape, start: int, end: int) -> None:
+    def __init__(self, dtype: str, shape: list[int], start: int, end: int) -> None:
         self.dtype = dtype
-        self.shape = list(shape)
+        self.shape = shape
         self.start = start
         self.end = end
 
-    @property
-    def nbytes(self) -> int:
-        return self.end - self.start
-
 
 def read_shard_header(path: str) -> tuple[dict[str, TensorInfo], dict | None, int]:
-    """解析 safetensors 头部(纯标准库,不读权重数据)。
+    """Parse a safetensors header without reading the payload.
 
-    布局:``[8 字节小端 u64: 头长度 N][N 字节 JSON 头][数据区]``。
+    Layout: ``[u64 LE: header length N][N bytes JSON header][data area]``.
 
     Returns:
-        (张量名 -> TensorInfo, ``__metadata__`` 或 None, 数据区起始的绝对偏移)
+        (tensor name -> TensorInfo, ``__metadata__`` or None, absolute
+        offset where the data area starts)
     """
     with open(path, "rb") as handle:
         raw = handle.read(8)
         if len(raw) != 8:
-            raise ValueError(f"{path}: 不是合法的 safetensors(文件太短)")
+            raise SourceError(f"{path}: not a valid safetensors file (too short)")
         (header_len,) = struct.unpack("<Q", raw)
         header = json.loads(handle.read(header_len))
     tensors: dict[str, TensorInfo] = {}
@@ -229,57 +416,94 @@ def read_shard_header(path: str) -> tuple[dict[str, TensorInfo], dict | None, in
     return tensors, metadata, 8 + header_len
 
 
-def parse_args() -> argparse.Namespace:
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--src", required=True, help="完整模型目录(含 *.safetensors)")
-    parser.add_argument("--dst", help="输出目录(与 --src 不同;--dry-run 时可省略)")
-    parser.add_argument("--role", required=True, choices=sorted(ROLE_RULES))
+    parser.add_argument(
+        "--src", required=True, help="complete model directory (with *.safetensors)"
+    )
+    parser.add_argument(
+        "--dst",
+        help="output directory (must differ from --src; optional with --dry-run)",
+    )
+    parser.add_argument(
+        "--role", required=True, choices=ROLES, help="which LWD role to slice for"
+    )
     parser.add_argument(
         "--max-shard-gb",
         type=float,
         default=5.0,
-        help="输出分片上限(默认 5GB;越大分片越少、索引越小)",
+        help="output shard size cap in GiB (default 5; larger = fewer shards)",
     )
-    parser.add_argument("--keep-prefix", action="append", default=[], help="追加保留前缀(可重复)")
+    parser.add_argument(
+        "--keep-prefix",
+        action="append",
+        default=[],
+        help="extra keep prefix, explicit operator classification (repeatable)",
+    )
     parser.add_argument(
         "--keep-name-regex",
         action="append",
         default=[],
-        help="追加按张量名匹配的正则(可重复;前缀规则表达不了时用,如仅保留某些层内参数)",
+        help=(
+            "extra keep regex on the tensor name (repeatable; "
+            "for cases prefixes cannot express)"
+        ),
     )
     parser.add_argument(
         "--metadata",
         choices=("auto", "all"),
         default="auto",
-        help="非权重条目策略:auto=按角色;all=全拷(含目录;云侧仍跑未打补丁的 vllm 时用)",
+        help=(
+            "non-weight entries: auto=per-role rules; "
+            "all=copy everything (cloud with unpatched vllm)"
+        ),
     )
     parser.add_argument(
         "--jobs",
         type=int,
         default=0,
-        help="写分片的并行进程数;0=自动(min(4, CPU 数)),1=单进程(便于排查)",
+        help=(
+            "writer processes; 0=auto (min(4, cpus)), "
+            "1=single process (easier debugging)"
+        ),
     )
     parser.add_argument(
         "--no-verify-src-readonly",
         action="store_true",
-        help="关闭运行前后对 --src 的只读快照校验(默认开启)",
+        help=(
+            "disable the before/after read-only snapshot check of --src (on by default)"
+        ),
     )
     parser.add_argument(
         "--no-progress",
         action="store_true",
-        help="关闭写盘进度显示(默认:终端原地刷新一行;重定向到文件时每 10 秒输出一行)",
+        help=(
+            "disable write progress "
+            "(default: in-place line on ttys, throttled otherwise)"
+        ),
     )
-    parser.add_argument("--dry-run", action="store_true", help="只打印将保留/丢弃的清单,不写文件")
-    return parser.parse_args()
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="only print the keep/drop plan, write nothing",
+    )
+    return parser.parse_args(argv)
 
 
 # ---------------------------------------------------------------------------
-# 源目录盘点
+# Source inventory
 # ---------------------------------------------------------------------------
+
+
 def find_index_file(src: str) -> str | None:
-    """找源目录里的索引文件(名字可能是 quant_model_weights.safetensors.index.json 等)。"""
+    """Find the index file (may be named quant_model_weights.safetensors.index.json)."""
     if os.path.isfile(os.path.join(src, INDEX_NAME)):
         return INDEX_NAME
     candidates = sorted(
@@ -295,10 +519,10 @@ def list_safetensors(src: str) -> list[str]:
 
 
 def load_weight_map(src: str) -> tuple[dict[str, str], str | None]:
-    """返回 (张量名 -> 分片文件名, 索引文件名或 None)。
+    """Return (tensor name -> shard file name, index file name or None).
 
-    有索引(任意 ``*.safetensors.index.json``)时直接用;没有索引时逐分片读头部枚举,
-    不依赖 safetensors 包。
+    Uses any ``*.safetensors.index.json`` when present; otherwise enumerates
+    shard headers one by one (no safetensors package needed).
     """
     index_name = find_index_file(src)
     if index_name is not None:
@@ -306,6 +530,11 @@ def load_weight_map(src: str) -> tuple[dict[str, str], str | None]:
             return json.load(handle)["weight_map"], index_name
     weight_map: dict[str, str] = {}
     for name in list_safetensors(src):
+        # Companions are read by path at runtime, never through the weight
+        # map; skipping them here keeps the fallback identical to the
+        # indexed path (whose weight_map also excludes companion tensors).
+        if any(fnmatch.fnmatch(name, pat) for pat in COMPANION_SAFETENSORS):
+            continue
         tensors, _, _ = read_shard_header(os.path.join(src, name))
         for key in tensors:
             weight_map[key] = name
@@ -315,701 +544,698 @@ def load_weight_map(src: str) -> tuple[dict[str, str], str | None]:
 def classify_safetensors(
     src: str, weight_map: dict[str, str], index_name: str | None
 ) -> tuple[set[str], list[str]]:
-    """把 ``*.safetensors`` 分成"权重分片"与"伴随文件"。
+    """Split ``*.safetensors`` into weight shards and companion files.
 
     Returns:
-        (权重分片文件名集合, 伴随 safetensors 文件名列表)
+        (weight shard file names, companion safetensors file names)
     """
     files = list_safetensors(src)
     if index_name is not None:
         weights = set(weight_map.values())
         return weights, [name for name in files if name not in weights]
-    # 没有索引:用已知模式兜底,避免把 rot.safetensors 当权重分片
+    # No index: fall back to the known companion patterns so rotation
+    # matrices are never treated as weight shards.
     companions = [
         name
         for name in files
-        if any(fnmatch.fnmatch(name, pattern) for pattern in COMPANION_SAFETENSORS)
+        if any(fnmatch.fnmatch(name, pat) for pat in COMPANION_SAFETENSORS)
     ]
-    return {name for name in files if name not in companions}, companions
+    weights = [name for name in files if name not in companions]
+    return set(weights), companions
 
 
-def select_keys(
-    weight_map: dict[str, str],
-    prefixes: tuple[str, ...],
-    patterns: tuple[tuple[str, "re.Pattern[str]"], ...] = (),
-) -> tuple[dict[str, list[str]], int]:
-    """归组要保留的张量;返回 {规则标签: [张量名]} 与命中总数。
-
-    先按前缀匹配,未命中的再用正则按整个张量名匹配(用于 DeepSeek-V4 的 Hash MoE
-    路由表这类"藏在 layers.<i> 之下但边侧必须保留"的参数)。
-    """
-    grouped: dict[str, list[str]] = defaultdict(list)
-    matched = 0
-    for key in weight_map:
-        for prefix in prefixes:
-            if key.startswith(prefix):
-                grouped[prefix].append(key)
-                matched += 1
-                break
-        else:
-            for label, pattern in patterns:
-                if pattern.match(key):
-                    grouped[label].append(key)
-                    matched += 1
-                    break
-    return grouped, matched
+# ---------------------------------------------------------------------------
+# Shard planning
+# ---------------------------------------------------------------------------
 
 
 def collect_tensor_info(
-    src: str, weight_files: set[str], keep: set[str], weight_map: dict[str, str]
-) -> tuple[dict[str, tuple[str, TensorInfo]], dict | None, dict[str, int]]:
-    """读需要的源分片头部。
+    src: str, keep: set[str], weight_files: set[str]
+) -> tuple[dict[str, TensorInfo], dict | None, int]:
+    """Read headers of source shards and collect info for kept tensors.
 
     Returns:
-        ({张量名: (分片, TensorInfo)}, 首个分片的 __metadata__, {分片: 数据区起始绝对偏移})
-
-    注意:TensorInfo 里的 offsets 是相对**该分片数据区**的,搬运时要加上数据区起点;
-    这里把每个分片的数据区起点一并返回,交给 plan_shards() 换算成绝对偏移。
+        (name -> TensorInfo, first shard's ``__metadata__`` or None, payload
+        bytes the output must write)
     """
-    wanted_per_shard: dict[str, list[str]] = defaultdict(list)
-    # 排序保证结果可复现:keep 是 set,遍历顺序受 PYTHONHASHSEED 影响,
-    # 不排序会导致同样的输入两次运行出现不同的分片打包(边界/顺序漂移)。
-    for key in sorted(keep):
-        wanted_per_shard[weight_map[key]].append(key)
-
-    info: dict[str, tuple[str, TensorInfo]] = {}
+    info: dict[str, TensorInfo] = {}
     metadata: dict | None = None
-    data_start: dict[str, int] = {}
-    for shard in sorted(wanted_per_shard):
-        if shard not in weight_files:
-            raise ValueError(f"张量所属分片不在索引里: {shard}")
-        tensors, shard_meta, shard_data_start = read_shard_header(os.path.join(src, shard))
-        data_start[shard] = shard_data_start
-        if metadata is None:
-            metadata = shard_meta
-        missing = [key for key in wanted_per_shard[shard] if key not in tensors]
-        if missing:
-            raise ValueError(f"{shard} 里找不到 {len(missing)} 个张量,例如 {missing[:3]}")
-        for key in wanted_per_shard[shard]:
-            info[key] = (shard, tensors[key])
-    return info, metadata, data_start
+    total = 0
+    for shard in sorted(weight_files):
+        tensors, shard_metadata, base = read_shard_header(os.path.join(src, shard))
+        if shard_metadata is not None and metadata is None:
+            metadata = shard_metadata
+        for name, tensor in tensors.items():
+            if name in keep:
+                if name in info:
+                    raise SourceError(f"tensor {name!r} appears in multiple shards")
+                # TensorInfo from the parser holds offsets relative to the
+                # data area; make them absolute for the copy step.
+                info[name] = TensorInfo(
+                    tensor.dtype, tensor.shape, base + tensor.start, base + tensor.end
+                )
+                total += tensor.end - tensor.start
+    missing = sorted(keep - set(info))
+    if missing:
+        suffix = "..." if len(missing) > 5 else ""
+        raise SourceError(f"tensors missing from shards: {missing[:5]}{suffix}")
+    return info, metadata, total
 
 
-def gib(num_bytes: int) -> float:
-    """字节 -> GiB。"""
-    return num_bytes / 2**30
-
-
-def fmt_duration(seconds: float) -> str:
-    """秒 -> "m:ss" / "h:mm:ss"。"""
-    seconds = max(int(seconds), 0)
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
-class Progress:
-    """写盘进度显示(百分比 + 已写体积 + 速率 + ETA)。
-
-    模式:
-      bar   -- 终端:回车原地刷新一行(在 tty 上默认用它)
-      lines -- 非 tty(重定向/日志):每 interval 秒输出一行,避免把日志刷满
-      off   -- 不输出
-
-    进度只写 stderr,stdout 依旧只有报告,方便 grep / 重定向。
-    """
-
-    def __init__(
-        self,
-        total_bytes: int,
-        label: str,
-        mode: str = "auto",
-        stream=None,
-        interval: float | None = None,
-    ) -> None:
-        self.stream = stream if stream is not None else sys.stderr
-        if mode == "auto":
-            is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
-            mode = "bar" if is_tty else "lines"
-        self.mode = mode
-        self.total = max(int(total_bytes), 1)
-        self.label = label
-        self.interval = interval if interval is not None else (0.3 if mode == "bar" else 10.0)
-        self.start = time.monotonic()
-        self.last_update = 0.0
-        self.done = 0
-        self.extra = ""
-        self.printed = False
-
-    def update(self, delta_bytes: int, **extra: object) -> None:
-        self.done += max(int(delta_bytes), 0)
-        if extra:
-            self.extra = " ".join(f"{key}={value}" for key, value in extra.items())
-        if self.mode == "off":
-            return
-        now = time.monotonic()
-        finished = self.done >= self.total
-        if not finished and now - self.last_update < self.interval:
-            return
-        self.last_update = now
-        elapsed = max(now - self.start, 1e-6)
-        ratio = min(self.done / self.total, 1.0)
-        speed = self.done / elapsed
-        eta = (self.total - self.done) / speed if speed > 0 else 0.0
-        text = (
-            f"{self.label} {ratio * 100:5.1f}% "
-            f"({gib(self.done):.1f}/{gib(self.total):.1f} GiB, "
-            f"{gib(speed):.2f} GiB/s, ETA {fmt_duration(eta)})"
-        )
-        if self.extra:
-            text += f" {self.extra}"
-        if self.mode == "bar":
-            print(f"\r{text}", end="\n" if finished else "", file=self.stream, flush=True)
-        else:
-            print(text, file=self.stream, flush=True)
-        self.printed = True
-
-    def close(self) -> None:
-        """收尾(bar 模式下补一个换行,免得后续输出接在同一行)。"""
-        if self.mode == "bar" and self.printed and self.done < self.total:
-            print(file=self.stream, flush=True)
-        self.printed = False
-
-
-# ---------------------------------------------------------------------------
-# 规划与写盘
-# ---------------------------------------------------------------------------
 def plan_shards(
-    info: dict[str, tuple[str, TensorInfo]],
-    data_start: dict[str, int],
-    max_shard_bytes: int,
-) -> list[dict]:
-    """把要保留的张量按源分片顺序打包成若干输出分片。
+    info: Mapping[str, TensorInfo], max_bytes: int
+) -> list[tuple[str, list[str]]]:
+    """Pack kept tensors into output shards of at most ``max_bytes``.
 
-    同一个源分片内的张量按头部顺序取,相邻区间在写盘时可以合并成连续拷贝。
-    entry = (张量名, 源分片, dtype, shape, **源文件绝对偏移**, 字节数)。
+    Deterministic: input is iterated in sorted order, so two runs over the
+    same source produce identical shard contents. Oversized single tensors
+    land in a shard of their own.
+
+    Returns:
+        list of (temp shard name, tensor names)
     """
-    entries_by_shard: dict[str, list[str]] = defaultdict(list)
-    order: dict[str, int] = {}
-    for key, (shard, _) in info.items():
-        if shard not in order:
-            order[shard] = len(order)
-        entries_by_shard[shard].append(key)
-
-    shards: list[dict] = []
-    current: list[tuple] = []
-    current_bytes = 0
-    for shard in sorted(entries_by_shard, key=lambda name: order[name]):
-        base = data_start[shard]
-        for key in entries_by_shard[shard]:
-            _, tensor = info[key]
-            if current and current_bytes + tensor.nbytes > max_shard_bytes:
-                shards.append({"entries": current})
-                current, current_bytes = [], 0
-            # 纯 tuple(不用自定义类),便于跨平台 pickle 给 worker 进程
-            current.append(
-                (key, shard, tensor.dtype, list(tensor.shape), base + tensor.start, tensor.nbytes)
-            )
-            current_bytes += tensor.nbytes
-    if current:
-        shards.append({"entries": current})
-    return shards
+    wanted: dict[str, list[str]] = {}
+    cur_name = "model-00001-of-XXXXX.safetensors"
+    cur_size = 0
+    count = 1
+    for name in sorted(info):
+        size = info[name].end - info[name].start
+        if cur_size > 0 and cur_size + size > max_bytes:
+            count += 1
+            cur_name = f"model-{count:05d}-of-XXXXX.safetensors"
+            cur_size = 0
+        wanted.setdefault(cur_name, []).append(name)
+        cur_size += size
+    return [(name, wanted[name]) for name in sorted(wanted)]
 
 
-def _write_all(fd: int, data: bytes, at: int) -> None:
-    """从绝对偏移 at 起写完整段数据(os.write 可能部分写)。"""
-    os.lseek(fd, at, os.SEEK_SET)
-    view = memoryview(data)
-    written = 0
-    while written < len(view):
-        written += os.write(fd, view[written:])
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
 
 
-def _copy_range(src_fd: int, dst_fd: int, count: int, src_off: int, dst_off: int) -> None:
-    """把源 fd 的 [src_off, src_off+count) 拷到目标 fd 的 dst_off。
+def _write_all(fd: int, data: memoryview, offset: int) -> None:
+    view = data
+    while view:
+        written = os.pwrite(fd, view, offset)
+        if not written:
+            raise WriteError(f"short write at offset {offset}")
+        offset += written
+        view = view[written:]
 
-    优先 ``os.copy_file_range``(同文件系统近似零拷贝);跨文件系统等场景退化为
-    大 buffer 读写。两条路径都用显式偏移,不依赖 fd 的文件位置。
+
+def _copy_range(src_fd: int, dst_fd: int, start: int, end: int, offset: int) -> None:
+    """Copy ``[start, end)`` of ``src_fd`` to ``offset`` in ``dst_fd``.
+
+    Tries zero-copy ``copy_file_range`` first (requires file descriptors),
+    falls back to chunked ``pread`` when the kernel refuses (e.g. older
+    kernels, cross-filesystem).
     """
-    remaining = count
-    src_pos, dst_pos = src_off, dst_off
-    if hasattr(os, "copy_file_range"):
+    copied = 0
+    while copied < end - start:
         try:
-            while remaining > 0:
-                copied = os.copy_file_range(src_fd, dst_fd, remaining, src_pos, dst_pos)
-                if copied <= 0:
-                    break
-                remaining -= copied
-                src_pos += copied
-                dst_pos += copied
-            if remaining == 0:
-                return
+            n = os.copy_file_range(
+                src_fd,
+                dst_fd,
+                count=min(COPY_CHUNK, end - start - copied),
+                offset_src=start + copied,
+                offset_dst=offset + copied,
+            )
+            if not n:
+                raise WriteError(f"fd {src_fd}: unexpected EOF at {start + copied}")
         except OSError:
-            pass  # 跨文件系统等场景:回退到普通读写
-    # 兜底路径用 lseek + read/write(Windows 上没有 preadv/pwritev)
-    buf = bytearray(min(COPY_CHUNK, max(count, 1)))
-    view = memoryview(buf)
-    remaining = count
-    while remaining > 0:
-        want = min(remaining, len(buf))
-        os.lseek(src_fd, src_pos, os.SEEK_SET)
-        got = os.read(src_fd, want)
-        if not got:
-            raise OSError("源文件提前结束(文件被截断?)")
-        _write_all(dst_fd, bytes(got), dst_pos)
-        src_pos += len(got)
-        dst_pos += len(got)
-        remaining -= len(got)
+            remaining = min(COPY_CHUNK, end - start - copied)
+            chunk = os.pread(src_fd, remaining, start + copied)
+            if not chunk:
+                raise WriteError(
+                    f"fd {src_fd}: unexpected EOF at {start + copied}"
+                ) from None
+            _write_all(dst_fd, memoryview(chunk), offset + copied)
+            n = len(chunk)
+        copied += n
 
 
-def write_one_shard(job: dict) -> tuple[str, int, int]:
-    """worker:写一个输出分片(临时名),返回 (临时名, 含头的字节数, 张量数)。"""
-    entries: list[tuple] = job["entries"]
-    src_dir: str = job["src_dir"]
-    temp_path: str = job["temp_path"]
+def write_one_shard(
+    shard: tuple[str, list[str]],
+    src: str,
+    dst: str,
+    info: Mapping[str, TensorInfo],
+    weight_map: Mapping[str, str],
+    queue: object | None = None,
+    metadata: Mapping[str, str] | None = None,
+) -> None:
+    """Write one output shard: JSON header + payload copied from source shards.
 
-    # 1) 重算头部(数据区偏移从 0 开始)
-    header: dict[str, dict] = {}
-    layout: list[tuple[str, int, int, int]] = []  # (源分片, 源偏移, 长度, 目标偏移)
+    The source ``__metadata__`` (e.g. ``{"format": "pt"}``) is preserved so
+    the output stays loadable by stock HF tooling. With ``queue`` (a
+    multiprocessing manager queue) the bytes written are pushed at least
+    every ``PROGRESS_STEP`` bytes for progress reporting.
+    """
+    name, wanted = shard
+    header: dict[str, dict[str, object]] = {}
     offset = 0
-    for key, shard, dtype, shape, start, nbytes in entries:
-        header[key] = {
-            "dtype": dtype,
-            "shape": shape,
-            "data_offsets": [offset, offset + nbytes],
+    for tensor in wanted:
+        size = info[tensor].end - info[tensor].start
+        header[tensor] = {
+            "dtype": info[tensor].dtype,
+            "shape": info[tensor].shape,
+            "data_offsets": [offset, offset + size],
         }
-        layout.append((shard, start, nbytes, offset))
-        offset += nbytes
-    if job.get("metadata"):
-        header["__metadata__"] = job["metadata"]
-    raw = json.dumps(header, separators=(",", ":")).encode()
-    raw += b" " * ((-len(raw)) % 8)  # 数据区必须 8 字节对齐
-    data_offset = 8 + len(raw)
-
-    # 2) 写头 + 按区间拷数据(相邻区间连续,天然合并)
-    dst_fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    src_fd = -1
-    current_src = None
-    queue = job.get("queue")
-    pending_report = 0
-    try:
-        _write_all(dst_fd, struct.pack("<Q", len(raw)) + raw, 0)
-        for shard, src_off, length, dst_off in layout:
-            if shard != current_src:
-                if src_fd >= 0:
-                    os.close(src_fd)
-                # 只读打开:源目录绝不被写入
-                src_fd = os.open(os.path.join(src_dir, shard), os.O_RDONLY)
-                current_src = shard
-            _copy_range(src_fd, dst_fd, length, src_off, data_offset + dst_off)
-            pending_report += length
-            if queue is not None and pending_report >= PROGRESS_STEP:
-                queue.put(pending_report)
-                pending_report = 0
-    except BaseException:
-        if src_fd >= 0:
-            os.close(src_fd)
-        os.close(dst_fd)
-        if os.path.isfile(temp_path):
-            os.remove(temp_path)  # 半成品必须删掉,名字还带 -of-XXXXX
-        raise
-    if src_fd >= 0:
-        os.close(src_fd)
-    os.close(dst_fd)
-    if queue is not None and pending_report:
-        queue.put(pending_report)
-    return os.path.basename(temp_path), data_offset + offset, len(entries)
+        offset += size
+    if metadata:
+        header["__metadata__"] = dict(metadata)
+    body = json.dumps(header, separators=(",", ":")).encode()
+    body += b" " * ((-len(body)) % 8)
+    raw = struct.pack("<Q", len(body)) + body
+    with open(os.path.join(dst, name), "wb") as handle:
+        _write_all(handle.fileno(), memoryview(raw), 0)
+        pos = len(raw)
+        pending = 0
+        src_fds: dict[str, int] = {}
+        try:
+            for tensor in wanted:
+                tensor_info = info[tensor]
+                source_shard = weight_map[tensor]
+                if source_shard not in src_fds:
+                    src_fds[source_shard] = os.open(
+                        os.path.join(src, source_shard), os.O_RDONLY
+                    )
+                _copy_range(
+                    src_fds[source_shard],
+                    handle.fileno(),
+                    tensor_info.start,
+                    tensor_info.end,
+                    pos,
+                )
+                size = tensor_info.end - tensor_info.start
+                pos += size
+                pending += size
+                if queue is not None and pending >= PROGRESS_STEP:
+                    queue.put(pending)
+                    pending = 0
+            os.fsync(handle.fileno())
+        finally:
+            for fd in src_fds.values():
+                os.close(fd)
+    if queue is not None and pending:
+        queue.put(pending)
 
 
 def write_slices(
     src: str,
     dst: str,
-    shards: list[dict],
-    metadata: dict | None,
+    entries: list[tuple[str, list[str]]],
+    info: Mapping[str, TensorInfo],
+    weight_map: Mapping[str, str],
     jobs: int,
-    progress: "Progress | None" = None,
-) -> list[str]:
-    """并行(或单进程)写出所有输出分片,全部成功后重命名为最终名字。"""
-    for index, shard in enumerate(shards, start=1):
-        shard["temp_path"] = os.path.join(dst, f"model-{index:05d}-of-XXXXX.safetensors")
-        shard["src_dir"] = src
-        shard["metadata"] = metadata
+    progress: Progress,
+    metadata: Mapping[str, str] | None = None,
+) -> None:
+    """Write every planned shard (optionally with a process pool).
 
-    done_count = 0
-    manager = None
-    queue = None
-    try:
-        if jobs > 1:
+    Temp names end in ``-of-XXXXX``; once all writes succeeded the files are
+    atomically renamed to ``-of-YYYYY`` with the true shard count, so a
+    half-written output is never mistaken for a complete one. On failure the
+    temp files are removed -- the output directory keeps only the metadata
+    copies and can simply be re-run.
+    """
+    if jobs < 0:
+        raise SourceError(f"--jobs must be >= 0, got {jobs}")
+
+    def _drain(queue: object, progress: Progress) -> None:
+        while True:
             try:
-                # mp.Queue 只能在进程创建时继承,ProcessPoolExecutor 传参会报错;
-                # 这里用 Manager 的代理队列(只用于进度上报,量很小)。
-                manager = mp.Manager()
-                queue = manager.Queue()
-                for shard in shards:
-                    shard["queue"] = queue
-                with ProcessPoolExecutor(max_workers=jobs) as pool:
-                    futures = {pool.submit(write_one_shard, shard): shard for shard in shards}
-                    pending = set(futures)
-                    while pending:
-                        done, pending = wait(pending, timeout=0.3, return_when=FIRST_COMPLETED)
-                        while True:
-                            try:
-                                delta = queue.get_nowait()
-                            except Exception:
-                                break
-                            if progress is not None:
-                                progress.update(delta, shards=done_count)
-                        for future in sorted(done, key=lambda f: futures[f]["temp_path"]):
-                            future.result()
-                            done_count += 1
-                            if progress is not None:
-                                progress.update(0, shards=done_count)
-            except (OSError, PermissionError, RuntimeError, ImportError) as exc:
-                # 受限环境(容器/seccomp/沙箱禁止匿名管道)起不了多进程:回退单进程,
-                # 语义与结果完全一致,只是慢一些。
+                progress.add(queue.get_nowait())
+            except Exception:
+                break
+
+    def _write_serial() -> None:
+        for shard in entries:
+            write_one_shard(shard, src, dst, info, weight_map, metadata=metadata)
+            progress.add(sum(info[t].end - info[t].start for t in shard[1]))
+        progress.finish()
+
+    try:
+        if jobs in (0, 1) or len(entries) <= 1:
+            _write_serial()
+        else:
+            try:
+                with mp.Manager() as manager:
+                    queue = manager.Queue()
+                    with ProcessPoolExecutor(max_workers=jobs) as pool:
+                        futures = [
+                            pool.submit(
+                                write_one_shard,
+                                shard,
+                                src,
+                                dst,
+                                info,
+                                weight_map,
+                                queue,
+                                metadata,
+                            )
+                            for shard in entries
+                        ]
+                        pending = set(futures)
+                        while pending:
+                            done, pending = wait(
+                                pending, timeout=0.3, return_when=FIRST_COMPLETED
+                            )
+                            for future in done:
+                                future.result()
+                            _drain(queue, progress)
+                    progress.finish()
+            except (OSError, RuntimeError, ImportError) as exc:
                 print(
-                    f"[warn] 无法启用多进程({type(exc).__name__}: {exc});回退为单进程写盘。",
+                    f"[warn] parallel writer unavailable ({exc!r}); "
+                    "falling back to single process",
                     file=sys.stderr,
                 )
-                if manager is not None:
-                    manager.shutdown()
-                manager, queue = None, None
-                done_count = 0
-                for shard in shards:
-                    shard.pop("queue", None)
-                    write_one_shard(shard)
-                    done_count += 1
-                    if progress is not None:
-                        progress.update(0, shards=done_count)
-        else:
-            for shard in shards:
-                write_one_shard(shard)
-                done_count += 1
-                if progress is not None:
-                    progress.update(0, shards=done_count)
+                _write_serial()
     except BaseException:
-        if progress is not None:
-            progress.close()
-        # 本次已写出的分片不完整,整套都不可用;清理掉,只保留 metadata 拷贝
-        removed = 0
-        for shard in shards:
-            path = shard["temp_path"]
-            if os.path.isfile(path):
-                os.remove(path)
-                removed += 1
-        print(
-            f"[clean] 写出失败,已删除本次生成的 {removed} 个分片"
-            f"(目标目录只留 metadata 文件,可直接重跑)",
-            file=sys.stderr,
-        )
+        for name, _ in entries:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(dst, name))
         raise
-    finally:
-        if manager is not None:
-            manager.shutdown()
 
-    total = len(shards)
-    final_names: list[str] = []
-    for index in range(1, total + 1):
-        temp_name = f"model-{index:05d}-of-XXXXX.safetensors"
-        final_name = f"model-{index:05d}-of-{total:05d}.safetensors"
-        os.replace(os.path.join(dst, temp_name), os.path.join(dst, final_name))
-        final_names.append(final_name)
-    if progress is not None:
-        progress.update(max(progress.total - progress.done, 0), shards=total)
-        progress.close()
-    return final_names
+    # Atomic rename to the true shard total once every write succeeded.
+    total = len(entries)
+    for name, _ in entries:
+        final = name.replace("-of-XXXXX", f"-of-{total:05d}")
+        os.replace(os.path.join(dst, name), os.path.join(dst, final))
 
 
-def write_index(dst: str, shards: list[dict], shard_names: list[str], companion_present: bool) -> None:
-    """写 ``model.safetensors.index.json``。
+def write_index(
+    dst: str,
+    entries: list[tuple[str, list[str]]],
+    companion_present: bool,
+    total_bytes: int,
+) -> None:
+    """Write (or deliberately drop) the output index.
 
-    * 分片数 <= 1 且目标目录没有伴随 safetensors:删掉旧索引(避免旧索引把自建分片
-      过滤掉);
-    * 其它情况(含"只有一个分片但有 rot.safetensors"):**必须写索引**,否则 vLLM
-      会把伴随 safetensors 当权重文件读入。
+    The index is rebuilt whenever any tensor file was written. A
+    single-shard output normally needs no index, but a copied companion
+    safetensors makes one mandatory -- without it the loader would treat
+    the companion as the only shard and fail on every tensor.
     """
-    index_path = os.path.join(dst, INDEX_NAME)
-    if len(shard_names) <= 1 and not companion_present:
-        if os.path.isfile(index_path):
+    total = len(entries)
+    if total <= 1 and not companion_present:
+        index_path = os.path.join(dst, INDEX_NAME)
+        if os.path.exists(index_path):
             os.remove(index_path)
-        return
-
-    weight_map: dict[str, str] = {}
-    total_size = 0
-    for shard, name in zip(shards, shard_names):
-        total_size += os.path.getsize(os.path.join(dst, name))
-        for entry in shard["entries"]:
-            weight_map[entry[0]] = name
-    with open(index_path, "w", encoding="utf-8") as handle:
-        json.dump(
-            {"metadata": {"total_size": total_size}, "weight_map": weight_map},
-            handle,
-            indent=2,
-        )
-    expected = {entry[0] for shard in shards for entry in shard["entries"]}
-    missing = expected - set(weight_map)
-    if missing:
-        raise RuntimeError(f"{len(missing)} 个张量没有写进新分片,例如 {sorted(missing)[:5]}")
-
-
-def verify_output(dst: str, shard_names: list[str], info: dict[str, tuple[str, TensorInfo]]) -> int:
-    """回读输出分片头部,要求键集合与每个张量的 dtype/shape/字节数都一致。"""
-    seen: dict[str, tuple[str, list[int], int]] = {}
-    for name in shard_names:
-        tensors, _, _ = read_shard_header(os.path.join(dst, name))
-        for key, tensor in tensors.items():
-            seen[key] = (tensor.dtype, tensor.shape, tensor.nbytes)
-    expected = {key: (t.dtype, t.shape, t.nbytes) for key, (_, t) in info.items()}
-    if set(seen) != set(expected):
         print(
-            f"[verify] FAIL: 计划 {len(expected)} 个张量 / 实际 {len(seen)} 个",
-            file=sys.stderr,
+            "[index] single shard, no companions: no index needed (removed if present)"
         )
-        return 4
-    for key, want in expected.items():
-        if seen[key] != want:
-            print(f"[verify] FAIL: {key} 元信息不一致 {seen[key]} != {want}", file=sys.stderr)
-            return 4
-    return 0
+        return
+    weight_map_out: dict[str, str] = {}
+    for name, tensors in entries:
+        final = name.replace("-of-XXXXX", f"-of-{total:05d}")
+        for tensor in tensors:
+            weight_map_out[tensor] = final
+    payload = {"metadata": {"total_size": total_bytes}, "weight_map": weight_map_out}
+    index_path = os.path.join(dst, INDEX_NAME)
+    tmp = index_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, index_path)
+    print(
+        f"[index] wrote {INDEX_NAME}: {total} shard(s), {len(weight_map_out)} tensors"
+    )
+
+
+def verify_output(
+    dst: str, entries: list[tuple[str, list[str]]], info: Mapping[str, TensorInfo]
+) -> None:
+    """Re-read the written headers and confirm tensor sets and dtype/shape.
+
+    Also checks each shard's file size against its own header (8 + header
+    length + payload), a cheap guard against truncated or shifted writes.
+    """
+    total = len(entries)
+    expected: set[str] = set()
+    for name, tensors in entries:
+        final = name.replace("-of-XXXXX", f"-of-{total:05d}")
+        path = os.path.join(dst, final)
+        if not os.path.isfile(path):
+            raise OutputVerifyError(f"missing output shard: {final}")
+        on_disk, _, base = read_shard_header(path)
+        if set(on_disk) != set(tensors):
+            raise OutputVerifyError(
+                f"{final}: tensor set mismatch "
+                f"(expected {len(tensors)}, got {len(on_disk)})"
+            )
+        payload = sum(on_disk[t].end - on_disk[t].start for t in tensors)
+        size = os.path.getsize(path)
+        if size != base + payload:
+            raise OutputVerifyError(
+                f"{final}: file size {size} != header+payload {base + payload}"
+            )
+        for tensor in tensors:
+            if on_disk[tensor].dtype != info[tensor].dtype or list(
+                on_disk[tensor].shape
+            ) != list(info[tensor].shape):
+                raise OutputVerifyError(f"{final}: dtype/shape mismatch for {tensor}")
+        expected |= set(tensors)
+    if expected != set(info):
+        raise OutputVerifyError("union of shard tensors != planned tensors")
 
 
 # ---------------------------------------------------------------------------
-# 非权重条目 / 源目录只读校验
+# Metadata
 # ---------------------------------------------------------------------------
+
+
 def _metadata_candidates(
     src: str, weight_files: set[str], companions: list[str]
 ) -> tuple[list[str], list[str]]:
-    """候选非权重条目 -> (文件, 目录)。
+    """Return (metadata file candidates, directory candidates).
 
-    文件 = 普通文件 + 伴随 safetensors;目录单独返回(默认不拷,规则点名才拷)。
+    Files start with the companions (so they can never fall under the
+    skip rules), then every top-level entry that is neither a weight shard
+    nor a non-companion ``*.safetensors`` nor an index (any name, standard
+    or custom -- the output always rebuilds its own) nor a skipped name.
     """
     files = list(companions)
     dirs: list[str] = []
     for name in sorted(os.listdir(src)):
-        if name in weight_files or name in companions:
+        if name in weight_files or name in files:
             continue
-        if name.endswith(".safetensors") or name.startswith(SKIP_FILE_PREFIX):
+        if (
+            name.endswith(".safetensors")
+            or name.endswith(INDEX_SUFFIX)
+            or name.startswith(SKIP_FILE_PREFIX)
+        ):
             continue
         if name in SKIP_FILE_EXACT:
             continue
-        (dirs if os.path.isdir(os.path.join(src, name)) else files).append(name)
+        if os.path.isdir(os.path.join(src, name)):
+            dirs.append(name)
+        else:
+            files.append(name)
     return sorted(files), dirs
 
 
 def plan_metadata(
     src: str, role: str, mode: str, weight_files: set[str], companions: list[str]
 ) -> tuple[list[str], list[str]]:
-    """返回 (要拷贝的条目, 主动跳过的条目)。
+    """Return (entries to copy, entries deliberately skipped) for this role.
 
-    文件(含伴随 safetensors)按角色规则(支持 ``*`` 通配)拷贝;目录默认不拷,除非规则
-    里**显式点名**它(写 ``"*"`` 不算点名,免得 ``--metadata auto`` 顺手带走整个目录)
-    或 mode 是 ``all``。
+    Files follow the per-role fnmatch rules. Directories are NOT copied by
+    default -- only when a rule other than ``*`` names one explicitly
+    (e.g. QuaRot's ``optional/``), or with ``mode == "all"``.
     """
-    allowed = ("*",) if mode == "all" else METADATA_RULES[role]
+    allowed = ("*",) if mode == "all" else METADATA_RULES.get(role, ())
     files, dirs = _metadata_candidates(src, weight_files, companions)
-
-    def keep_file(name: str) -> bool:
-        return any(fnmatch.fnmatch(name, rule) for rule in allowed)
-
-    def keep_dir(name: str) -> bool:
-        if mode == "all":
-            return True
-        return any(rule != "*" and fnmatch.fnmatch(name, rule) for rule in allowed)
-
-    wanted = [name for name in files if keep_file(name)]
-    wanted += [name for name in dirs if keep_dir(name)]
+    wanted = [name for name in files if any(fnmatch.fnmatch(name, p) for p in allowed)]
+    wanted += [
+        name
+        for name in dirs
+        if mode == "all" or any(p != "*" and fnmatch.fnmatch(name, p) for p in allowed)
+    ]
     skipped = [name for name in files + dirs if name not in wanted]
     return wanted, skipped
 
 
 def copy_metadata(src: str, dst: str, names: list[str]) -> list[str]:
-    """拷贝非权重条目;目录会整目录递归拷贝(例如 optional/)。"""
-    copied = []
+    """Copy non-weight entries; directories are copied recursively."""
+    copied: list[str] = []
     for name in names:
-        source_path = os.path.join(src, name)
-        if os.path.isdir(source_path):
-            shutil.copytree(source_path, os.path.join(dst, name), dirs_exist_ok=True)
+        source = os.path.join(src, name)
+        if os.path.isdir(source):
+            shutil.copytree(source, os.path.join(dst, name), dirs_exist_ok=True)
             copied.append(name + "/")
-            continue
-        if not os.path.isfile(source_path):
-            continue
-        shutil.copy2(source_path, os.path.join(dst, name))
-        copied.append(name)
+        else:
+            shutil.copy2(source, os.path.join(dst, name))
+            copied.append(name)
     return copied
 
 
-def snapshot_tree(root: str) -> dict[str, tuple[int, int, int]]:
-    """(相对路径 -> (size, mtime_ns, inode)),用于证明源目录没被改动。"""
-    snapshot: dict[str, tuple[int, int, int]] = {}
-    for current, dirs, files in os.walk(root):
-        dirs.sort()
+# ---------------------------------------------------------------------------
+# Read-only guard
+# ---------------------------------------------------------------------------
+
+
+def snapshot_tree(path: str) -> dict[str, tuple[int, int, int]]:
+    """Stat snapshot of every file under ``path``: name -> (mtime_ns, size, inode)."""
+    snap: dict[str, tuple[int, int, int]] = {}
+    for root, dirs, files in os.walk(path):
+        dirs[:] = sorted(dirs)
         for name in sorted(files):
-            path = os.path.join(current, name)
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, path)
             try:
-                stat = os.stat(path)
+                st = os.stat(full)
             except OSError:
                 continue
-            snapshot[os.path.relpath(path, root)] = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
-    return snapshot
+            snap[rel] = (int(st.st_mtime_ns), int(st.st_size), int(st.st_ino))
+    return snap
 
 
-def main() -> int:
-    args = parse_args()
-    prefixes = tuple(args.keep_prefix) + ROLE_RULES[args.role]
-    patterns: list[tuple[str, "re.Pattern[str]"]] = [
-        (f"re:{pattern.pattern}", pattern) for pattern in ROLE_NAME_PATTERNS[args.role]
+def snapshot_changes(
+    before: dict[str, tuple[int, int, int]], after: dict[str, tuple[int, int, int]]
+) -> list[str]:
+    """Paths whose snapshot entry changed, was added or removed (sorted)."""
+    return [
+        name
+        for name in sorted(set(before) | set(after))
+        if before.get(name) != after.get(name)
     ]
-    for raw in args.keep_name_regex:
+
+
+# ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
+
+
+class Progress:
+    """Stderr-only progress line: in-place on a tty, throttled otherwise."""
+
+    def __init__(self, total: float, enabled: bool = True) -> None:
+        self.total = max(float(total), 1.0)
+        self.done = 0
+        self.enabled = enabled and sys.stderr.isatty()
+        self.start = time.time()
+        self.last = 0.0
+
+    def add(self, n: int) -> None:
+        self.done += n
+        if not self.enabled:
+            return
+        now = time.time()
+        if now - self.last < PROGRESS_INTERVAL:
+            return
+        self.last = now
+        pct = min(100.0, self.done * 100.0 / self.total)
+        sys.stderr.write(
+            f"\r[write] {pct:5.1f}% ({fmt_gib(self.done)}/{fmt_gib(int(self.total))})"
+        )
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.time() - self.start
+        sys.stderr.write(
+            f"\r[write] 100.0% ({fmt_gib(int(self.total))}) in {elapsed:.1f}s   \n"
+        )
+        sys.stderr.flush()
+
+
+def fmt_gib(n: int) -> str:
+    return f"{n / (1 << 30):.2f} GiB"
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def _parse_cli_patterns(raw: list[str]) -> list[re.Pattern[str]]:
+    out = []
+    for item in raw:
         try:
-            patterns.append((f"re:{raw}", re.compile(raw)))
+            out.append(re.compile(item))
         except re.error as exc:
-            print(f"--keep-name-regex 非法: {raw} ({exc})", file=sys.stderr)
-            return 2
-    patterns_tuple = tuple(patterns)
+            raise SourceError(f"--keep-name-regex {item!r}: {exc}") from exc
+    return out
 
-    # 相对路径按当前工作目录解析;顺带展开 ~,并消掉符号链接,
-    # 这样下面"dst 不能等于/包含 src"的校验不会被软链接绕过。
-    src = os.path.realpath(os.path.expanduser(args.src))
-    if not os.path.isdir(src):
-        print(f"源目录不存在: {src}", file=sys.stderr)
-        return 2
 
-    # 源目录只读校验(默认开启):先拍快照,收尾时比对
-    guard_snapshot = None if args.no_verify_src_readonly else snapshot_tree(src)
-
-    weight_map, index_name = load_weight_map(src)
-    weight_files, companions = classify_safetensors(src, weight_map, index_name)
-    grouped, matched = select_keys(weight_map, prefixes, patterns_tuple)
-
-    total_bytes = sum(os.path.getsize(os.path.join(src, name)) for name in weight_files)
-    print(f"[in ] {len(weight_map)} tensor(s), {gib(total_bytes):.2f} GiB on disk")
-    print(f"[plan] source index: {index_name or '(无索引,逐分片读头部)'}")
-    if companions:
-        print(f"[plan] companion safetensors(非权重分片): {companions}")
-    print(f"[rule] keep prefixes: {list(prefixes)}")
-    if patterns_tuple:
-        print(f"[rule] keep name patterns: {[label for label, _ in patterns_tuple]}")
-
-    labels = prefixes + tuple(label for label, _ in patterns_tuple)
-    width = max([40, *(len(label) for label in labels)])
-    print("\n  matched tensors per rule:")
-    kept = 0
-    for label in labels:
-        keys = grouped.get(label, [])
-        if not keys:
-            print(f"    {label:{width}s} 0 tensor(s)  <-- 没命中,检查命名布局/是否该保留")
-            continue
-        kept += len(keys)
-        print(f"    {label:{width}s} {len(keys)} tensor(s)")
-    print(f"\n  => keep {kept} tensor(s) of {len(weight_map)}; drop {len(weight_map) - kept}")
-
-    dropped_groups: dict[str, int] = defaultdict(int)
-    keep = {key for keys in grouped.values() for key in keys}
-    for key in weight_map:
-        if key not in keep:
-            dropped_groups[".".join(key.split(".")[:3])] += 1
-    print("\n  dropped tensors grouped by leading components (top 15):")
-    for name, count in sorted(dropped_groups.items(), key=lambda item: -item[1])[:15]:
-        print(f"    {name:48s} {count}")
-
-    if matched == 0:
+def _print_rule_report(
+    role: str,
+    table: Mapping[str, frozenset[str]],
+    live: bool,
+    keep: set[str],
+    drop: set[str],
+    uncovered: list[str],
+    attribution: dict[str, list[str]],
+) -> None:
+    table_source = (
+        "live import from vllm" if live else "vendored fallback (vllm not importable)"
+    )
+    keep_rows = sorted(k for k, owners in table.items() if role in owners)
+    drop_rows = sorted(k for k, owners in table.items() if role not in owners)
+    print(f"[rule] module ownership table: {table_source} ({len(table)} rows)")
+    print(f"[rule] {role} keeps rows: {', '.join(keep_rows)}")
+    print(f"[rule] {role} drops rows: {', '.join(drop_rows)}")
+    if role == "edge" and _EDGE_KEEP_PATTERNS:
         print(
-            "\n没有任何张量命中保留规则,请用 --keep-prefix/--keep-name-regex 指定正确规则。",
+            "[rule] edge tensor special-case keeps: tid2eid (Hash MoE routing tables)"
+        )
+    if _BOTH_KEEP_PATTERNS:
+        print(
+            "[rule] both-role tensor special-case keeps: "
+            "hc_head (DeepSeek-V4 hyper-connection head)"
+        )
+    total = len(keep) + len(drop) + len(uncovered)
+    print(
+        f"[plan] {total} tensors: keep {len(keep)}, drop {len(drop)}, "
+        f"uncovered {len(uncovered)}"
+    )
+    for label in sorted(attribution):
+        print(f"[plan] {label}: {len(attribution[label])} tensors")
+    if drop:
+        groups: dict[str, int] = {}
+        for name in drop:
+            key = ".".join(name.split(".")[:3])
+            groups[key] = groups.get(key, 0) + 1
+        top = sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))[:15]
+        print("[drop] top dropped groups (first 3 components):")
+        for key, count in top:
+            print(f"    {key}: {count}")
+    if uncovered:
+        print(f"[rule] FAIL: {len(uncovered)} tensor(s) matched by no rule:")
+        for name in uncovered[:20]:
+            print(f"    {name}")
+        groups = {}
+        for name in uncovered:
+            key = ".".join(name.split(".")[:3])
+            groups[key] = groups.get(key, 0) + 1
+        top = sorted(groups.items(), key=lambda kv: (-kv[1], kv[0]))[:15]
+        print("[rule] uncovered groups (first 3 components):")
+        for key, count in top:
+            print(f"    {key}: {count}")
+        print(
+            "[rule] classify them explicitly with --keep-prefix/--keep-name-regex "
+            "or extend LWD_MODULE_OWNERSHIP"
+        )
+
+
+def _run(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cli_patterns = _parse_cli_patterns(args.keep_name_regex)
+
+    table, live = load_module_ownership()
+    if not live:
+        print(
+            "[warn] vllm not importable: using the vendored ownership table snapshot",
             file=sys.stderr,
         )
-        return 3
 
-    # 读头部 -> 精确体积 + 分片规划(dry-run 也做,让 [size] 是准确值)
-    try:
-        info, metadata, data_start = collect_tensor_info(src, weight_files, keep, weight_map)
-    except (OSError, ValueError) as exc:
-        print(f"\n  [size] 无法统计保留体积: {exc}", file=sys.stderr)
-        return 2
-    keep_size = sum(tensor.nbytes for _, tensor in info.values())
+    src = os.path.realpath(os.path.expanduser(args.src))
+    if not os.path.isdir(src):
+        raise SourceError(f"--src {args.src!r}: not a directory")
+    guard_before = None if args.no_verify_src_readonly else snapshot_tree(src)
+
+    weight_map, index_name = load_weight_map(src)
+    if not weight_map:
+        raise SourceError(f"--src {src!r}: no tensors found")
+    weight_files, companions = classify_safetensors(src, weight_map, index_name)
+
+    keep, drop, uncovered, attribution = classify_all(
+        weight_map, args.role, table, args.keep_prefix, cli_patterns
+    )
+    _print_rule_report(args.role, table, live, keep, drop, uncovered, attribution)
+    if uncovered:
+        raise RuleCoverageError(
+            f"{len(uncovered)} tensor(s) matched no rule "
+            f"(first: {uncovered[0]!r}); classify them explicitly before splitting"
+        )
+    if not keep:
+        raise RuleCoverageError("no tensors matched the keep rules for this role")
+
+    info, shard_metadata, payload_bytes = collect_tensor_info(src, keep, weight_files)
+    entries = plan_shards(info, int(args.max_shard_gb * (1 << 30)))
     print(
-        f"\n  [size] 将写出 {gib(keep_size):.2f} GiB / 源 {gib(total_bytes):.2f} GiB "
-        f"({keep_size / max(total_bytes, 1) * 100:.1f}%)"
+        f"[plan] {args.role} output: {len(entries)} shard(s), "
+        f"{fmt_gib(payload_bytes)} payload, shard cap {args.max_shard_gb} GiB"
     )
 
-    max_shard_bytes = int(args.max_shard_gb * 2**30)
-    shards = plan_shards(info, data_start, max_shard_bytes)
-    print(f"  [plan] {len(shards)} output shard(s), <= {args.max_shard_gb} GiB each")
-
-    meta_copy, meta_skip = plan_metadata(src, args.role, args.metadata, weight_files, companions)
-    print(f"\n[meta] 将拷贝 {len(meta_copy)} 个非权重条目: {meta_copy}")
-    if meta_skip:
-        print(f"[meta] 主动跳过 {len(meta_skip)} 个: {meta_skip}")
+    meta_files, meta_skipped = plan_metadata(
+        src, args.role, args.metadata, weight_files, companions
+    )
+    print(f"[meta] copying {len(meta_files)} entries for role {args.role}:")
+    for name in meta_files:
+        print(f"    {name}")
+    if meta_skipped:
+        print(f"[meta] skipping {len(meta_skipped)}: {', '.join(meta_skipped)}")
     if args.metadata == "auto" and args.role == "cloud":
         print(
-            "[meta] 云侧最小化依赖 vllm 的 LWD 改动(skip_tokenizer_init + mm_encoder_remote);"
-            "若云侧仍跑未打补丁的 vllm,请加 --metadata all"
+            "[meta] cloud minimal set assumes the LWD vllm patches; "
+            "for an unpatched vllm use --metadata all"
         )
+
     if args.dry_run:
+        print("[done ] dry-run: nothing written")
         return 0
 
     if not args.dst:
-        print("非 dry-run 必须给 --dst", file=sys.stderr)
-        return 2
+        raise SourceError("--dst is required unless --dry-run is set")
     dst = os.path.realpath(os.path.expanduser(args.dst))
-    if dst == src or src.startswith(dst + os.sep):
-        print("为安全起见,--dst 不能等于/包含 --src", file=sys.stderr)
-        return 2
-
-    # 空间预检:宁可在这里退出,也不要在写第 N 个分片时把盘写满、留下半成品
-    if keep_size:
-        probe = dst
-        while not os.path.exists(probe):
-            parent = os.path.dirname(probe)
-            if parent == probe:
-                break
-            probe = parent
-        free = shutil.disk_usage(probe).free
-        need = keep_size + 256 * 2**20  # 留 256MiB 余量
-        print(f"\n[space] 目标 {probe} 可用 {free / 2**30:.2f} GiB,需要 {need / 2**30:.2f} GiB")
-        if free < need:
-            print(
-                "空间不足:换一个有空间的 --dst(另一块盘/挂载点),或先清理目标盘。",
-                file=sys.stderr,
-            )
-            return 5
-
-    jobs = args.jobs if args.jobs > 0 else min(4, os.cpu_count() or 1)
+    if dst == src:
+        raise SourceError("--dst must differ from --src")
+    if os.path.commonpath([dst, src]) == src:
+        raise SourceError("--dst must not be inside --src")
     os.makedirs(dst, exist_ok=True)
-    copied = copy_metadata(src, dst, meta_copy)
-    print(f"\n[copy] {len(copied)} metadata entrie(s): {copied}")
-    print(f"[write] {len(shards)} shard(s), jobs={jobs}, 字节直写(不 materialize 张量)")
 
-    progress = Progress(
-        keep_size,
-        "[write]",
-        mode="off" if (args.no_progress or not keep_size) else "auto",
+    # Disk space preflight: payload + headers + metadata + fixed slack.
+    needed = payload_bytes + 256 * 2**20
+    free = shutil.disk_usage(dst).free
+    if free < needed:
+        raise WriteError(
+            f"insufficient disk space: need {fmt_gib(needed)}, free {fmt_gib(free)}"
+        )
+
+    print(f"[copy] metadata -> {dst}")
+    copied = copy_metadata(src, dst, meta_files)
+    print(f"[copy] {len(copied)} metadata entries copied: {', '.join(copied)}")
+
+    progress = Progress(payload_bytes, enabled=not args.no_progress)
+    jobs = args.jobs if args.jobs > 0 else min(4, os.cpu_count() or 1)
+    try:
+        write_slices(
+            src, dst, entries, info, weight_map, jobs, progress, shard_metadata
+        )
+        companion_present = any(name in meta_files for name in companions)
+        write_index(dst, entries, companion_present, payload_bytes)
+    except OSError as exc:
+        raise WriteError(f"write failed: {exc}") from exc
+    verify_output(dst, entries, info)
+
+    if guard_before is not None:
+        changes = snapshot_changes(guard_before, snapshot_tree(src))
+        if changes:
+            shown = ", ".join(changes[:5])
+            raise SourceModifiedError(f"--src changed during the split: {shown}")
+
+    total_out = sum(
+        os.path.getsize(os.path.join(dst, f))
+        for f in os.listdir(dst)
+        if os.path.isfile(os.path.join(dst, f))
     )
-    shard_names = write_slices(src, dst, shards, metadata, jobs, progress=progress)
-    companion_in_dst = any(name in set(companions) for name in meta_copy)
-    write_index(dst, shards, shard_names, companion_in_dst)
-
-    code = verify_output(dst, shard_names, info)
-    if code != 0:
-        return code
-    total_written = sum(os.path.getsize(os.path.join(dst, name)) for name in shard_names)
-    print(f"[verify] OK: {len(info)} tensor(s), {gib(total_written):.2f} GiB in {dst}")
-
-    if guard_snapshot is not None:
-        after = snapshot_tree(src)
-        if after != guard_snapshot:
-            changed = sorted(set(after) ^ set(guard_snapshot))[:5]
-            details = [f"{name}: {guard_snapshot.get(name)} -> {after.get(name)}" for name in changed]
-            print(
-                f"[guard] FAIL: 源目录 {src} 在本次运行中发生了变化(绝不允许): {details}",
-                file=sys.stderr,
-            )
-            return 6
-        print(f"[guard] 源目录只读校验通过({len(after)} 个文件快照一致)")
-
-    print("[next ] 用 split 出来的目录启动该侧;若仍报 'Following weights were not initialized',按报错名单补张量")
+    print(f"[done ] role={args.role} -> {dst} ({fmt_gib(total_out)})")
+    print(f"[next ] start vllm with --model {dst}")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return _run(argv)
+    except LwdSplitError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return exc.exit_code
 
 
 if __name__ == "__main__":

@@ -1,86 +1,91 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Drop checkpoint tensors that belong to modules this LWD role does not build.
+"""Skip checkpoint tensors of modules the LWD role does not own.
 
-LWD (layerwise disaggregated) edge/cloud deployments construct only the
-modules their role actually runs, so the model contains ``PPMissingLayer`` /
-``StageMissingLayer`` placeholders (see
-:mod:`vllm.model_executor.models.utils`).  When such a process is still pointed
-at a full checkpoint -- the usual state while bringing a deployment up -- the
-loader can skip the placeholders' weights *before* they are read from disk.
-This mirrors :mod:`vllm.model_executor.model_loader.ep_weight_filter`, which
-does the same for experts a rank does not own.
-
-Matching is component-wise rather than prefix-based on purpose:
-
-* the checkpoint name and the vLLM module name do not always agree on their
-  leading components -- a multimodal checkpoint stores the tower as
-  ``model.visual.*`` while the vLLM module is ``visual``, and DeepSeek's native
-  checkpoints drop the ``model.`` prefix entirely (``layers.3.mlp`` for the
-  module ``model.layers.3``) -- so a prefix test would silently miss them;
-  a leading ``model`` component is therefore ignored on both sides;
-* component matching keeps ``layers.3`` from matching ``layers.30``.
-
-Checkpoint layout note: :meth:`DefaultModelLoader._prepare_weights` enumerates
-the shards that are actually present on disk and only uses
-``model.safetensors.index.json`` to drop duplicates, so a model directory that
-holds a subset of the shards (or newly written ones) loads fine.  When an index
-file is kept, every shard that must be read has to be listed in its
-``weight_map``: an unlisted file is filtered out and, when nothing is left, the
-loader raises ``Cannot find any model weights``.  ``config.json`` -- and the
-tokenizer/processor configs -- must stay in place, since the model class is
-built from them.
+Build-time pruning (the ``LWD_MODULE_OWNERSHIP`` guards) already avoids
+constructing those modules, but the checkpoint on disk still contains
+their tensors: loading them would fail with unmatched weights and waste
+disk reads. This filter drops such tensors at iteration time, deriving
+its skip keys from the same ownership table so load-time and build-time
+stay consistent.
 """
 
-from __future__ import annotations
+from functools import lru_cache
 
-from collections.abc import Iterable
-
-
-def _strip_model_prefix(parts: list[str]) -> list[str]:
-    """Drop a leading ``model`` component (present in HF, absent in native)."""
-    return parts[1:] if len(parts) > 1 and parts[0] == "model" else parts
+from vllm.model_executor.models.utils import LWD_MODULE_OWNERSHIP
 
 
-def parse_skip_keys(placeholder_names: Iterable[str]) -> list[list[str]]:
-    """Convert dotted placeholder module names into component keys.
+@lru_cache(maxsize=2)
+def parse_skip_keys(role: str) -> frozenset[str]:
+    """Module-path suffixes the role does not own, from the ownership table."""
+    return frozenset(
+        suffix for suffix, owners in LWD_MODULE_OWNERSHIP.items() if role not in owners
+    )
 
-    Args:
-        placeholder_names: Module names as returned by
-            :func:`vllm.model_executor.models.utils.get_pp_missing_layer_names`,
-            i.e. dotted paths, usually with a trailing dot.
 
-    Returns:
-        One list of path components per name; empty names are dropped.
+def _matches_module_suffix(name: str, key: str) -> bool:
+    """Whether a dot-boundary prefix of ``name`` is a module path ending in
+    ``key``, mirroring the suffix semantics of ``lwd_skips_module``.
+
+    Checkpoint names may nest the vLLM module path under extra components
+    (``model.visual.merger`` for the ``visual`` tower), so every module
+    prefix of the tensor name is checked, not just the whole name.
     """
-    return [
-        _strip_model_prefix(name.rstrip(".").split("."))
-        for name in placeholder_names
-        if name
-    ]
+    parts = name.split(".")
+    # The last component is the leaf parameter (e.g. "weight"), not a module.
+    for i in range(1, len(parts)):
+        path = ".".join(parts[:i])
+        if path == key or path.endswith("." + key):
+            return True
+    return False
 
 
-def name_is_skipped(weight_name: str, skip_keys: list[list[str]]) -> bool:
-    """Return whether *weight_name* lives inside one of the skipped modules.
+_VL_TEXT_PREFIX = "model.language_model."
 
-    Args:
-        weight_name: Checkpoint tensor name, e.g. ``model.layers.3.mlp.w1`` or
-            ``layers.3.mlp.w1`` (native checkpoint layout).
-        skip_keys: Component keys produced by :func:`parse_skip_keys`.
 
-    Returns:
-        ``True`` when some key matches a contiguous run of components of
-        *weight_name*.
+def _unwrap_vl_text_prefix(name: str) -> str:
+    """Rewrite the VL checkpoint nesting ``model.language_model.*`` to
+    ``model.*``.
+
+    VL checkpoints (Qwen3-VL, GLM-4.5V) store the language model under
+    ``model.language_model.`` while the ownership table and flat text
+    checkpoints use ``model.`` — the same community-checkpoint rewrite the
+    Qwen3.5 weights mapper applies.
     """
-    if not skip_keys:
+    if name.startswith(_VL_TEXT_PREFIX):
+        return "model." + name[len(_VL_TEXT_PREFIX) :]
+    return name
+
+
+def lwd_should_skip_weight(name: str, role: str | None) -> bool:
+    """Whether checkpoint tensor ``name`` belongs to a module ``role`` skips.
+
+    All matches are on dot boundaries, so ``visual.`` never matches
+    ``visualizer.``. Checkpoint name layouts covered:
+
+    - flat: the key prefixes the name (``model.layers.0...`` for the
+      ``model.layers`` container, ``visual.merger...`` for the tower);
+    - VL nesting: ``model.language_model.*`` is unwrapped to ``model.*``
+      before matching (Qwen3-VL / GLM-4.5V checkpoints);
+    - native DeepSeek, which drops the leading ``model`` component
+      (``layers.3.mlp.w1``, ``norm.weight``): matched by the bare last key
+      component at the head of the name only, so tower-internal names such
+      as ``visual.merger.norm.weight`` are never touched.
+
+    A module prefix of the unwrapped name may also end with the key, so
+    vLLM module-tree paths (``language_model.model.norm.weight``) keep
+    matching defensively.
+    """
+    if role is None:
         return False
-    parts = _strip_model_prefix(weight_name.split("."))
-    num_parts = len(parts)
-    for key in skip_keys:
-        key_len = len(key)
-        if key_len == 0 or key_len > num_parts:
-            continue
-        for start in range(num_parts - key_len + 1):
-            if parts[start : start + key_len] == key:
-                return True
+    name = _unwrap_vl_text_prefix(name)
+    for key in parse_skip_keys(role):
+        bare = key.rsplit(".", 1)[-1]
+        if (
+            name == key
+            or name.startswith(key + ".")
+            or _matches_module_suffix(name, key)
+            or name.startswith(bare + ".")
+        ):
+            return True
     return False

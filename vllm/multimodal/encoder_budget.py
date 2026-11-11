@@ -4,6 +4,7 @@ from collections.abc import Mapping
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import lwd_role_of, lwd_skips_module
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.processing import BaseMultiModalProcessor
 from vllm.multimodal.registry import MultiModalRegistry
@@ -59,6 +60,30 @@ class MultiModalBudget:
 
         self.max_model_len = model_config.max_model_len
         self.max_num_reqs = scheduler_config.max_num_seqs
+
+        # [LWD] The cloud role never sees raw multimodal inputs: the edge
+        # owns the vision tower, and the cloud weight split deliberately
+        # omits the HF processor files. Building the processor below would
+        # fail to load preprocessor_config.json from the split directory,
+        # so report an empty budget instead: no multimodal item can be
+        # scheduled, which matches the cloud's data-plane contract.
+        # `processor` stays unset on purpose: any code path that reaches for
+        # it on the cloud has already skipped every empty-budget branch and
+        # must fail loudly (AttributeError) instead of touching a half-built
+        # processor.
+        if lwd_skips_module("visual", lwd_role_of(vllm_config)):
+            logger.info_once(
+                "[LWD] cloud role: multimodal inputs stay on the edge; "
+                "using an empty multimodal budget"
+            )
+            self.cache = None
+            self.mm_limits: Mapping[str, int] = {}
+            self.encoder_compute_budget = 0
+            self.encoder_cache_size = 0
+            self.mm_max_toks_per_item: Mapping[str, int] = {}
+            self.mm_max_items_per_prompt: Mapping[str, int] = {}
+            self.mm_max_items_per_batch: Mapping[str, int] = {}
+            return
 
         with set_default_torch_num_threads():  # Avoid hang during startup
             cache = (

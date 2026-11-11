@@ -5,6 +5,7 @@ import glob
 import os
 import time
 from collections.abc import Callable, Generator, Iterable
+from functools import partial
 from typing import cast
 
 import torch
@@ -18,10 +19,6 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
-)
-from vllm.model_executor.model_loader.lwd_weight_filter import (
-    name_is_skipped,
-    parse_skip_keys,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
@@ -42,6 +39,24 @@ from vllm.tracing import instrument
 from vllm.transformers_utils.repo_utils import list_filtered_repo_files
 
 logger = init_logger(__name__)
+
+
+def _skip_unowned_weights(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    skip_name: Callable[[str], bool] | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Drop tensors of modules the LWD role never builds.
+
+    The safetensors path skips them before reading from disk; other load
+    formats fall back to this wrapper so the model never sees unmatched
+    weights.
+    """
+    if skip_name is None:
+        yield from weights
+        return
+    for name, tensor in weights:
+        if not skip_name(name):
+            yield name, tensor
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -293,13 +308,13 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
-                        skip_name=skip_name,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
                         safetensors_prefetch_block_size=(
                             self.load_config.safetensors_prefetch_block_size
                         ),
+                        skip_name=skip_name,
                     )
         else:
             if extra_config.get("enable_multithread_load"):
@@ -328,6 +343,15 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        # Local imports: models.utils (home of the LWD ownership table)
+        # imports this package at module level, so importing them at the top
+        # of this module would be circular.
+        from vllm.model_executor.model_loader.lwd_weight_filter import (
+            lwd_should_skip_weight,
+            parse_skip_keys,
+        )
+        from vllm.model_executor.models.utils import lwd_role
+
         primary_weights = DefaultModelLoader.Source(
             model_config.model,
             model_config.revision,
@@ -335,20 +359,18 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        # Filter placeholders inside the safetensors iterator so skipped
-        # tensors are never read from disk. The outer filter remains the
-        # fallback for other load formats.
-        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
-        skip_name = (
-            (lambda name: name_is_skipped(name, skip_keys)) if skip_keys else None
+        role = lwd_role()
+        skip_name: Callable[[str], bool] | None = (
+            None if role is None else partial(lwd_should_skip_weight, role=role)
         )
-        if skip_name is not None:
+        if role is not None:
             logger.info_once(
-                "LWD weight filter: %d placeholder module(s) skipped before reading",
-                len(skip_keys),
+                "[LWD] role=%s skips loading tensors of %s",
+                role,
+                ", ".join(sorted(parse_skip_keys(role))),
             )
-        yield from self._skip_unbuilt_weights(
-            model, self._get_weights_iterator(primary_weights, skip_name)
+        yield from _skip_unowned_weights(
+            self._get_weights_iterator(primary_weights, skip_name), skip_name
         )
 
         secondary_weights = cast(
@@ -356,41 +378,9 @@ class DefaultModelLoader(BaseModelLoader):
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._skip_unbuilt_weights(
-                model, self._get_weights_iterator(source, skip_name)
+            yield from _skip_unowned_weights(
+                self._get_weights_iterator(source, skip_name), skip_name
             )
-
-    def _skip_unbuilt_weights(
-        self,
-        model: nn.Module,
-        weights: Generator[tuple[str, torch.Tensor], None, None],
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Skip tensors for placeholders in a trimmed LWD model."""
-        skip_keys = parse_skip_keys(self._placeholder_module_names(model))
-        if not skip_keys:
-            yield from weights
-            return
-        num_skipped = 0
-        for name, tensor in weights:
-            if name_is_skipped(name, skip_keys):
-                num_skipped += 1
-                continue
-            yield name, tensor
-        if num_skipped:
-            logger.debug(
-                "LWD weight filter skipped %d placeholder tensor(s)", num_skipped
-            )
-
-    @staticmethod
-    def _placeholder_module_names(model: nn.Module) -> list[str]:
-        from vllm.config import get_current_vllm_config_or_none
-        from vllm.model_executor.models.utils import get_pp_missing_layer_names
-
-        config = get_current_vllm_config_or_none()
-        lwd_config = getattr(config, "lwd_config", None) if config else None
-        if lwd_config is None:
-            return []
-        return get_pp_missing_layer_names(model)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(

@@ -94,6 +94,7 @@ from .utils import (
     WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
+    lwd_role,
     lwd_skips_module,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -268,7 +269,7 @@ class Qwen3_5Model(Qwen3NextModel):
         )
 
         if get_pp_group().is_last_rank and not lwd_skips_module(
-            vllm_config, maybe_prefix(prefix, "norm")
+            "model.norm", lwd_role()
         ):
             self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -514,7 +515,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            if lwd_skips_module(vllm_config, maybe_prefix(prefix, "visual")):
+            if lwd_skips_module("visual", lwd_role()):
                 self.visual = PPMissingLayer()
             else:
                 self.visual = Qwen3_VisionTransformer(
@@ -523,11 +524,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                     quant_config=quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
-
-        if isinstance(self.visual, PPMissingLayer):
-            self.use_deepstack = False
-            self.deepstack_num_level = 0
-            self.multiscale_dim = 0
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(
@@ -741,7 +737,7 @@ class Qwen3_5MoeForConditionalGeneration(
         self.multiscale_dim = self.visual_dim * self.deepstack_num_level
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            if lwd_skips_module(vllm_config, maybe_prefix(prefix, "visual")):
+            if lwd_skips_module("visual", lwd_role()):
                 self.visual = PPMissingLayer()
             else:
                 self.visual = Qwen3_VisionTransformer(
@@ -750,11 +746,6 @@ class Qwen3_5MoeForConditionalGeneration(
                     quant_config=quant_config,
                     prefix=maybe_prefix(prefix, "visual"),
                 )
-
-        if isinstance(self.visual, PPMissingLayer):
-            self.use_deepstack = False
-            self.deepstack_num_level = 0
-            self.multiscale_dim = 0
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5MoeForCausalLM(

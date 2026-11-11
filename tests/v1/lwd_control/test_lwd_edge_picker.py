@@ -8,10 +8,14 @@
 
 from __future__ import annotations
 
+import enum
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
+    lwd_grammar_ready,
     lwd_pick_prefill_batch,
 )
 
@@ -179,3 +183,61 @@ def test_waiting_candidates_use_negotiated_computed_tokens():
 
     assert req_ids == ["hit"]
     assert got == {"hit": 16}
+
+
+# --- grammar-ready filter (edge/cloud execution-set consistency) ---
+
+_MISSING = object()
+
+
+class _Status(enum.Enum):
+    WAITING = 0
+    WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = 5
+
+
+_BLOCKED = _Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+
+
+def _grammar_request(status, grammar):
+    return SimpleNamespace(
+        status=status,
+        structured_output_request=(
+            None if grammar is _MISSING else SimpleNamespace(grammar=grammar)
+        ),
+    )
+
+
+def test_grammar_ready_passes_plain_requests():
+    """No constraint (or already promoted): selectable."""
+    assert lwd_grammar_ready(_grammar_request(_Status.WAITING, None), _BLOCKED)
+    assert lwd_grammar_ready(
+        _grammar_request(_Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, object()),
+        _Status.WAITING,
+    )
+
+
+def test_grammar_ready_defers_blocked_uncompiled_requests():
+    """Blocked and still compiling: the cloud native scheduler defers it,
+    so the edge picker must defer it too."""
+    assert not lwd_grammar_ready(
+        _grammar_request(_Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, None),
+        _BLOCKED,
+    )
+    assert not lwd_grammar_ready(
+        _grammar_request(_Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, _MISSING),
+        _BLOCKED,
+    )
+
+
+def test_grammar_ready_passes_compiled_or_failed_grammars():
+    """Compiled grammar (or a compile failure, which the native error path
+    finishes) is selectable: promotion stays with the native scheduler."""
+    grammar = SimpleNamespace(done=True)
+    assert lwd_grammar_ready(
+        _grammar_request(_Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, grammar),
+        _BLOCKED,
+    )
+    assert lwd_grammar_ready(
+        _grammar_request(_Status.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR, ValueError()),
+        _BLOCKED,
+    )
