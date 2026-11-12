@@ -46,11 +46,13 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
     LwdC2eNotify,
+    LwdCloudHeartbeat,
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
     LwdMessage,
@@ -58,6 +60,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_restart_hooks import (
+    notify_cloud_restarted,
 )
 from vllm.v1.lwd_control.lwd_exceptions import LwdTransferFailedError
 from vllm.v1.request import Request
@@ -67,6 +72,8 @@ from vllm.v1.request import Request
 # conservative, validate performance with 2 first.
 LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
+# Liveness sweep rate limit: the verdict's latency granularity.
+_LWD_SWEEP_INTERVAL_S = 1.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
 # total) before failing: by then the cloud stopped reading or is gone.
@@ -114,6 +121,20 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
             handshake_timeout_s
         )
+        # Liveness accounts (peer-restart line): the control-plane IO thread
+        # beats, the engine thread sweeps; the frozenset snapshot is the
+        # admission gate's reader view.
+        self._lwd_hello_lock = threading.Lock()
+        self._lwd_hello_last = {
+            connection: time.monotonic() for connection in self._lwd_clouds
+        }
+        self._lwd_hello_boot: dict[LwdConnectionId, str] = {}
+        self._lwd_silent: set[LwdConnectionId] = set()
+        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
+        self._lwd_hello_silent_s = (
+            self._lwd_control_plane.spec.config.hello_silent_s
+        )
+        self._lwd_last_sweep = 0.0
         expected = len(self._lwd_clouds)
         while len(self._lwd_cloud_params) < expected:
             if not self._lwd_cloud_params_received.wait(
@@ -205,8 +226,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         ).connection_id
 
     def _lwd_dispatch_message(self, peer: LwdPeer, msg: LwdMessage) -> bool:
-        """Cloud limits -> record and wake the startup wait; c2e -> scheduler
-        notify queue + WAKEUP; anything else is unknown."""
+        """Cloud limits -> record and wake the startup wait; heartbeats ->
+        liveness accounts; c2e -> scheduler notify queue + WAKEUP; anything
+        else is unknown."""
+        if isinstance(msg, LwdCloudHeartbeat):
+            self._lwd_beat(self._lwd_connection_of(peer), msg.boot_id)
+            return True
         if isinstance(msg, LwdCloudParamsNotify):
             connection = self._lwd_connection_of(peer)
             self._lwd_cloud_params[connection] = msg
@@ -290,6 +315,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         request: Request,
         preferred: LwdConnectionId | None = None,
     ) -> None:
+        gate_reason = self._lwd_gate_reason(request.request_id)
+        if gate_reason is not None:
+            # Availability gate (peer-restart line): enqueue first so the
+            # FIFO-ordered ABORT finds the request in the scheduler, then
+            # reject through the abort channel (the cloud's failure
+            # isolation pattern) — a fast, retryable client-visible finish
+            # instead of a zombie-link hang.
+            lwd_logger.error(
+                "[edge] request rejected req=%s: %s",
+                request.request_id,
+                gate_reason,
+            )
+            self._lwd_enqueue_request(request)
+            self.aborts_queue.put_nowait([request.request_id])
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.ABORT, [request.request_id])
+            )
+            return
         dp_idx = self.scheduler.lwd_admit_request(request, preferred)
         client = self._lwd_coord_clients.get(dp_idx)
         try:
@@ -393,6 +436,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def step_with_batch_queue(self):
         self._lwd_drain_probe_completions()
+        self._lwd_sweep_liveness()
         try:
             return super().step_with_batch_queue()
         except LwdTransferFailedError as failure:
@@ -420,6 +464,79 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if request_ids:
             self.abort_requests(request_ids)
         return [], False
+
+    def _lwd_beat(self, connection: LwdConnectionId, boot_id: str) -> None:
+        """Control-plane IO thread: one cloud heartbeat arrived. A boot-id
+        change is a cloud-restart verdict; recovery from silence releases
+        the gate via the snapshot refresh."""
+        with self._lwd_hello_lock:
+            self._lwd_hello_last[connection] = time.monotonic()
+            previous_boot = self._lwd_hello_boot.get(connection)
+            self._lwd_hello_boot[connection] = boot_id
+            was_silent = connection in self._lwd_silent
+            if was_silent:
+                self._lwd_silent.discard(connection)
+                self._lwd_silent_routes = frozenset(self._lwd_silent)
+        if was_silent:
+            lwd_logger.error(
+                "[edge] %s back after silence (heartbeat resumed)", connection
+            )
+        if previous_boot is not None and previous_boot != boot_id:
+            lwd_logger.error(
+                "[edge] %s RESTARTED (boot_id %s -> %s)",
+                connection,
+                previous_boot,
+                boot_id,
+            )
+            notify_cloud_restarted(
+                connection.cloud_id, connection.dp_idx, "boot id changed"
+            )
+
+    def _lwd_sweep_liveness(self) -> None:
+        """Engine thread, rate-limited to the sweep interval: a silent
+        verdict fires the linked data-plane teardown and freezes the gate's
+        snapshot; the next heartbeat releases it."""
+        now = time.monotonic()
+        if now - self._lwd_last_sweep < _LWD_SWEEP_INTERVAL_S:
+            return
+        self._lwd_last_sweep = now
+        with self._lwd_hello_lock:
+            gone = sorted(
+                (connection, now - last)
+                for connection, last in self._lwd_hello_last.items()
+                if connection not in self._lwd_silent
+                and now - last > self._lwd_hello_silent_s
+            )
+            for connection, _ in gone:
+                self._lwd_silent.add(connection)
+                self._lwd_silent_routes = frozenset(self._lwd_silent)
+        for connection, silent_for in gone:
+            lwd_logger.error(
+                "[edge] %s silent %.0fs (no cloud heartbeat)",
+                connection,
+                silent_for,
+            )
+            notify_cloud_restarted(
+                connection.cloud_id,
+                connection.dp_idx,
+                f"heartbeat silent {silent_for:.0f}s",
+            )
+
+    def _lwd_gate_reason(self, request_id: str) -> str | None:
+        """Admission gate: None admits, a reason rejects. All routes silent
+        rejects everything; a wrapped id (the edge_share per-frontend
+        prefix) rejects when every connection of its source edge is
+        silent. Requests already routed to a live cloud keep flowing."""
+        silent = self._lwd_silent_routes
+        if not silent:
+            return None
+        edge_id, _ = parse_edge_id(request_id)
+        scoped = {c for c in self._lwd_clouds if c.edge_id == edge_id}
+        if set(self._lwd_clouds) <= silent or (
+            scoped and scoped <= silent
+        ):
+            return f"cloud unavailable (silent routes {sorted(silent)})"
+        return None
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """Notify each request's original cloud DP, then finish natively."""

@@ -157,6 +157,13 @@ class LwdControlPlaneConfig:
     send_queue_max: Annotated[int, Field(strict=True, ge=1)] = 1000
     """Outbound messages buffered per DP rank before sending reports
     backpressure."""
+    hello_interval_s: LwdPositiveSeconds = 1.0
+    """Seconds between one cloud DP's liveness heartbeats to its edges."""
+    hello_silent_s: LwdPositiveSeconds = 10.0
+    """Seconds without a cloud heartbeat before the edge tears that cloud
+    DP's data-plane links down and gates new requests to it; the next
+    heartbeat releases the gate. Also bounds the in-flight failure
+    latency of the teardown."""
     hello_retry_interval_s: LwdPositiveSeconds = 5.0
     """Seconds between edge registration attempts until the cloud answers."""
     handshake_timeout_s: LwdPositiveSeconds = 1800.0

@@ -21,6 +21,7 @@ import json
 import queue
 import threading
 import time
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -51,6 +52,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
     LwdC2eNotify,
+    LwdCloudHeartbeat,
     LwdCloudParamsNotify,
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
@@ -289,6 +291,13 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
         lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+        # Liveness epoch (peer-restart line): random per process launch; the
+        # edge treats a change of it as "this cloud DP restarted".
+        self._lwd_boot_id = uuid.uuid4().hex[:16]
+        self._lwd_hello_interval_s = (
+            self._lwd_control_plane.spec.config.hello_interval_s
+        )
+        self._lwd_last_heartbeat_at = 0.0
 
     def _lwd_dp_coordinator_addr(self) -> str:
         """Routable coordinator stats endpoint, or empty without one."""
@@ -869,10 +878,28 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         MQ -> gate readiness predicate); the rest is native."""
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
+        self._lwd_send_heartbeat_if_due()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
+
+    def _lwd_send_heartbeat_if_due(self) -> None:
+        """One liveness beat per hello interval to every registered edge.
+        Dropped (not retried) on a full outbound queue: the next beat covers
+        the loss, and retrying would block the engine step behind a
+        stalled edge."""
+        now = time.monotonic()
+        if now - self._lwd_last_heartbeat_at < self._lwd_hello_interval_s:
+            return
+        self._lwd_last_heartbeat_at = now
+        for peer in self._lwd_edges:
+            self._lwd_send(peer, LwdCloudHeartbeat(self._lwd_boot_id))
+        lwd_logger.debug(
+            "[cloud] heartbeat sent boot_id=%s edges=%d",
+            self._lwd_boot_id,
+            len(self._lwd_edges),
+        )
 
     def step(self):
         """Same for the synchronous step path: drain the watermark at
