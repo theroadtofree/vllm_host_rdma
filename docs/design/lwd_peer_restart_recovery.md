@@ -261,3 +261,25 @@ as Phase 1 (standards: a replacement is done in one step, docs ride with it).
   AI-written test lists go to the reviewer.
 - vllm and vllm-ascend PRs cross-link; design doc + failure-model flip ride with
   the phase that implements them.
+
+### 7.1 Porting lessons (grows with each incident)
+
+1. **A periodic mechanism is only as alive as its host thread.** The old
+   branch's heartbeat lived on always-running pump/publisher threads; this
+   repo's control plane binds the sender to the engine thread and has no
+   resident business pump. Porting "send a beat every second" onto the
+   engine STEP loop made the heartbeat blind while the engine idles: a
+   healthy idle deployment read as dead on the first request, and the
+   linked teardown destroyed its delivery. The correct host is the
+   input-queue WAKEUP primitive (the heartbeat thread ticks the queue,
+   the engine thread sends — owner-thread contract intact). Rule: before
+   porting any periodic/background behavior, answer WHERE it runs when the
+   system is idle.
+2. **Dynamic-link features must not touch the healthy path.** Every
+   recovery-side addition was audited for normal-path reachability
+   (exception-only, registration-only, or negligible-cost items pass);
+   the one item that reached into the default scenario — the step-loop
+   heartbeat — is exactly the one that broke it. Unit tests passed
+   because each mechanism was correct in isolation; the failing scenario
+   was the INTERACTION (idle bring-up × first request). Regression tests
+   must encode the default scenario shape, not just the mechanism.

@@ -46,8 +46,8 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
+from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
@@ -72,6 +72,14 @@ _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_RETIRED_ROUTE_CAP = 4096
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
+
+
+class _LwdHeartbeatTick:
+    """Input-queue sentinel of the heartbeat thread: the engine thread (the
+    control sender's owner) sends one liveness beat on receipt."""
+
+
+_LWD_HEARTBEAT_TICK = _LwdHeartbeatTick()
 
 
 def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
@@ -298,6 +306,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self._lwd_control_plane.spec.config.hello_interval_s
         )
         self._lwd_last_heartbeat_at = 0.0
+        self._lwd_heartbeat_stop = threading.Event()
+        threading.Thread(
+            target=self._lwd_heartbeat_thread,
+            name="lwd-cloud-heartbeat",
+            daemon=True,
+        ).start()
 
     def _lwd_dp_coordinator_addr(self) -> str:
         """Routable coordinator stats endpoint, or empty without one."""
@@ -481,6 +495,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, _LwdHeartbeatTick
+        ):
+            # Engine thread (the sender's owner): one liveness beat per
+            # interval. The tick comes from the heartbeat thread, which only
+            # touches the input queue — the control sender is bound to this
+            # thread and an idle engine must still step for the beat.
+            self._lwd_send_heartbeat_if_due()
+            return
         if (
             request_type == EngineCoreRequestType.WAKEUP
             and isinstance(request, tuple)
@@ -775,6 +798,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         getattr(self, "_lwd_rejected_nonces", {}).pop(request_id, None)
 
     def shutdown(self) -> None:
+        self._lwd_heartbeat_stop.set()
         super().shutdown()
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
@@ -878,17 +902,29 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         MQ -> gate readiness predicate); the rest is native."""
         self._lwd_poll_coordination()
         self._lwd_drain_irecv_completions()
-        self._lwd_send_heartbeat_if_due()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
         return engine_core_outputs, model_executed
 
+    def _lwd_heartbeat_thread(self) -> None:
+        """Idle-safe liveness beats: an engine with no traffic never steps,
+        so the step loop cannot carry the heartbeat — a silent-but-alive
+        idle cloud would then read as dead on the edge's first step and
+        get its healthy links torn down. This thread only touches the
+        input queue (the control sender is bound to the engine thread):
+        one tick per hello interval wakes the loop and the engine thread
+        sends the beat."""
+        while not self._lwd_heartbeat_stop.wait(self._lwd_hello_interval_s):
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.WAKEUP, _LWD_HEARTBEAT_TICK)
+            )
+
     def _lwd_send_heartbeat_if_due(self) -> None:
-        """One liveness beat per hello interval to every registered edge.
-        Dropped (not retried) on a full outbound queue: the next beat covers
-        the loss, and retrying would block the engine step behind a
-        stalled edge."""
+        """Engine thread: one liveness beat per hello interval to every
+        registered edge. Dropped (not retried) on a full outbound queue:
+        the next beat covers the loss, and retrying would block the engine
+        step behind a stalled edge."""
         now = time.monotonic()
         if now - self._lwd_last_heartbeat_at < self._lwd_hello_interval_s:
             return

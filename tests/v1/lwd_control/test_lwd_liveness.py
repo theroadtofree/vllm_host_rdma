@@ -135,6 +135,48 @@ def test_gate_rejects_only_when_the_routes_are_silent(
     assert engine._lwd_gate_reason("e1-wrapped-req") is not None
 
 
+def test_gate_uses_live_staleness_before_the_first_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep runs at step head: a cloud that went silent while the
+    engine idled must not admit the very request that wakes it."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
+    assert engine._lwd_silent_routes == frozenset()  # no sweep has run
+    assert engine._lwd_gate_reason("plain-req") is not None
+
+
+def test_abort_skips_the_cloud_notify_for_silent_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An abort notify to a silent cloud cannot arrive and would stall the
+    abort behind send retries: it is skipped, the live cloud still gets
+    its notify."""
+    from types import SimpleNamespace
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    monkeypatch.setattr(EngineCoreProc, "abort_requests", lambda self, ids: None)
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine._lwd_probe_manager = SimpleNamespace(abort=lambda request_id: None)
+    engine._lwd_probe_chains = {}
+    engine._lwd_silent_routes = frozenset({CONNECTION})
+    sent: list = []
+    engine.scheduler = SimpleNamespace(
+        lwd_edge_abort=lambda ids: [
+            (CONNECTION, "e0-r1"),
+            (CONNECTION_E1, "e0-r2"),
+        ],
+        requests={"e0-r2": SimpleNamespace(lwd_prefix_nonce=0)},
+    )
+    monkeypatch.setattr(
+        engine, "_lwd_send_to_cloud", lambda dp_idx, message: sent.append(dp_idx)
+    )
+    engine.abort_requests(["e0-r1", "e0-r2"])
+    assert sent == [CONNECTION_E1]
+
+
 def test_registry_fires_every_hook_and_survives_exceptions() -> None:
     fired: list = []
     hooks_module.register_cloud_restart_hook(
@@ -143,6 +185,28 @@ def test_registry_fires_every_hook_and_survives_exceptions() -> None:
     hooks_module.register_cloud_restart_hook(_raising_hook)
     hooks_module.notify_cloud_restarted(1, 0, "test reason")
     assert fired == [("ok", 1)]
+
+
+def test_heartbeat_tick_dispatches_the_beat_to_the_engine_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heartbeat thread only touches the input queue (the control
+    sender is bound to the engine thread); the tick makes the engine
+    thread send the beat."""
+    from vllm.v1.engine import EngineCoreRequestType
+    from vllm.v1.lwd_control.control_cloud_scheduler import (
+        lwd_cloud_engine as cloud_module,
+    )
+
+    engine = object.__new__(LwdCloudEngineCore)
+    beats: list = []
+    monkeypatch.setattr(
+        engine, "_lwd_send_heartbeat_if_due", lambda: beats.append(1)
+    )
+    engine._handle_client_request(
+        EngineCoreRequestType.WAKEUP, cloud_module._LWD_HEARTBEAT_TICK
+    )
+    assert beats == [1]
 
 
 def test_cloud_engine_sends_one_heartbeat_per_interval(

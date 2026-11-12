@@ -523,11 +523,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
 
     def _lwd_gate_reason(self, request_id: str) -> str | None:
-        """Admission gate: None admits, a reason rejects. All routes silent
-        rejects everything; a wrapped id (the edge_share per-frontend
-        prefix) rejects when every connection of its source edge is
-        silent. Requests already routed to a live cloud keep flowing."""
-        silent = self._lwd_silent_routes
+        """Admission gate: None admits, a reason rejects. The frozen sweep
+        snapshot is unioned with a LIVE staleness view: the sweep runs at
+        step head, so a cloud that went silent while the engine idled must
+        not admit the very request that wakes it. All routes silent rejects
+        everything; a wrapped id (the edge_share per-frontend prefix)
+        rejects when every connection of its source edge is silent."""
+        with self._lwd_hello_lock:
+            now = time.monotonic()
+            silent = self._lwd_silent_routes | {
+                connection
+                for connection, last in self._lwd_hello_last.items()
+                if now - last > self._lwd_hello_silent_s
+            }
         if not silent:
             return None
         edge_id, _ = parse_edge_id(request_id)
@@ -548,6 +556,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_probe_chains.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
         for dp_idx, request_id in routed_aborts:
+            if dp_idx in self._lwd_silent_routes:
+                # A silent cloud cannot receive the notify anyway, and its
+                # own bookkeeping dies with the restart/reset; skipping
+                # keeps the abort (and the containment driving it) from
+                # stalling behind the send retries of a dead peer.
+                lwd_logger.error(
+                    "[edge] abort notify skipped req=%s: %s is silent",
+                    request_id,
+                    dp_idx,
+                )
+                continue
             request = self.scheduler.requests.get(request_id)
             self._lwd_send_to_cloud(
                 dp_idx,
