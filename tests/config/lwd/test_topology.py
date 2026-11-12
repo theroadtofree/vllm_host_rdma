@@ -290,6 +290,17 @@ def test_host_layout_rejects_ranks_world_size_and_port_violations(
         LwdTopology.from_dict(raw)
 
 
+def test_host_block_submit_wait_ready_s_default_and_validation() -> None:
+    """The reconnect-window budget defaults to 5 s and must stay positive."""
+    topology = LwdTopology.from_dict(host_payload())
+    assert topology.deployment.data_plane_host is not None
+    assert topology.deployment.data_plane_host.submit_wait_ready_s == 5.0
+    raw = host_payload()
+    raw["deployment"]["data_plane_host"] = {"submit_wait_ready_s": 0.0}
+    with pytest.raises(ValueError, match="submit_wait_ready_s"):
+        LwdTopology.from_dict(raw)
+
+
 @pytest.mark.parametrize(
     "fault,match",
     [

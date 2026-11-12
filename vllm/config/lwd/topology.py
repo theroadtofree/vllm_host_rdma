@@ -29,6 +29,7 @@ LwdId = Annotated[int, Field(strict=True, ge=0)]
 LwdCount = Annotated[int, Field(strict=True, ge=1)]
 LwdPort = Annotated[int, Field(strict=True, ge=1, le=65535)]
 LwdString = Annotated[StrictStr, Field(pattern=r"\S")]
+LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
 def _address(value: str) -> str:
@@ -76,6 +77,12 @@ class LwdHostDataPlane:
 
     down_buffer_size: LwdCount = 32
     """DOWN (cloud->edge) block size in MB; identical on both peers."""
+
+    submit_wait_ready_s: LwdPositiveSeconds = 5.0
+    """Bounded submit-time wait for a link to leave a broken/reconnect
+    window (peer restart, network break): a send landing inside the gap
+    fails fail-fast, so it waits this long first and then proceeds either
+    way. Identical on both peers."""
 
     deployment: Literal["in_process", "sidecar"] = "in_process"
     """"in_process" = the transport runs inside each engine process;
@@ -141,9 +148,6 @@ class LwdScramble:
 class LwdFeatures:
     enable_early_recv: StrictBool = False
     scramble: LwdScramble = Field(default_factory=LwdScramble)
-
-
-LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
