@@ -963,6 +963,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_settle_request(request_id)
         return routed_aborts
 
+    def lwd_edge_up_batch_request_ids(
+        self, connection: LwdConnectionId, seqnos: list[int]
+    ) -> list[str]:
+        """Requests whose UP send failed mid-flight (containment input): the
+        batch entries still sit in the account's pending bookkeeping and
+        release through the abort path that follows this lookup."""
+        account = self._lwd_accounts.get(connection)
+        if account is None:
+            return []
+        request_ids: set[str] = set()
+        for seqno in seqnos:
+            request_ids.update(account.pending_batches.get(seqno, ()))
+        return sorted(request_ids)
+
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
     ) -> bool:

@@ -104,7 +104,23 @@ Phase 1 without Phase 2 means **recovery happens when the peer returns** (new li
 adopted, fingerprint differs); killing the zombie link *before* the peer returns
 is Phase 2's linked teardown.
 
-### 3.3 Phase 2 — control plane: liveness and the availability gate
+### 3.3 Phase 2 — control plane: liveness, failure containment and the availability gate
+
+The old branch shipped liveness and failure containment as one loop with the
+Phase 1 resets; this repo's current failure semantics escalate instead of
+contain, so **Phase 2 starts with the containment half**, or Phase 1's resets
+never get to matter under traffic:
+
+1. **Edge side**: a failed transfer future today raises through the runner
+   into a fatal EngineCore error (the frontend exits with it). Containment
+   means per-request failure: the victim request finishes with
+   `FinishReason.ERROR`, the engine keeps serving.
+2. **Cloud side**: a link break today routes the early-recv error path into
+   `abort_connection`'s permanent `_failed_connections` marking (no un-fail
+   path exists). Containment means a transient drop for mere link errors —
+   the Phase 1 reset then re-enables the connection when the peer returns.
+
+The liveness layer then makes the containment window fast and observable:
 
 The old branch plumbed heartbeat accounting into three ZMQ receive paths (one per
 legacy form); this repo has a single ROUTER/DEALER control plane, so the port lands
@@ -202,9 +218,17 @@ introduced once each; the old `reannounce` is retired in favor of
 
 | Phase | Content | Acceptance |
 | --- | --- | --- |
-| 1 | Data-plane consumption side (§3.2) + registry skeleton | Cloud-restart and edge-restart drills on real machines: the error chains above, no request hang, no leaked pinned buffer |
-| 2 | Control-plane liveness, linked teardown, gate (§3.3) | Zombie-window drill: kill the cloud, confirm teardown fires before the peer returns; gate admits/rejects/releases |
+| 1 | Data-plane consumption side (§3.2) + registry skeleton | Unit tests in full; **idle-window drills**: kill the peer with zero in-flight traffic, restart it, new requests must flow with the error chains below and the survivor process NOT restarting |
+| 2 | Failure containment + control-plane liveness, linked teardown, gate (§3.3) | Traffic-window drills: survivor keeps serving through the outage, victim requests fail within the bounded window (no ~63 s zombie hang), gate admits/rejects/releases |
 | 3 | ROUTER handover + attach runtime (§3.4) | Primary-edge restart drill: attach frontend re-registers, engine revives, requests survive |
+
+The Phase 1 acceptance is deliberately narrow: the survivor's failure
+handling is fatal today (an edge transfer failure kills the engine; a cloud
+link break permanently fails the connection — §3.3 items 1-2), so any drill
+with in-flight traffic at the break degenerates into a full-stack restart
+rather than validating the resets. Idle-window drills verify the Phase 1
+mechanics (wiring, lazy baseline, ledger drop); the traffic-window behavior
+arrives with Phase 2.
 
 Each phase's failure branches are unit-testable without NPU (queue baseline
 reset, ledger drop, MISS logging, gate admit/reject/silent-release); the drills

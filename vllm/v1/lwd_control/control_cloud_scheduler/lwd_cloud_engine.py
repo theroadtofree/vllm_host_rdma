@@ -956,6 +956,20 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 if (
                     isinstance(item, tuple)
                     and len(item) == 4
+                    and item[1] == "link_error"
+                ):
+                    lwd_logger.error(
+                        "[pre-recv] link error on %s at seqno=%s: %s (transient: "
+                        "retiring its requests, connection NOT failed)",
+                        connection,
+                        item[2],
+                        item[3],
+                    )
+                    self._lwd_retire_connection_requests(connection)
+                    continue
+                if (
+                    isinstance(item, tuple)
+                    and len(item) == 4
                     and item[1] == "error"
                 ):
                     self._lwd_fail_connection(connection, item[2], item[3])
@@ -1004,6 +1018,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             seqno,
             error,
         )
+        self._lwd_retire_connection_requests(connection)
+
+    def _lwd_retire_connection_requests(
+        self, connection: LwdConnectionId
+    ) -> None:
+        """Abort every request routed to one connection without deciding
+        whether the connection may come back: the permanent failed marking
+        stays with the caller (a link error retires its in-flight requests
+        but leaves the connection recoverable)."""
         request_ids = [
             request_id
             for request_id, peer in self._lwd_request_routes.items()

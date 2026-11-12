@@ -59,6 +59,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
 )
+from vllm.v1.lwd_control.lwd_exceptions import LwdTransferFailedError
 from vllm.v1.request import Request
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
@@ -392,7 +393,33 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def step_with_batch_queue(self):
         self._lwd_drain_probe_completions()
-        return super().step_with_batch_queue()
+        try:
+            return super().step_with_batch_queue()
+        except LwdTransferFailedError as failure:
+            return self._lwd_contain_transfer_failure(failure)
+
+    def _lwd_contain_transfer_failure(
+        self, failure: LwdTransferFailedError
+    ) -> tuple[list, bool]:
+        """Containment: a mid-batch data-plane failure aborts its requests
+        (each cloud notified through the normal abort path, bookkeeping
+        settled) and the engine keeps stepping instead of dying with the
+        frontend. See docs/design/lwd_peer_restart_recovery.md."""
+        request_ids = failure.req_ids
+        if request_ids is None:
+            request_ids = self.scheduler.lwd_edge_up_batch_request_ids(
+                failure.connection, failure.seqnos
+            )
+        lwd_logger.error(
+            "[edge] transfer failed on %s seqnos=%s: "
+            "aborting %d request(s), engine continues",
+            failure.connection,
+            sorted(failure.seqnos),
+            len(request_ids),
+        )
+        if request_ids:
+            self.abort_requests(request_ids)
+        return [], False
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """Notify each request's original cloud DP, then finish natively."""
