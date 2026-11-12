@@ -17,11 +17,11 @@ from pydantic import (
     AfterValidator,
     ConfigDict,
     Field,
-    model_validator,
     StrictBool,
     StrictStr,
     TypeAdapter,
     field_validator,
+    model_validator,
 )
 from pydantic.dataclasses import dataclass
 
