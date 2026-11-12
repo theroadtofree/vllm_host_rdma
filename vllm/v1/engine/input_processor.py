@@ -16,7 +16,6 @@ from vllm.inputs import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.models.utils import lwd_role_of, lwd_skips_module
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -60,13 +59,7 @@ class InputProcessor:
         self.supports_mm_inputs = mm_registry.supports_multimodal_inputs(model_config)
         self.mm_encoder_cache_size = 0
         self.skip_prompt_length_check = False
-        # [LWD] The cloud role never sees raw multimodal inputs (the edge
-        # owns the vision tower) and its weight split omits the HF processor
-        # files, so probing the multimodal budget there would fail to load
-        # the image processor. Keep the no-multimodal defaults above.
-        if self.supports_mm_inputs and not lwd_skips_module(
-            "visual", lwd_role_of(vllm_config)
-        ):
+        if self.supports_mm_inputs:
             mm_budget = MultiModalBudget(vllm_config, mm_registry)
             self.mm_encoder_cache_size = mm_budget.encoder_cache_size
             self.skip_prompt_length_check = (
