@@ -17,11 +17,11 @@ from pydantic import (
     AfterValidator,
     ConfigDict,
     Field,
+    model_validator,
     StrictBool,
     StrictStr,
     TypeAdapter,
     field_validator,
-    model_validator,
 )
 from pydantic.dataclasses import dataclass
 
@@ -63,71 +63,12 @@ class _UniqueKeyLoader(yaml.SafeLoader):
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class LwdHostDataPlane:
-    """Settings of the host (RoCE) data plane; only meaningful when
-    ``deployment.data_plane_comm`` is ``host``."""
-
-    up_buffer_size: LwdCount | None = None
-    """UP (edge->cloud) block size in MB. Omitted = derived from the model
-    (hidden size, hash layers, ``max_num_batched_tokens``) and rounded up
-    to 32 MiB. Set it only to override the derivation: a value below the
-    derived requirement is accepted with a startup warning, and a frame
-    larger than the block is rejected at submit. Identical on both peers."""
-
-    down_buffer_size: LwdCount = 32
-    """DOWN (cloud->edge) block size in MB; identical on both peers."""
-
-    deployment: Literal["in_process", "sidecar"] = "in_process"
-    """"in_process" = the transport runs inside each engine process;
-    "sidecar" = one dedicated transport daemon per host owns the
-    listeners and engines attach through the ctl socket + shm. Both peers
-    of a link must match."""
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
     scene: Literal["single_instance", "edge_share", "cloud_share", "lwd_cluster"]
+    hccl_world_size: LwdCount
     edges_num: LwdCount
     clouds_num: LwdCount
-    hccl_world_size: LwdCount | None = None
-    data_plane_comm: Literal["device", "host"] = "device"
-    data_plane_host: LwdHostDataPlane | None = None
-    """Host-comm settings block, required when ``data_plane_comm: host``
-    and omitted otherwise — the extension point for future host-plane
-    properties."""
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class LwdQosDataPlane:
-    """QoS of the LWD data plane (host comm: injected into UCX at link
-    init, code-level, no env; device comm ignores these)."""
-
-    traffic_class: Annotated[int, Field(strict=True, ge=0, le=255)] | None = None
-    """RoCEv2 DSCP / IB Traffic Class; None = UCX default (auto -> 106
-    for RoCEv2). Effective QoS needs matching switch PFC/ETS policy,
-    usually paired with ``sl``; identical on both peers."""
-
-    sl: Annotated[int, Field(strict=True, ge=0, le=15)] | None = None
-    """RoCEv2 Ethernet priority (PCP) / IB Service Level; None = UCX
-    default (0). Pair with ``traffic_class``; identical on both peers."""
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class LwdQosCtrlPlane:
-    """QoS of the LWD control plane (ZMQ links, DSCP-marked sockets)."""
-
-    dscp: Annotated[int, Field(strict=True, ge=0, le=63)] | None = None
-    """DSCP mark for control-plane traffic; None = leave sockets
-    unmarked (OS default). Identical on both peers."""
-
-
-@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
-class LwdQoS:
-    """Cross-plane QoS policy of the deployment (top-level ``qos`` block)."""
-
-    data_plane: LwdQosDataPlane | None = None
-    ctrl_plane: LwdQosCtrlPlane | None = None
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -214,11 +155,8 @@ class LwdCoordination:
 class LwdDP:
     dp_idx: LwdId
     addr: Annotated[StrictStr, AfterValidator(_address)]
-    ranks: tuple[LwdId, ...] = ()
-    """Global ranks of this DP. Required when ``data_plane_comm`` is
-    ``device``; omitted in host comm, where no global comm domain exists."""
+    ranks: Annotated[tuple[LwdId, ...], Field(min_length=1)]
     ctrl_port: LwdPort | None = None
-    data_port: LwdPort | None = None
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -267,12 +205,6 @@ class LwdDPConnection:
 
     @property
     def cloud_leader_rank(self) -> int:
-        # Device-comm only: host comm has no ranks (see LwdDP.ranks).
-        if not self.cloud.ranks:
-            raise ValueError(
-                "cloud_leader_rank requires data_plane_comm=device "
-                "(no ranks in host comm)"
-            )
         return self.cloud.ranks[0]
 
 
@@ -283,7 +215,6 @@ class LwdTopology:
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
-    qos: LwdQoS | None = None
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the canonical topology SHA-256 digest."""
@@ -318,11 +249,6 @@ class LwdTopology:
         ).encode("utf-8")
         object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
         return topology
-
-    @property
-    def is_host_comm(self) -> bool:
-        """True when ``data_plane_comm`` is host: edge and cloud are separate worlds."""
-        return self.deployment.data_plane_comm == "host"
 
     @field_validator("edges", "clouds")
     @classmethod
@@ -362,72 +288,10 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] Instances must have matching DP indices and the same DP count"
             )
-        if self.is_host_comm:
-            # No shared HCCL world: the host-specific layout rules apply
-            # instead of the rank-allocation ones.
-            self._validate_host_layout()
-        else:
-            self._validate_ranks()
+        self._validate_ranks()
         self._validate_control_ports()
 
-    def _validate_host_layout(self) -> None:
-        """Layout rules of data_plane_comm=host (no global comm domain).
-
-        Ranks are meaningless and must be omitted everywhere; the cloud
-        is the only listener (one shared listener per cloud DP, edges
-        connect out), so data_port is cloud-only.
-        """
-        for instance in (*self.edges, *self.clouds):
-            if any(dp.ranks for dp in instance.dp):
-                raise ValueError(
-                    "[LWD] ranks must be omitted when "
-                    "data_plane_comm=host (no global comm domain; "
-                    "links are established from addr/data_port)"
-                )
-        if self.deployment.hccl_world_size is not None:
-            raise ValueError(
-                "[LWD] hccl_world_size must be omitted when "
-                "data_plane_comm=host (the edge and cloud are "
-                "separate worlds; their sizes come from their own "
-                "launches)"
-            )
-        for instance in self.edges:
-            if any(dp.data_port is not None for dp in instance.dp):
-                raise ValueError(
-                    "[LWD] data_port is cloud-only (edges connect out and never listen)"
-                )
-        by_addr: dict[str, list[int]] = {}
-        for instance in self.clouds:
-            for dp in instance.dp:
-                if dp.data_port is None:
-                    raise ValueError(
-                        "[LWD] data_port is required on every cloud DP "
-                        "when data_plane_comm=host (ctrl_port is "
-                        "control-plane only)"
-                    )
-                by_addr.setdefault(dp.addr, []).append(dp.data_port)
-        for addr, ports in by_addr.items():
-            if len(ports) != len(set(ports)):
-                raise ValueError(f"[LWD] duplicate data_port on {addr}")
-
     def _validate_ranks(self) -> None:
-        if self.deployment.data_plane_host is not None:
-            raise ValueError(
-                "[LWD] data_plane_host is host-comm-only and must be "
-                "omitted when data_plane_comm=device"
-            )
-        if self.deployment.hccl_world_size is None:
-            raise ValueError(
-                "[LWD] hccl_world_size is required when "
-                "data_plane_comm=device (the edge and cloud share one world)"
-            )
-        for instance in (*self.edges, *self.clouds):
-            for dp in instance.dp:
-                if not dp.ranks:
-                    raise ValueError(
-                        "[LWD] ranks are required on every DP when "
-                        "data_plane_comm=device"
-                    )
         for edge in self.edges:
             if len({(dp.addr, dp.ranks) for dp in edge.dp}) != 1:
                 raise ValueError(
@@ -456,9 +320,7 @@ class LwdTopology:
                     "duplicate or overlapping ranks"
                 )
             ranks.update(dp.ranks)
-        world_size = self.deployment.hccl_world_size
-        assert world_size is not None  # checked above
-        if ranks != set(range(world_size)):
+        if ranks != set(range(self.deployment.hccl_world_size)):
             raise ValueError(
                 "[LWD] Unique ranks must cover [0, hccl_world_size) without gaps"
             )

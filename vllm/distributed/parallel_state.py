@@ -1794,10 +1794,7 @@ def init_distributed_environment(
     config = get_current_vllm_config_or_none()
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if config is not None and config.lwd_config is not None:
-        if not config.lwd_config.topology.is_host_comm:
-            world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
-        # Host comm: keep the native world args computed above (the edge
-        # and cloud are separate launches with no shared LWD world).
+        world_size, rank, distributed_init_method = _lwd_world_args(config, rank)
     elif (
         config is not None
         and config.parallel_config.distributed_executor_backend != "external_launcher"
@@ -2025,13 +2022,9 @@ def initialize_model_parallel(
     from vllm.config import get_current_vllm_config
 
     config = get_current_vllm_config()
-    if config.lwd_config is not None and not config.lwd_config.topology.is_host_comm:
+    if config.lwd_config is not None:
         _lwd_initialize_model_parallel(config, tensor_model_parallel_size, backend)
         return
-    # Host comm (data_plane_comm=host): no shared cross-side world, so the
-    # topology-derived groups do not apply; fall through to the native
-    # init path (each instance builds its own TP/DP groups like a plain
-    # vLLM deployment).
     data_parallel_size = config.parallel_config.data_parallel_size
     enable_elastic_ep = config.parallel_config.enable_elastic_ep
     parallel_config = config.parallel_config
@@ -2317,10 +2310,11 @@ def _lwd_world_args(vllm_config: "VllmConfig", rank: int) -> tuple[int, int, str
     distributed_init_method = get_distributed_init_method(
         parallel_config.master_addr, parallel_config.master_port
     )
-    world_size = lwd_config.topology.deployment.hccl_world_size
-    if world_size is None:
-        raise ValueError("[LWD] hccl_world_size is required for LWD device comm")
-    return (world_size, dp_ranks[rank], distributed_init_method)
+    return (
+        lwd_config.topology.deployment.hccl_world_size,
+        dp_ranks[rank],
+        distributed_init_method,
+    )
 
 
 def _lwd_initialize_model_parallel(
@@ -2358,8 +2352,6 @@ def _lwd_initialize_model_parallel(
     local_rank = get_world_group().local_rank
     tp_groups = [list(group) for group in spec.tp_groups]
     singleton_groups = [list(group) for group in spec.singleton_groups]
-    dp_groups = [list(group) for group in spec.dp_groups]
-    ep_groups = [list(group) for group in spec.ep_groups]
     _TP = init_model_parallel_group(
         tp_groups,
         local_rank,
@@ -2386,7 +2378,7 @@ def _lwd_initialize_model_parallel(
     # collectives span the co-located ranks of every cloud DP.
     is_moe = vllm_config.model_config is None or vllm_config.model_config.is_moe
     _DP = init_model_parallel_group(
-        dp_groups if is_moe else singleton_groups,
+        spec.dp_groups if is_moe else singleton_groups,
         local_rank,
         backend,
         group_name="dp",
@@ -2394,7 +2386,7 @@ def _lwd_initialize_model_parallel(
     if is_moe:
         # Experts sharded dp x tp over each cloud instance, as natively.
         _EP = init_model_parallel_group(
-            ep_groups,
+            spec.ep_groups,
             local_rank,
             backend,
             group_name="ep",
@@ -2402,7 +2394,7 @@ def _lwd_initialize_model_parallel(
         )
         if parallel_config.enable_eplb:
             _EPLB = init_model_parallel_group(
-                ep_groups, local_rank, backend, group_name="eplb"
+                spec.ep_groups, local_rank, backend, group_name="eplb"
             )
     logger.info(
         "[LWD] rank %d in world size %d: TP group %s, data-plane channels %s",

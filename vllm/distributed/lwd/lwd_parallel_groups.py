@@ -128,13 +128,8 @@ class LwdParallelGroupsSpec:
         ]
         # 5. Sorted TP groups make every process create them in the same
         # order.
-        world_size = topology.deployment.hccl_world_size
-        if world_size is None:
-            raise ValueError(
-                "[LWD] hccl_world_size is required for the device data plane"
-            )
         return cls(
-            world_size=world_size,
+            world_size=topology.deployment.hccl_world_size,
             tp_groups=tuple(sorted((*edge_allocations, *cloud_allocations))),
             dp_groups=tuple(dp_groups),
             ep_groups=tuple(ep_groups),
@@ -195,19 +190,6 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             f"[LWD] not supported in edge-cloud mode: {', '.join(unsupported)}"
         )
-    if lwd_config.topology.is_host_comm:
-        # Host comm has no shared HCCL world and no topology ranks; the
-        # rank-allocation checks below are device-only. Each DP is an
-        # independent engine launch, so the parallel sizes must match the
-        # local instance's DP count instead.
-        if parallel_config.data_parallel_size != len(lwd_config.instance.dp):
-            raise ValueError(
-                f"[LWD] data parallel size {parallel_config.data_parallel_size} "
-                f"!= {len(lwd_config.instance.dp)} DPs of {lwd_config.role} "
-                f"instance {lwd_config.instance_id} (host comm: one engine "
-                "launch per DP)"
-            )
-        return
     # Raises for topologies the shared HCCL world cannot host.
     LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     # The topology gives every DP of an instance the same rank count.
