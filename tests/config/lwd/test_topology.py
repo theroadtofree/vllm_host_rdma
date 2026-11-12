@@ -290,17 +290,6 @@ def test_host_layout_rejects_ranks_world_size_and_port_violations(
         LwdTopology.from_dict(raw)
 
 
-def test_host_block_memory_budget_default_and_validation() -> None:
-    """The per-rank host memory budget defaults to 12 GiB and stays positive."""
-    topology = LwdTopology.from_dict(host_payload())
-    assert topology.deployment.data_plane_host is not None
-    assert topology.deployment.data_plane_host.memory_budget_mb == 12 * 1024
-    raw = host_payload()
-    raw["deployment"]["data_plane_host"] = {"memory_budget_mb": 0}
-    with pytest.raises(ValueError, match="memory_budget_mb"):
-        LwdTopology.from_dict(raw)
-
-
 @pytest.mark.parametrize(
     "fault,match",
     [

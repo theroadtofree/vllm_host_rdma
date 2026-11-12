@@ -77,12 +77,6 @@ class LwdHostDataPlane:
     down_buffer_size: LwdCount = 32
     """DOWN (cloud->edge) block size in MB; identical on both peers."""
 
-    memory_budget_mb: LwdCount = 12 * 1024
-    """Per-rank host data-plane memory budget in MB: an estimated need
-    above it (the block pools of every local link) fails startup. Raise
-    it for multi-edge scenes, where one cloud DP serves several edges and
-    the pool count grows linearly with the connection count."""
-
     deployment: Literal["in_process", "sidecar"] = "in_process"
     """"in_process" = the transport runs inside each engine process;
     "sidecar" = one dedicated transport daemon per host owns the

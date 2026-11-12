@@ -25,7 +25,6 @@ deployment:
   data_plane_host:               # host-only block
     up_buffer_size: 128          # MB; omit to derive it from the model
     down_buffer_size: 32         # MB
-    memory_budget_mb: 12288      # MB per rank; raise it for multi-edge scenes
     deployment: in_process       # in_process | sidecar
 edges:
   - id: 0
@@ -45,7 +44,6 @@ qos:
 | `deployment.data_plane_comm` | Transport family; `host` selects this document |
 | `deployment.data_plane_host.up_buffer_size` | UP block in MB. Omitted (`null`) = derived from `hidden_size`, hash layers and `max_num_batched_tokens`, rounded up to 32 MiB |
 | `deployment.data_plane_host.down_buffer_size` | DOWN block in MB, used as configured (default 32) |
-| `deployment.data_plane_host.memory_budget_mb` | Per-rank host memory budget in MB (default 12 GiB): the estimated block-pool need of every local link must fit, else startup fails |
 | `deployment.data_plane_host.deployment` | `in_process` = transport inside each engine; `sidecar` = one transport daemon per host |
 | `dp[].data_port` | Cloud-only, required on every cloud DP in host mode; the edge never listens |
 | `deployment.hccl_world_size`, `dp[].ranks` | Must be omitted in host mode |
@@ -113,7 +111,7 @@ Block size is per direction and must match on both peers; it is verified at hand
 - An explicit value wins; if it is below the derived requirement, startup logs a warning and the frame that does not fit fails later at submit.
 - Unknown model type → fallback 128 MiB with a warning.
 
-Initialization also enforces a per-rank host memory budget (`data_plane_host.memory_budget_mb`, default 12 GiB): `pools × 4 × (up + down)` must fit, otherwise startup fails with the computed numbers rather than exhausting host memory at runtime. Multi-edge scenes raise the pool count linearly (a cloud DP serving E edges owns 2·E pools), so the budget is topology config, not a constant.
+Initialization also enforces a per-rank host memory budget (`_HOST_MEM_BUDGET_MB = 12 GiB`, sized for the multi-instance scenes): `pools × 4 × (up + down)` must fit, otherwise startup fails with the computed numbers rather than exhausting host memory at runtime.
 
 ## QoS
 
@@ -152,7 +150,7 @@ Both peers must carry the same values; effective QoS needs matching switch PFC/E
 | `tests/config/lwd/test_topology.py` | Host layout validation errors and `data_plane_host` misuse |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_block_policy.py` | Block derivation, explicit override, fallback, invalid inputs |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_frame_guard.py` | Submit-time rejection of an oversized frame |
-| `tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py` | Registry layout per scene: one shared listener per cloud DP across edges, sidecar attach, budget and data_port failure branches |
+| `tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py` | Registry layout per scene: one shared listener per cloud DP across edges, sidecar attach, endpoint filtering and the data_port failure branch |
 
 Anything that needs libucp, RoCE hardware or an NPU is verified on the real deployment; see the runbooks in the RFC issue.
 
