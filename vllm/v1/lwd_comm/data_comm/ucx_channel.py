@@ -1312,20 +1312,27 @@ class LwdUcxChannel:
                             f"early={self._early_count}); failing fast"
                         )
                         if os.environ.get("LWD_UCX_STUCK_RAISE", "1") != "0":
+                            # Capture everything BEFORE _fail_all_pending: it
+                            # clears _expects and resets _expects_t0 to 0, so
+                            # evaluating them afterwards reports the process
+                            # uptime instead of the stall duration (observed as
+                            # "waited 28023.1s" for a 13.1s stall).
                             _stuck_tags = sorted(self._expects)
+                            _stuck_s = now - self._expects_t0
+                            _stuck_early = self._early_count
                             self._fail_all_pending(
                                 RuntimeError(
                                     f"ucx channel {self._name} first recv expects "
-                                    f"stuck ({now - self._expects_t0:.1f}s) after "
-                                    f"tags={len(self._expects)} "
+                                    f"stuck ({_stuck_s:.1f}s) after "
+                                    f"tags={len(_stuck_tags)} "
                                     f"min_tag={min(_stuck_tags)}"
                                 )
                             )
                             raise RuntimeError(
                                 f"[ucx-chan] {self._name} first recv expects stuck: "
                                 f"pre-posted tags={_stuck_tags} waited "
-                                f"{now - self._expects_t0:.1f}s with "
-                                f"early={self._early_count} -- fail-fast "
+                                f"{_stuck_s:.1f}s with "
+                                f"early={_stuck_early} -- fail-fast "
                                 f"(LWD_UCX_STUCK_RAISE=0 disables)"
                             )
                 logger.warning(
