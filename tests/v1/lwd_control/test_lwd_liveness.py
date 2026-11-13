@@ -326,3 +326,32 @@ def test_edge_send_to_cloud_drops_for_an_unreachable_peer(
 
     monkeypatch.setattr(engine, "_lwd_send", send)
     engine._lwd_send_to_cloud(CONNECTION, LwdAbortNotify("req-1", 0))  # no raise
+
+
+def test_edge_reregistration_resets_the_connection_seqno_books(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (fifth incident): a restarted edge's seqno stream restarts
+    at 0 while _lwd_latest_seqnos kept the old incarnation's high-water
+    mark — the new stream's first RangeNotify was dropped as a duplicate
+    and the request hung with its UP frame already sent."""
+    from types import SimpleNamespace
+
+    from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
+
+    engine = object.__new__(LwdCloudEngineCore)
+    engine._lwd_edges = set()
+    engine._lwd_cloud_params = SimpleNamespace()
+    engine._lwd_latest_seqnos = {CONNECTION: 3}
+    engine._lwd_pending_seqnos = {CONNECTION: {3: {"old-req"}}}
+    engine.lwd_config = SimpleNamespace(instance_id=0)
+    sent: list = []
+    monkeypatch.setattr(
+        engine, "_lwd_send_until_queued", lambda peer, message: sent.append(peer)
+    )
+    engine._lwd_handle_peer_registered(LwdPeer(instance_id=0, dp_rank=0))
+    # The old incarnation's seqno books are gone; the new stream's
+    # seqno=0 passes the duplicate gate (0 > -1).
+    assert engine._lwd_latest_seqnos == {}
+    assert engine._lwd_pending_seqnos == {}
+    assert len(sent) == 1  # scheduling limits still go out first

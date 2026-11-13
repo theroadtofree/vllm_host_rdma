@@ -335,6 +335,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
         self._lwd_edges.add(peer)
+        # A (re)registered edge is a NEW process incarnation: its seqno
+        # streams restart from zero, so the connection's old-incarnation
+        # bookkeeping must not gate the new one. _lwd_latest_seqnos kept
+        # the old stream's high-water mark, dropping the new stream's
+        # first RangeNotify as a "duplicate" — the request hung with its
+        # UP frame already sent and nothing posted to receive it. (This
+        # callback fires only for a fresh registration or a session
+        # replacement, never for the same process's retried hellos, so
+        # the reset cannot fire on a mere link blip.)
+        connection = self._lwd_connection_of(peer)
+        self._lwd_latest_seqnos.pop(connection, None)
+        self._lwd_pending_seqnos.pop(connection, None)
         self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
             "[cloud] edge %s registered; scheduling limits sent: %s",
