@@ -752,7 +752,14 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
         for connection_id, handshake in self._handshakes.items():
-            if handshake.completed or not handshake.should_send_hello(now):
+            # The periodic HELLO never stops at a completed handshake: it
+            # doubles as re-registration. A restarted cloud's ROUTER holds
+            # no session until the next HELLO arrives — a completed-forever
+            # gate left the edge registered only in its own view while the
+            # cloud never learned the edge again (no heartbeat, no business
+            # routing, a permanent admission gate). The cloud dedupes
+            # same-session retries (refresh + re-accept, registered=False).
+            if not handshake.should_send_hello(now):
                 continue
             hello = lwd_encode_link_message(handshake.hello)
             link_index = self._link_indices[connection_id]

@@ -137,12 +137,14 @@ on **one** receive path.
   cloud DP's data-plane links (force reconnect; in-flight ops fail fast), closing
   the "control plane recovered, data plane still zombie" window;
 - `boot_id` change fires the same notification with that reason;
-- **reannounce** (old registry-form-specific re-handshake) is expected to be
-  absorbed by this plane's existing registration retry — the edge already retries
-  registration until the cloud answers (`hello_retry_interval_s`). Verify during
-  the port; if the cloud's ready table stays empty after restart so it never
-  answers, add a re-register trigger on silent detection rather than a new
-  channel concept;
+- **reannounce** is absorbed by this plane's periodic HELLO — verified the
+  hard way: `_on_tick` originally stopped re-sending HELLO once the
+  handshake completed, so a restarted cloud's ROUTER never saw the edge
+  again (silent forever, permanent gate) even though `should_send_hello`
+  documented "HELLO doubles as registration and the application
+  heartbeat". The tick gate now honors that contract: HELLO flows every
+  `hello_retry_interval_s` forever, and the cloud dedupes same-session
+  retries (refresh + re-accept, `registered=False`).
 - **Availability gate**: the edge engine's admission check rejects new requests
   with `FinishReason.ERROR` while every known route is silent (partial silence
   rejects only requests whose target group is silent). The gate releases on the
