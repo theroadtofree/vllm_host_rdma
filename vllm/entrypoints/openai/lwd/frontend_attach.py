@@ -23,6 +23,7 @@ import json
 import os
 import signal
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +45,16 @@ _MSG_ENDPOINTS = "LWD_FRONTEND_ENDPOINTS"
 _MSG_BARRIER = "LWD_FRONTEND_BARRIER"
 _MSG_ERROR = "LWD_FRONTEND_ERROR"
 _POLL_INTERVAL_S = 1.0
+# Re-register watchdog cadence: while the primary lives each round is a
+# silent no-op; after a primary restart the next round releases its startup
+# barrier (old-branch invariant: barrier for startup, resident rounds for
+# runtime).
+_REREGISTER_INTERVAL_S = 10.0
+_REREGISTER_TIMEOUT_S = 5.0
+# Captured by run_attach_api_server for the re-register watchdog: the args
+# namespace and listen address are stable for the process lifetime.
+_WATCHDOG_ARGS: Any = None
+_WATCHDOG_LISTEN: tuple[str, int] = ("0.0.0.0", 0)
 
 # Engine-affecting options explicitly set by an attach command must agree with
 # the primary. Listen, HTTP transport, attachment plumbing, and unused engine
@@ -293,6 +304,10 @@ class FrontendAttachServer:
         self.stats_update_address: str | None = None
         self._listen_addresses = {0: main_listen}
         self._accepted: set[int] = set()
+        # client_index -> pid of the live attached process: distinguishes a
+        # restarted frontend (new pid -> reset stale state) from the
+        # watchdog's routine re-registration (same pid -> silent no-op).
+        self._accepted_pids: dict[int, Any] = {}
         self._reported: dict[int, tuple[str, str]] = {}
         self._ctx = zmq.Context()
         self._socket = make_zmq_socket(
@@ -378,13 +393,32 @@ class FrontendAttachServer:
             )
             return
         if index in self._accepted:
-            reply(
-                {
-                    "type": _MSG_ERROR,
-                    "reason": f"client_index {index} is already attached",
-                }
+            if message.get("pid") == self._accepted_pids.get(index):
+                # Routine watchdog round from the same live process: the
+                # primary is healthy, nothing changed — silent no-op.
+                reply(
+                    {
+                        "type": _MSG_ACCEPT,
+                        "client_count": self.client_count,
+                        "stats_update_address": self.stats_update_address,
+                        "frontend_args": self.frontend_args_payload,
+                    }
+                )
+                return
+            # A restarted attach frontend re-registers with the same index:
+            # the old process is gone, so reset its stale state instead of
+            # starving the re-registration (its listen address and reported
+            # endpoints belonged to the dead process).
+            logger.info(
+                "LWD attach frontend %d restarted (pid %s -> %s); "
+                "resetting prior state",
+                index,
+                self._accepted_pids.get(index),
+                message.get("pid"),
             )
-            return
+            self._accepted.discard(index)
+            self._reported.pop(index, None)
+            self._listen_addresses.pop(index, None)
         remote_payload = message.get("config_payload")
         if not isinstance(remote_payload, dict):
             reply({"type": _MSG_ERROR, "reason": "missing config_payload"})
@@ -415,6 +449,7 @@ class FrontendAttachServer:
                 return
         self._listen_addresses[index] = (listen_host, listen_port)
         self._accepted.add(index)
+        self._accepted_pids[index] = message.get("pid")
         logger.info(
             "Accepted LWD attach frontend %d (pid %s)", index, message.get("pid")
         )
@@ -433,8 +468,14 @@ class FrontendAttachServer:
             reply({"type": _MSG_ERROR, "reason": "frontend has not attached"})
             return
         if index in self._reported:
-            reply({"type": _MSG_ERROR, "reason": "endpoints already supplied"})
-            return
+            # Re-report from a live frontend (a restarted primary's fresh
+            # barrier is repopulated by this): replace the stale entry
+            # instead of rejecting — the endpoints are stable while the
+            # frontend lives.
+            logger.debug(
+                "LWD attach frontend %d re-reported endpoints; replacing",
+                index,
+            )
         input_address = message.get("input_address")
         output_address = message.get("output_address")
         if not _valid_zmq_address(input_address) or not _valid_zmq_address(
@@ -444,6 +485,32 @@ class FrontendAttachServer:
             return
         self._reported[index] = (input_address, output_address)
         reply({"type": _MSG_BARRIER, "client_index": index})
+
+    def serve_background(self) -> None:
+        """Answer (re)registrations for the rest of the process lifetime.
+
+        The startup barrier only covers launch: an attach frontend
+        restarted at runtime must be able to re-register, which a closed
+        server would starve (barrier for startup, resident service for
+        runtime)."""
+        if self._closed:
+            return
+        threading.Thread(
+            target=self._serve_forever,
+            name="lwd-frontend-attach-server",
+            daemon=True,
+        ).start()
+
+    def _serve_forever(self) -> None:
+        while not self._closed:
+            try:
+                events = self._socket.poll(_POLL_INTERVAL_S * 1000)
+            except zmq.ZMQError:
+                return  # closed at shutdown
+            while events:
+                identity, payload = self._socket.recv_multipart()
+                self._handle_message(identity, payload)
+                events = self._socket.poll(0)
 
     def close(self) -> None:
         if self._closed:
@@ -464,16 +531,18 @@ class FrontendAttachServer:
 class FrontendAttachClient:
     """Non-primary frontend's half of the native endpoint barrier."""
 
-    def __init__(self, endpoint: str):
+    def __init__(self, endpoint: str, recv_timeout_s: float | None = None):
         host, port = parse_endpoint(endpoint, "--api-server-attach")
         self.main_address = get_tcp_uri(host, port)
         self._ctx = zmq.Context()
         self._socket = make_zmq_socket(
             self._ctx, self.main_address, zmq.DEALER, bind=False, linger=0
         )
-        self._socket.setsockopt(
-            zmq.RCVTIMEO, int(envs.VLLM_ENGINE_READY_TIMEOUT_S * 1000)
-        )
+        if recv_timeout_s is None:
+            timeout = envs.VLLM_ENGINE_READY_TIMEOUT_S
+        else:
+            timeout = recv_timeout_s
+        self._socket.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
         self._closed = False
 
     def _roundtrip(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -563,6 +632,12 @@ def run_attach_api_server(args: Any) -> None:
     """Run one non-primary API frontend without launching local engines."""
     plan = resolve_attach_plan(args)
     assert plan is not None and plan.mode == "attach"
+    # Watchdog rounds run after this function's scope: capture the config
+    # payload and listen address now (both are stable for the process
+    # lifetime — the payload derives from CLI args, the listen from args).
+    global _WATCHDOG_ARGS, _WATCHDOG_LISTEN
+    _WATCHDOG_ARGS = args
+    _WATCHDOG_LISTEN = _resolve_listen(args)
     with FrontendAttachClient(plan.endpoint) as client:
         accepted = client.attach(
             plan.client_index,
@@ -597,13 +672,21 @@ def run_attach_api_server(args: Any) -> None:
 
         listen_address, sock = setup_server(args, reuse_port=False)
         bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
+        # Deterministic engine IO ports (old-branch invariant): a restarted
+        # attach frontend rebinds the SAME port, so the running engine's
+        # DEALER/PUSH reconnect transparently — ephemeral ports would leave
+        # the engine connected to the dead process's address. The primary's
+        # index 0 uses the standard allocation; attach indices derive from
+        # the registration endpoint's port.
+        reg_port = parse_endpoint(plan.endpoint, "--api-server-attach")[1]
+        engine_io_base = reg_port + 1000 + 2 * plan.client_index
         manager = APIServerProcessManager(
             listen_address=listen_address,
             sock=sock,
             args=args,
             num_servers=1,
-            input_addresses=[get_tcp_uri(bind_ip, 0)],
-            output_addresses=[get_tcp_uri(bind_ip, 0)],
+            input_addresses=[get_tcp_uri(bind_ip, engine_io_base)],
+            output_addresses=[get_tcp_uri(bind_ip, engine_io_base + 1)],
             stats_update_address=accepted.get("stats_update_address"),
             client_count=client_count,
             client_indices=[plan.client_index],
@@ -611,9 +694,56 @@ def run_attach_api_server(args: Any) -> None:
         try:
             inputs, outputs = manager.gather_actual_addresses()
             client.report_endpoints(plan.client_index, inputs[0], outputs[0])
+            _start_reregister_watchdog(plan, inputs[0], outputs[0])
             wait_for_completion_or_failure(api_server_manager=manager)
         finally:
             manager.shutdown()
+
+
+def _start_reregister_watchdog(
+    plan: FrontendAttachPlan,
+    input_address: str,
+    output_address: str,
+) -> None:
+    """Primary-restart self-healing (old-branch invariant): re-register on
+    a fixed cadence with an independent short connection per round. While
+    the primary lives each round is a silent no-op; after a primary restart
+    the next round re-attaches and re-reports, releasing the new primary's
+    startup barrier. Runs until the process exits (daemon)."""
+
+    def loop() -> None:
+        while True:
+            time.sleep(_REREGISTER_INTERVAL_S)
+            try:
+                with FrontendAttachClient(
+                    plan.endpoint, recv_timeout_s=_REREGISTER_TIMEOUT_S
+                ) as client:
+                    client.attach(
+                        plan.client_index,
+                        compute_attach_config_payload(
+                            _resolve_watchdog_args(), plan
+                        ),
+                        _resolve_watchdog_listen(),
+                    )
+                    client.report_endpoints(
+                        plan.client_index, input_address, output_address
+                    )
+            except Exception:
+                logger.debug(
+                    "LWD attach re-registration round failed (primary down?); "
+                    "retrying next tick",
+                    exc_info=True,
+                )
+
+    threading.Thread(target=loop, name="lwd-attach-reregister", daemon=True).start()
+
+
+def _resolve_watchdog_args() -> Any:
+    return _WATCHDOG_ARGS
+
+
+def _resolve_watchdog_listen() -> tuple[str, int]:
+    return _WATCHDOG_LISTEN
 
 
 def lwd_dispatch_attach_frontend(args: Any) -> bool:
@@ -662,6 +792,10 @@ def wait_for_attach_registrations(
     for client_index, (input_address, output_address) in reported.items():
         addresses.inputs[client_index] = input_address
         addresses.outputs[client_index] = output_address
+    # The barrier covered startup; runtime re-registrations (a restarted
+    # attach frontend, or a restarted primary's watchdog rounds) are served
+    # by the resident thread.
+    registration_server.serve_background()
 
 
 def attach_scope(registration_server: FrontendAttachServer | None) -> Any:
