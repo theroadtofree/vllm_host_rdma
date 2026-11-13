@@ -746,7 +746,7 @@ class LwdUcxChannel:
         self._q.put(("send", tag, addr, len(data), op))
         return op
 
-    def acquire_staging(self) -> LwdUcxBlock:
+    def acquire_staging(self, timeout: float | None = None) -> LwdUcxBlock | None:
         """Send-direction channel: take a pool block for D2H staging
         (pool_staging channels only).
 
@@ -757,15 +757,24 @@ class LwdUcxChannel:
         any thread, typically the assembly layer send thread. Raises once
         the channel shuts down. The block .buf/.addr mean the same as on
         a receive block (the rcache registers it on the first send).
+
+        ``timeout`` (seconds) caps the wait: on expiry None is returned
+        and the caller retries — used by the sender-side stall watchdog,
+        which dumps stacks while the pool is starved without breaking the
+        backpressure semantics. None (default) blocks forever (old
+        behaviour).
         """
         if not self._pool_staging:
             raise RuntimeError(f"acquire_staging on non-staging channel {self._name}")
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             blk = self._pool.get(timeout=0.05)
             if blk is not None:
                 return blk
             if self._stopped:
                 raise RuntimeError(f"staging wait aborted (shutdown) on {self._name}")
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
     def release_staging(self, blk: LwdUcxBlock) -> None:
         """Return a staging block (called from the send completion

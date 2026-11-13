@@ -51,9 +51,10 @@ class LwdUcxTransportPort(Protocol):
     """Transport port of one channel (engine-side view; method contracts
     in LwdUcxChannel)."""
 
-    def acquire_staging(self) -> Any:
+    def acquire_staging(self, timeout: float | None = None) -> Any:
         """Take a staging block from the pool for D2H (blocks until one is
-        free; raises on shutdown)."""
+        free; raises on shutdown). ``timeout`` caps the wait and returns
+        None on expiry (stall-watchdog retry loop)."""
         ...
 
     def release_staging(self, blk: Any) -> None:
@@ -477,7 +478,8 @@ class LwdUcxDaemonPort:
     # ------------------------------------------------------------------ #
     # protocol methods (LwdUcxTransportPort)                             #
     # ------------------------------------------------------------------ #
-    def acquire_staging(self) -> Any:
+    def acquire_staging(self, timeout: float | None = None) -> Any:
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._staging_cond:
                 if self._free_staging:
@@ -486,6 +488,8 @@ class LwdUcxDaemonPort:
                 if self._stopped:
                     raise RuntimeError("staging wait aborted (shutdown)")
                 self._staging_cond.wait(timeout=0.05)
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
 
     def release_staging(self, blk: Any) -> None:
         """Engine-side release entry (error path; normally done by
