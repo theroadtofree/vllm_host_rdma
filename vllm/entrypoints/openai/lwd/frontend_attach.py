@@ -799,6 +799,13 @@ def wait_for_attach_registrations(
 
 
 def attach_scope(registration_server: FrontendAttachServer | None) -> Any:
-    if registration_server is None:
-        return contextlib.nullcontext()
-    return registration_server
+    """The registration server outlives the STARTUP with-block: the scope's
+    exit runs as soon as the startup barrier collects (the serve loop runs
+    outside the with), and closing there left nothing listening on the
+    registration endpoint — an attach frontend restarted at runtime hung
+    forever on its ATTACH reply. The resident `serve_background` thread
+    owns the socket for the rest of the process lifetime (old-branch
+    invariant: barrier for startup, resident service for runtime; the
+    daemon thread and process exit release it)."""
+    del registration_server
+    return contextlib.nullcontext()

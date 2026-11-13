@@ -157,3 +157,16 @@ def test_serve_background_thread_is_daemon(monkeypatch: pytest.MonkeyPatch) -> N
     assert thread.daemon
     assert polls  # the resident loop is polling
     server._closed = True
+
+
+def test_attach_scope_does_not_close_the_registration_server() -> None:
+    """Regression (seventh incident): the serve with-block exits as soon as
+    the startup barrier collects — the scope must not close the server on
+    exit, or nothing listens on the registration endpoint and a restarted
+    attach frontend hangs forever on its ATTACH reply."""
+    from vllm.entrypoints.openai.lwd.frontend_attach import attach_scope
+
+    server = _server()
+    with attach_scope(server):
+        pass
+    assert not server._closed
