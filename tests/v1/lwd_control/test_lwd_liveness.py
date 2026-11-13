@@ -45,6 +45,14 @@ def _raising_hook(cloud_id: int, dp_idx: int, reason: str) -> None:
     raise RuntimeError("hook boom")
 
 
+class _RecordingQueue:
+    def __init__(self) -> None:
+        self.items: list = []
+
+    def put_nowait(self, item) -> None:  # noqa: ANN001
+        self.items.append(item)
+
+
 def _edge_engine(
     monkeypatch: pytest.MonkeyPatch, connections, notified: list
 ) -> LwdEdgeEngineCore:
@@ -147,6 +155,25 @@ def test_gate_uses_live_staleness_before_the_first_sweep(
     assert engine._lwd_gate_reason("plain-req") is not None
 
 
+def test_gate_rejection_uses_the_abort_channel_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (duplicate request id): the gate must NOT enqueue the
+    request itself — the caller enqueues unconditionally after admission,
+    so the rejection goes through aborts_queue alone (drained at the next
+    step head, after the single enqueue entered the scheduler)."""
+    from types import SimpleNamespace
+
+    engine = _edge_engine(monkeypatch, [CONNECTION], [])
+    engine._lwd_silent_routes = frozenset({CONNECTION})
+    engine.aborts_queue = _RecordingQueue()
+    engine.input_queue = _RecordingQueue()
+    request = SimpleNamespace(request_id="plain-req", client_index=0)
+    engine._lwd_admit_and_notify(request, None)
+    assert engine.aborts_queue.items == [["plain-req"]]
+    assert engine.input_queue.items == []  # the caller owns the single enqueue
+
+
 def test_abort_skips_the_cloud_notify_for_silent_connections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,9 +227,7 @@ def test_heartbeat_tick_dispatches_the_beat_to_the_engine_thread(
 
     engine = object.__new__(LwdCloudEngineCore)
     beats: list = []
-    monkeypatch.setattr(
-        engine, "_lwd_send_heartbeat_if_due", lambda: beats.append(1)
-    )
+    monkeypatch.setattr(engine, "_lwd_send_heartbeat_if_due", lambda: beats.append(1))
     engine._handle_client_request(
         EngineCoreRequestType.WAKEUP, cloud_module._LWD_HEARTBEAT_TICK
     )

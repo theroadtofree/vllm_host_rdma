@@ -317,21 +317,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> None:
         gate_reason = self._lwd_gate_reason(request.request_id)
         if gate_reason is not None:
-            # Availability gate (peer-restart line): enqueue first so the
-            # FIFO-ordered ABORT finds the request in the scheduler, then
-            # reject through the abort channel (the cloud's failure
-            # isolation pattern) — a fast, retryable client-visible finish
-            # instead of a zombie-link hang.
+            # Availability gate (peer-restart line): reject through the abort
+            # channel — aborts_queue is drained at the NEXT step head, after
+            # the caller's single native enqueue has entered the scheduler,
+            # so the abort finds the request exactly once and the client
+            # gets a fast, retryable finish instead of a zombie-link hang.
+            # (Enqueueing HERE as well double-adds the request: the caller
+            # enqueues unconditionally after this returns.)
             lwd_logger.error(
                 "[edge] request rejected req=%s: %s",
                 request.request_id,
                 gate_reason,
             )
-            self._lwd_enqueue_request(request)
             self.aborts_queue.put_nowait([request.request_id])
-            self.input_queue.put_nowait(
-                (EngineCoreRequestType.ABORT, [request.request_id])
-            )
             return
         dp_idx = self.scheduler.lwd_admit_request(request, preferred)
         client = self._lwd_coord_clients.get(dp_idx)
