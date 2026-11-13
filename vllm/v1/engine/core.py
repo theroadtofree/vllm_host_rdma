@@ -1774,11 +1774,24 @@ class EngineCoreProc(EngineCore):
             poller = zmq.Poller()
             ready_response = self._make_ready_response()
             ready_payload = msgspec.msgpack.encode(ready_response)
+            # A frontend restarted at runtime rebinds its input ROUTER (the
+            # deterministic engine IO port) and its fresh MPClient waits for
+            # this engine's READY — but READY is sent ONCE, below. The DEALER
+            # reconnect is the engine's only visibility into the frontend's
+            # return, so every (re)connection re-sends it. An already-settled
+            # frontend leaves the extra frame in its ROUTER queue, unread and
+            # harmless; MPClient tolerates the duplicate during init.
+            monitors: dict[zmq.Socket, zmq.Socket] = {}
             for input_socket in input_sockets:
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
                 input_socket.send(ready_payload)
+                monitor = stack.enter_context(
+                    input_socket.get_monitor_socket(zmq.EVENT_CONNECTED)
+                )
+                monitors[monitor] = input_socket
+                poller.register(monitor, zmq.POLLIN)
                 poller.register(input_socket, zmq.POLLIN)
 
             if coord_socket is not None:
@@ -1789,13 +1802,23 @@ class EngineCoreProc(EngineCore):
             ready_event.set()
             del ready_event
             while True:
-                for input_socket, _ in poller.poll():
+                for polled, _ in poller.poll():
+                    reconnected = monitors.get(polled)
+                    if reconnected is not None:
+                        # Monitor frames are (event, value); CONNECTED only.
+                        polled.recv_multipart()
+                        logger.info(
+                            "Input socket reconnected; re-sending READY "
+                            "(frontend may have restarted)"
+                        )
+                        reconnected.send(ready_payload)
+                        continue
                     # (RequestType, RequestData)
-                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    type_frame, *data_frames = polled.recv_multipart(copy=False)
                     # NOTE(yongji): ignore READY message sent by DP coordinator
                     # that is used to notify newly started engines
                     if type_frame.buffer == b"READY":
-                        assert input_socket == coord_socket
+                        assert polled == coord_socket
                         continue
                     request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 

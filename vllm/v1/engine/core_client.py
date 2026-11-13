@@ -727,7 +727,13 @@ class MPClient(EngineCoreClient):
                         f"VLLM_ENGINE_READY_TIMEOUT_S=<seconds>"
                     )
                 identity, payload = sync_input_socket.recv_multipart()
-                identities.remove(identity)
+                if identity not in identities:
+                    # A duplicate READY: the engine re-sends it on every
+                    # DEALER (re)connection, so the initial send and the
+                    # first connect event can both land here — already
+                    # counted, harmless.
+                    continue
+                identities.discard(identity)
                 self._apply_ready_response(payload)
 
             self.core_engine: EngineIdentity = self.core_engines[0]
