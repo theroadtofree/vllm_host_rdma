@@ -1774,23 +1774,39 @@ class EngineCoreProc(EngineCore):
             poller = zmq.Poller()
             ready_response = self._make_ready_response()
             ready_payload = msgspec.msgpack.encode(ready_response)
+            # First-hand evidence for frontend-restart drills: the exact
+            # addresses this input thread actually holds. A wrong, stale or
+            # placeholder address surfaces here instead of as silently
+            # evaporating requests.
+            logger.error(
+                "[Core] input thread up: %d frontend(s), identity=%s, addresses=%s",
+                len(input_sockets),
+                identity.hex(),
+                list(input_addresses),
+            )
             # A frontend restarted at runtime rebinds its input ROUTER (the
             # deterministic engine IO port) and its fresh MPClient waits for
             # this engine's READY — but READY is sent ONCE, below. The DEALER
             # reconnect is the engine's only visibility into the frontend's
             # return, so every (re)connection re-sends it. An already-settled
             # frontend leaves the extra frame in its ROUTER queue, unread and
-            # harmless; MPClient tolerates the duplicate during init.
-            monitors: dict[zmq.Socket, zmq.Socket] = {}
-            for input_socket in input_sockets:
+            # harmless; MPClient tolerates the duplicate during init. The
+            # disconnect/retry events complete the connection-layer evidence
+            # for restart drills (a message that never arrives while the
+            # address is correct means the connection itself never came up).
+            monitor_events = (
+                zmq.EVENT_CONNECTED | zmq.EVENT_CONNECT_RETRIED | zmq.EVENT_DISCONNECTED
+            )
+            ready_monitors: dict[zmq.Socket, tuple[zmq.Socket, str]] = {}
+            for input_socket, input_address in zip(input_sockets, input_addresses):
                 # Send initial message to each input socket - this is required
                 # before the front-end ROUTER socket can send input messages
                 # back to us.
                 input_socket.send(ready_payload)
                 monitor = stack.enter_context(
-                    input_socket.get_monitor_socket(zmq.EVENT_CONNECTED)
+                    input_socket.get_monitor_socket(monitor_events)
                 )
-                monitors[monitor] = input_socket
+                ready_monitors[monitor] = (input_socket, input_address)
                 poller.register(monitor, zmq.POLLIN)
                 poller.register(input_socket, zmq.POLLIN)
 
@@ -1801,61 +1817,120 @@ class EngineCoreProc(EngineCore):
 
             ready_event.set()
             del ready_event
+            input_address_of = dict(zip(input_sockets, input_addresses))
+            frame_trace_interval_s = 5.0
+            frame_trace_last = 0.0
+            retry_log_interval_s = 60.0
+            retry_log_last: dict[zmq.Socket, float] = {}
             while True:
-                for polled, _ in poller.poll():
-                    reconnected = monitors.get(polled)
-                    if reconnected is not None:
-                        # Monitor frames are (event, value); CONNECTED only.
-                        polled.recv_multipart()
-                        logger.info(
-                            "Input socket reconnected; re-sending READY "
-                            "(frontend may have restarted)"
-                        )
-                        reconnected.send(ready_payload)
-                        continue
-                    # (RequestType, RequestData)
-                    type_frame, *data_frames = polled.recv_multipart(copy=False)
-                    # NOTE(yongji): ignore READY message sent by DP coordinator
-                    # that is used to notify newly started engines
-                    if type_frame.buffer == b"READY":
-                        assert polled == coord_socket
-                        continue
-                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+                # The input thread is a daemon: an uncaught exception would
+                # kill it silently and every frontend request would hang
+                # with no error anywhere. Contain it as a visible engine
+                # failure instead.
+                try:
+                    for polled, _ in poller.poll():
+                        now = time.monotonic()
+                        if now - frame_trace_last >= frame_trace_interval_s:
+                            frame_trace_last = now
+                            input_address = input_address_of.get(polled)
+                            if input_address is not None:
+                                logger.debug(
+                                    "[Core] input frame received on %s",
+                                    input_address,
+                                )
+                        target = ready_monitors.get(polled)
+                        if target is not None:
+                            # Monitor frames are (event|value, endpoint).
+                            frames = polled.recv_multipart()
+                            event = int.from_bytes(bytes(frames[0])[:2], "little")
+                            input_socket, input_address = target
+                            if event == zmq.EVENT_CONNECTED:
+                                input_socket.send(ready_payload)
+                                logger.error(
+                                    "[Core] input DEALER connected to %s; "
+                                    "READY sent (frontend restart self-heal)",
+                                    input_address,
+                                )
+                            elif event == zmq.EVENT_DISCONNECTED:
+                                logger.error(
+                                    "[Core] input DEALER disconnected from "
+                                    "%s (frontend gone; awaiting its return)",
+                                    input_address,
+                                )
+                            elif (
+                                now - retry_log_last.get(polled, 0.0)
+                                >= retry_log_interval_s
+                            ):
+                                retry_log_last[polled] = now
+                                logger.error(
+                                    "[Core] input DEALER connection to %s "
+                                    "still retrying; frontend not bound or "
+                                    "unreachable, its ROUTER drops the "
+                                    "messages",
+                                    input_address,
+                                )
+                            continue
+                        # (RequestType, RequestData)
+                        type_frame, *data_frames = polled.recv_multipart(copy=False)
+                        # NOTE(yongji): ignore READY message sent by DP coordinator
+                        # that is used to notify newly started engines
+                        if type_frame.buffer == b"READY":
+                            assert polled == coord_socket
+                            continue
+                        request_type = EngineCoreRequestType(bytes(type_frame.buffer))
 
-                    # Deserialize the request data.
-                    request: Any
-                    if request_type == EngineCoreRequestType.ADD:
-                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
-                        try:
-                            request = self.preprocess_add_request(req)
-                        except MultiModalCacheMissError as e:
-                            # P0/P1 shadow drift -- return a retryable signal (P0
-                            # drops the stale entry, client resends with data).
-                            self._handle_mm_cache_miss(req, e)
-                            continue
-                        except Exception:
-                            self._handle_request_preproc_error(req)
-                            continue
-                    elif request_type == EngineCoreRequestType.UTILITY:
-                        request = generic_decoder.decode(data_frames)
-                        client_idx, call_id, method, args = request
-                        if method == FT_UTILITY_METHOD:
-                            self.ft_sentinel.handle_command(
-                                client_idx, call_id, args[0]
+                        # Deserialize the request data.
+                        request: Any
+                        if request_type == EngineCoreRequestType.ADD:
+                            req: EngineCoreRequest = add_request_decoder.decode(
+                                data_frames
                             )
-                            continue
-                    else:
-                        request = generic_decoder.decode(data_frames)
+                            logger.debug(
+                                "[Core] input ADD req=%s client=%d",
+                                req.request_id,
+                                req.client_index,
+                            )
+                            try:
+                                request = self.preprocess_add_request(req)
+                            except MultiModalCacheMissError as e:
+                                # P0/P1 shadow drift -- return a retryable signal (P0
+                                # drops the stale entry, client resends with data).
+                                self._handle_mm_cache_miss(req, e)
+                                continue
+                            except Exception:
+                                self._handle_request_preproc_error(req)
+                                continue
+                        elif request_type == EngineCoreRequestType.UTILITY:
+                            request = generic_decoder.decode(data_frames)
+                            client_idx, call_id, method, args = request
+                            if method == FT_UTILITY_METHOD:
+                                self.ft_sentinel.handle_command(
+                                    client_idx, call_id, args[0]
+                                )
+                                continue
+                        else:
+                            request = generic_decoder.decode(data_frames)
 
-                        if request_type == EngineCoreRequestType.ABORT:
-                            # Aborts are added to *both* queues, allows us to eagerly
-                            # process aborts while also ensuring ordering in the input
-                            # queue to avoid leaking requests. This is ok because
-                            # aborting in the scheduler is idempotent.
-                            self.aborts_queue.put_nowait(request)
+                            if request_type == EngineCoreRequestType.ABORT:
+                                # Aborts are added to *both* queues, allows
+                                # us to eagerly process aborts while also
+                                # ensuring ordering in the input queue to
+                                # avoid leaking requests. This is ok because
+                                # aborting in the scheduler is idempotent.
+                                self.aborts_queue.put_nowait(request)
 
-                    # Push to input queue for core busy loop.
-                    self.input_queue.put_nowait((request_type, request))
+                        # Push to input queue for core busy loop.
+                        self.input_queue.put_nowait((request_type, request))
+                except Exception:
+                    logger.exception(
+                        "[Core] input socket IO thread died; escalating "
+                        "engine failure (frontends would otherwise hang "
+                        "silently)"
+                    )
+                    self.input_queue.put_nowait(
+                        (EngineCoreRequestType.EXECUTOR_FAILED, b"")
+                    )
+                    return
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int

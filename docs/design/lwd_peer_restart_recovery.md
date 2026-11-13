@@ -175,6 +175,23 @@ has no runtime counterpart here (only the CLI/config validation of
    the primary's frontend endpoint is explicit `IP:port` config, so a restart
    rebinds the same address by construction and libzmq reconnects transparently.
 
+   The engine-revival contract, as implemented in `core_client.py`: the output
+   reader survives the old engine's `ENGINE_CORE_DEAD` broadcast (an exited
+   reader means every later output is unread and requests hang with no error),
+   and the dead flag clears on either of two complementary criteria — a normal
+   output frame (the replacement engine already produced output), or the READY
+   re-send buffered on the input ROUTER, probed from the send path when the
+   dead marker intercepts a request. During the dead window new requests fail
+   fast at the AsyncLLM admission gate (`errored` reads the same flag) —
+   inherited old-branch behavior; the gate reopens once either criterion fires.
+   The batch also carries the old branch's drill-log chain and its input-thread
+   death containment: engine input address self-certification, DEALER
+   connect/disconnect/retry events, a frontend-side ROUTER accept monitor, and
+   rate-limited message-path probes (debug) pairing with the engine's for the
+   three-hop proof (client sent → engine received → output received). An input
+   thread that dies escalates as a visible engine failure instead of leaving
+   every frontend hanging silently.
+
 ### 3.5 Logging discipline (standard 7.12)
 
 Event chains at error level, one line per event; steady-state probes at debug.
@@ -300,3 +317,15 @@ as Phase 1 (standards: a replacement is done in one step, docs ride with it).
    list (host liveness, exactly-once settlement, must-reach-after-
    trigger) and treat those invariants as the acceptance conditions of
    the new implementation.
+4. **The porting unit is the scenario row, not the mechanism batch.** The
+   old branch's defect→fix table groups fixes by restart scenario, each row
+   a complete recovery chain. Porting those rows as "technical tranches"
+   broke the grouping twice: the persistent-registration fix arrived as
+   half a pair (`serve_background` without the `attach_scope`
+   nullcontext — the with-block still closed the server), and READY
+   resend was scheduled as primary-restart work although the old table
+   assigns it to the frontend-restart row (a restarted frontend's fresh
+   `MPClient` waits for it). Both surfaced as machine incidents before
+   their scheduled tranche even started. Rule: port scenario row by
+   scenario row, close a row only when its drill passes end to end, and
+   move pairs listed together in the reference together in the port.

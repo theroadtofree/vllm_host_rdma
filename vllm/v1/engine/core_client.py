@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import queue
 import sys
+import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
@@ -68,6 +69,38 @@ from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
+
+# Message-path probes (debug, rate-limited): paired with the engine-side
+# probes they prove the three hops of a request ("client sent -> engine
+# received -> client got output") during restart drills. At most one line
+# per interval under load, silent in normal operation.
+_TRACE_INTERVAL_S = 5.0
+_trace_send_last = 0.0
+_trace_output_last = 0.0
+
+
+def _trace_request_send(request_type: Any, request: Any, engine: Any) -> None:
+    global _trace_send_last
+    now = time.monotonic()
+    if now - _trace_send_last < _TRACE_INTERVAL_S:
+        return
+    _trace_send_last = now
+    logger.debug(
+        "[Core-client] request SENT type=%s req=%s engine=%s",
+        getattr(request_type, "name", request_type),
+        getattr(request, "request_id", None),
+        engine.hex() if isinstance(engine, (bytes, bytearray)) else repr(engine),
+    )
+
+
+def _trace_output_received(nframes: int) -> None:
+    global _trace_output_last
+    now = time.monotonic()
+    if now - _trace_output_last < _TRACE_INTERVAL_S:
+        return
+    _trace_output_last = now
+    logger.debug("[Core-client] output frame received frames=%d", nframes)
+
 
 AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 
@@ -533,6 +566,18 @@ class BackgroundResources:
         if len(frames) == 1 and (frames[0].buffer == EngineCoreProc.ENGINE_CORE_DEAD):
             self.engine_dead = True
             raise EngineDeadError()
+        if self.engine_dead:
+            # Revival criterion #1 (engine revival, primary restart): a
+            # normal output frame arriving while the dead flag is set
+            # means a replacement engine has taken over — the old engine's
+            # DEAD broadcast set the flag and the reader loop stayed alive
+            # for exactly this moment. Clear the flag so sends flow
+            # again; error level so one restart grep-able end to end.
+            self.engine_dead = False
+            logger.error(
+                "[Core-client] engine revived (normal output frame after "
+                "DEAD): request flow resumed (main command restarted)"
+            )
 
 
 @dataclass
@@ -606,6 +651,52 @@ class MPClient(EngineCoreClient):
                     bind=True,
                     router_handover=enable_input_socket_handover,
                 )
+                # Frontend-side link of the restart-drill log chain: the
+                # engine DEALER's connect/disconnect as seen from this
+                # ROUTER (with the engine's "input thread up" log this
+                # pins which side a silent gap is on). Pure observability —
+                # revival is decided by the READY probe / output frames.
+                # The monitor socket of an asyncio client is
+                # asyncio-flavoured, so shadow it for the plain probe
+                # thread; probe setup failure must not break the client.
+                try:
+                    router_monitor = zmq.Socket.shadow(
+                        self.input_socket.get_monitor_socket(
+                            zmq.EVENT_ACCEPTED | zmq.EVENT_DISCONNECTED
+                        )
+                    )
+
+                    def log_router_events(monitor=router_monitor) -> None:
+                        try:
+                            while True:
+                                if not monitor.poll(60000):
+                                    continue
+                                frames = monitor.recv_multipart()
+                                event = int.from_bytes(bytes(frames[0])[:2], "little")
+                                if event == zmq.EVENT_ACCEPTED:
+                                    logger.error(
+                                        "[Core-client] input ROUTER accepted "
+                                        "engine connection at %s (engine can "
+                                        "receive requests)",
+                                        input_address,
+                                    )
+                                elif event == zmq.EVENT_DISCONNECTED:
+                                    logger.error(
+                                        "[Core-client] input ROUTER lost "
+                                        "engine connection at %s (engine "
+                                        "died/restarting?)",
+                                        input_address,
+                                    )
+                        except zmq.ZMQError:
+                            return  # socket closed (client shutdown)
+
+                    Thread(
+                        target=log_router_events,
+                        daemon=True,
+                        name="core-client-router-monitor",
+                    ).start()
+                except Exception:  # noqa: BLE001 - probe must not break the client
+                    logger.exception("[Core-client] input ROUTER monitor setup failed")
                 self.resources.output_socket = make_zmq_socket(
                     self.ctx, output_address, zmq.PULL
                 )
@@ -767,8 +858,44 @@ class MPClient(EngineCoreClient):
         )
 
     def ensure_alive(self):
+        if self.resources.engine_dead and self._maybe_revived():
+            # Revival criterion #2 cleared the dead flag; let this send
+            # through (a replacement engine has taken over).
+            pass
         if self.resources.engine_dead:
             raise EngineDeadError()
+
+    def _maybe_revived(self) -> bool:
+        """Probe the input ROUTER for a replacement engine's READY.
+
+        After the old engine's DEAD broadcast nothing reaches the input
+        ROUTER but the READY that every engine (re)connection re-sends
+        (engine replies travel on the output socket), so a buffered frame
+        here means a new engine has connected and its READY went unread —
+        the client never receives on the input socket after init. The
+        reader loop uses a normal output frame as the complementary
+        criterion (see ``validate_alive``); whichever fires first revives
+        the client.
+        """
+        sock = self.resources.input_socket
+        if sock is None:
+            return False
+        try:
+            # Shadow so the probe works for the asyncio client as well
+            # (asyncio recv returns futures); all calls are non-blocking.
+            probe = zmq.Socket.shadow(sock)
+            if not probe.poll(0):
+                return False
+            while probe.poll(0):
+                probe.recv_multipart(flags=zmq.NOBLOCK)
+        except Exception:
+            return False
+        self.resources.engine_dead = False
+        logger.error(
+            "[Core-client] engine revived (READY probe on input socket): "
+            "request flow resumed (main command restarted)"
+        )
+        return True
 
     def dp_engines_running(self) -> bool:
         return self.engines_running
@@ -927,7 +1054,22 @@ class SyncMPClient(MPClient):
                         break
 
                     frames = out_socket.recv_multipart(copy=False)
-                    resources.validate_alive(frames)
+                    _trace_output_received(len(frames))
+                    try:
+                        resources.validate_alive(frames)
+                    except EngineDeadError:
+                        # Engine death (the old engine's DEAD broadcast on a
+                        # primary restart) must not end the reader: the
+                        # frontend stays up and a later normal output frame
+                        # from the replacement engine clears the flag (see
+                        # validate_alive). Exiting here would leave every
+                        # subsequent output unread and hang requests with
+                        # no error anywhere.
+                        logger.error(
+                            "[Core-client] engine DEAD received; reader kept "
+                            "alive awaiting revival (main command restarted?)"
+                        )
+                        continue
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
                         _process_utility_output(outputs.utility_output, utility_results)
@@ -967,6 +1109,7 @@ class SyncMPClient(MPClient):
         self.ensure_alive()
         # (Identity, RequestType, SerializedRequest)
         msg = (self.core_engine, request_type.value, *self.encoder.encode(request))
+        _trace_request_send(request_type, request, self.core_engine)
         # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
         # until it's finished sending them (there is a ref chain from the underlying
         # memoryview back to the original owning tensor/ndarray).
@@ -1122,7 +1265,21 @@ class AsyncMPClient(MPClient):
             try:
                 while True:
                     frames = await output_socket.recv_multipart(copy=False)
-                    resources.validate_alive(frames)
+                    _trace_output_received(len(frames))
+                    try:
+                        resources.validate_alive(frames)
+                    except EngineDeadError:
+                        # Same revival contract as the sync reader: DEAD
+                        # (the old engine's broadcast on a primary restart)
+                        # keeps the loop alive; a later normal output frame
+                        # clears the flag (see validate_alive). Exiting
+                        # here would leave every subsequent output unread.
+                        logger.error(
+                            "[Core-client] engine DEAD received; async "
+                            "reader kept alive awaiting revival (main "
+                            "command restarted?)"
+                        )
+                        continue
                     outputs: EngineCoreOutputs = decoder.decode(frames)
                     if outputs.utility_output:
                         if (
@@ -1195,6 +1352,7 @@ class AsyncMPClient(MPClient):
             engine = self.core_engine
 
         message = (request_type.value, *self.encoder.encode(request))
+        _trace_request_send(request_type, request, engine)
         return self._send_input_message(message, engine)
 
     def _send_input_message(
