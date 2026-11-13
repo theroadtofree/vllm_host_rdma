@@ -466,6 +466,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ),
         ):
             return False
+        # Debug: enqueue timestamp for the IO->engine-loop handoff latency
+        # measurement (see _lwd_handle_range_notify). The hint cannot be
+        # consumed until the engine loop reaches this WAKEUP, so a long gap
+        # here is direct evidence of "step-head throttling": the receive post
+        # waits a whole engine step behind a heavy prefill forward.
+        try:
+            self._lwd_msg_enq_ts[(peer.instance_id, type(msg).__name__, getattr(msg, "seqno", -1))] = time.monotonic()
+            if len(self._lwd_msg_enq_ts) > 1024:
+                # Bounded: drop the oldest half (insertion-ordered dict);
+                # only late-consumed entries matter, lost old ones are fine.
+                for k in list(self._lwd_msg_enq_ts)[:512]:
+                    self._lwd_msg_enq_ts.pop(k, None)
+        except AttributeError:
+            self._lwd_msg_enq_ts = {}
+            self._lwd_msg_enq_ts[(peer.instance_id, type(msg).__name__, getattr(msg, "seqno", -1))] = time.monotonic()
         self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, (peer, msg)))
         return True
 
@@ -585,6 +600,26 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
         num_tokens = sum(item.num_tokens for item in items)
+        # Debug: IO->engine handoff latency. With concurrent large prompts the
+        # engine step stretches to seconds; a hint stuck behind that step is
+        # the "posted too late" leg of the stuck receive. >1s is far beyond
+        # the milliseconds a healthy idle loop takes.
+        _enq_ts = getattr(self, "_lwd_msg_enq_ts", {}).pop(
+            (connection_id.edge_id, type(notify).__name__, notify.seqno), None
+        )
+        if _enq_ts is not None:
+            _handoff_s = time.monotonic() - _enq_ts
+            if _handoff_s > 1.0:
+                lwd_logger.error(
+                    "[Lwd][pre-recv] HINT consumed late: seqno=%d sat in the "
+                    "engine queue for %.1fs before the loop reached it "
+                    "(num_tokens=%d, reqs=%d) -- receive posting is "
+                    "throttled by the engine step cadence",
+                    notify.seqno,
+                    _handoff_s,
+                    num_tokens,
+                    len(request_ids),
+                )
         lwd_logger.info(
             "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
             notify.seqno,

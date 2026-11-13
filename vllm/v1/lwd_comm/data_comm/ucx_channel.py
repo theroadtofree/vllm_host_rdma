@@ -76,8 +76,10 @@ import ctypes
 import os
 import queue
 import struct
+import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -100,6 +102,21 @@ from vllm.v1.lwd_comm.data_comm.ucx_ucp import (
 )
 
 logger = init_logger(__name__)
+
+
+def _dump_all_threads(reason: str) -> None:
+    """ERROR-level snapshot of every live thread's stack.
+
+    Debug fail-fast payload for the recv-stuck watchdog: the raise only
+    unwinds this IO thread, so the *rest* of the process (engine loop,
+    comm thread, sender threads) is captured here instead.
+    """
+    lines = [reason]
+    names = {t.ident: t.name for t in threading.enumerate()}
+    for tid, frame in sys._current_frames().items():
+        lines.append(f"---- thread {names.get(tid, '?')} (tid={tid}) ----")
+        lines.extend(traceback.format_stack(frame))
+    logger.error("\n".join(lines))
 
 
 class LwdHostDoneEvent:
@@ -537,6 +554,8 @@ class LwdUcxChannel:
         # went from empty to non-empty (used for stuck detection)
         self._expects: dict[int, deque[LwdUcxOp]] = {}
         self._expects_t0 = 0.0
+        # recv-stuck watchdog has fired (one dump+raise per channel lifetime)
+        self._stuck_fired = False
         # early frames (arrived before the post): tag -> FIFO of bytes (one tag
         # sent repeatedly loses nothing, arrivals pair up with posts one by one);
         # total count bounded by _early_max
@@ -1276,6 +1295,39 @@ class LwdUcxChannel:
                         min(self._expects),
                         self._early_count,
                     )
+                    if not self._stuck_fired:
+                        # Debug fail-fast: the first stuck pre-post is a bug
+                        # symptom, not a recoverable condition -- dump every
+                        # thread's stack while the scene is intact, then kill the
+                        # IO thread so the failure surfaces immediately instead
+                        # of dragging on for minutes (the 11-13 incident ran
+                        # 40-80s/frame for 5+ minutes with only this periodic
+                        # ERROR as the trail). Set LWD_UCX_STUCK_RAISE=0 to
+                        # restore observe-only behaviour.
+                        self._stuck_fired = True
+                        _dump_all_threads(
+                            f"[ucx-chan] {self._name}: FIRST recv expects stuck "
+                            f"({now - self._expects_t0:.1f}s, tags="
+                            f"{len(self._expects)}, min_tag={min(self._expects)}, "
+                            f"early={self._early_count}); failing fast"
+                        )
+                        if os.environ.get("LWD_UCX_STUCK_RAISE", "1") != "0":
+                            _stuck_tags = sorted(self._expects)
+                            self._fail_all_pending(
+                                RuntimeError(
+                                    f"ucx channel {self._name} first recv expects "
+                                    f"stuck ({now - self._expects_t0:.1f}s) after "
+                                    f"tags={len(self._expects)} "
+                                    f"min_tag={min(_stuck_tags)}"
+                                )
+                            )
+                            raise RuntimeError(
+                                f"[ucx-chan] {self._name} first recv expects stuck: "
+                                f"pre-posted tags={_stuck_tags} waited "
+                                f"{now - self._expects_t0:.1f}s with "
+                                f"early={self._early_count} -- fail-fast "
+                                f"(LWD_UCX_STUCK_RAISE=0 disables)"
+                            )
                 logger.warning(
                     "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
                     "early=%d broken=%s",

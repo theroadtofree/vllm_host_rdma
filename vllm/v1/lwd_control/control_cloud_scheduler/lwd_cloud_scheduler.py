@@ -164,6 +164,38 @@ class LwdCloudScheduler(LwdBaseScheduler):
             prefill_inflight, avail_rows, len(ledger),
             self.max_num_scheduled_tokens,
         )
+        # Debug: "data arrived but not scheduled" -- avail_rows is the
+        # arrived-minus-computed backlog; if it stays above half the token
+        # budget across snapshots, the arrival pipeline is delivering rows
+        # the scheduler cannot drain (the other ERROR lines then say which
+        # leg is slow: pump capacity / HINT handoff / window staging).
+        if prefill_inflight and avail_rows > self.max_num_scheduled_tokens // 2:
+            _first_seen = getattr(self, "_lwd_avail_rows_stuck_since", None)
+            if _first_seen is None:
+                self._lwd_avail_rows_stuck_since = now
+            elif now - _first_seen > self._LWD_CONCURRENCY_LOG_INTERVAL_S:
+                worst = max(
+                    (
+                        int(ledger.get(req.request_id, 0)) - req.num_computed_tokens,
+                        req.request_id,
+                    )
+                    for queue in (self.running, self.waiting, self.skipped_waiting)
+                    for req in queue
+                    if req.num_computed_tokens < req.num_prompt_tokens
+                )
+                lwd_logger.error(
+                    "[Lwd][conc] arrived rows not being scheduled: avail_rows=%d "
+                    ">= half budget=%d for %.1fs (worst backlog req=%s rows=%d) "
+                    "-- receive pipeline outruns scheduling or vice versa; "
+                    "check the pump/HINT/staging ERROR lines around this ts",
+                    avail_rows,
+                    self.max_num_scheduled_tokens,
+                    now - _first_seen,
+                    worst[1],
+                    worst[0],
+                )
+        else:
+            self._lwd_avail_rows_stuck_since = None
         free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         reservations = getattr(self, "lwd_prefix_reservations", None)
         active_reservations = (
