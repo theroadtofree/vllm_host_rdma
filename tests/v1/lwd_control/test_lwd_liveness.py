@@ -255,3 +255,74 @@ def test_cloud_engine_sends_one_heartbeat_per_interval(
     # Within the interval: no second beat.
     engine._lwd_send_heartbeat_if_due()
     assert len(sent) == 1
+
+
+def test_heartbeat_prunes_an_unreachable_edge_instead_of_dying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (cloud died with the edge): the plane unregisters a gone
+    edge; the next beat must skip it — a liveness probe that crashes on a
+    dead probed peer kills the prober."""
+    from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+        LwdPeerNotRegisteredError,
+    )
+
+    gone, live = "peer-gone", "peer-live"
+    engine = object.__new__(LwdCloudEngineCore)
+    engine._lwd_edges = {gone, live}
+    engine._lwd_boot_id = "boot-42"
+    engine._lwd_hello_interval_s = 1000.0
+    engine._lwd_last_heartbeat_at = 0.0
+
+    def send(peer, message):  # noqa: ANN001
+        if peer == gone:
+            raise LwdPeerNotRegisteredError(f"{peer} has not completed the handshake")
+        return True
+
+    monkeypatch.setattr(engine, "_lwd_send", send)
+    engine._lwd_send_heartbeat_if_due()
+    # The unreachable edge is pruned; the live one keeps its beat.
+    assert engine._lwd_edges == {live}
+
+
+def test_cloud_send_until_queued_drops_for_an_unreachable_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Business messages to a gone edge drop (the plane already drops its
+    payloads) instead of failing the engine."""
+    from vllm.v1.engine.core import EngineShutdownState
+    from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+        LwdPeerNotRegisteredError,
+    )
+    from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdAbortNotify
+
+    engine = object.__new__(LwdCloudEngineCore)
+    engine.shutdown_state = EngineShutdownState.RUNNING
+
+    def send(peer, message):  # noqa: ANN001
+        raise LwdPeerNotRegisteredError(f"{peer} has not completed the handshake")
+
+    monkeypatch.setattr(engine, "_lwd_send", send)
+    # Must not raise; the message is dropped for the unreachable peer.
+    engine._lwd_send_until_queued("peer-gone", LwdAbortNotify("req-1", 0))
+
+
+def test_edge_send_to_cloud_drops_for_an_unreachable_peer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The edge's business send follows the same drop-until-reachable
+    semantic: the request fails through the data-plane containment path,
+    not through an engine death."""
+    from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+        LwdPeerNotRegisteredError,
+    )
+    from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdAbortNotify
+
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine._lwd_clouds = {CONNECTION: "peer-gone"}
+
+    def send(peer, message):  # noqa: ANN001
+        raise LwdPeerNotRegisteredError(f"{peer} has not completed the handshake")
+
+    monkeypatch.setattr(engine, "_lwd_send", send)
+    engine._lwd_send_to_cloud(CONNECTION, LwdAbortNotify("req-1", 0))  # no raise

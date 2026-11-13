@@ -45,7 +45,10 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdEdgeControlPlane,
+    LwdPeerNotRegisteredError,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -276,12 +279,25 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self, dp_idx: LwdConnectionId, message: LwdEdgeToCloudMessage
     ) -> None:
         """Send to one cloud DP rank, retrying a full outbound queue; raises
-        once the retries run out instead of losing the message."""
+        once the retries run out instead of losing the message. An
+        unregistered cloud (its ROUTER is gone; the plane already drops
+        the payloads) drops the message instead of failing the engine:
+        the restarted cloud's state is fresh, the request fails through
+        the data-plane containment path."""
         cloud = self._lwd_clouds[dp_idx]
-        for attempt in range(_LWD_SEND_RETRY_STEPS):
-            if self._lwd_send(cloud, message):
-                return
-            time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
+        try:
+            for attempt in range(_LWD_SEND_RETRY_STEPS):
+                if self._lwd_send(cloud, message):
+                    return
+                time.sleep(_LWD_SEND_RETRY_INTERVAL_S * (attempt + 1))
+        except LwdPeerNotRegisteredError:
+            lwd_logger.error(
+                "[edge] %s to cloud %s %s dropped: peer unreachable",
+                type(message).__name__,
+                dp_idx,
+                cloud,
+            )
+            return
         raise RuntimeError(
             f"[LWD] {type(message).__name__} to cloud {dp_idx} {cloud} not "
             f"sent: outbound queue still full after {_LWD_SEND_RETRY_STEPS} "

@@ -46,6 +46,9 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdPeerNotRegisteredError,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -344,17 +347,28 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     ) -> None:
         """Retry a full outbound queue until the message is queued; gives up
         with an error once shutdown is requested, so a stalled edge cannot
-        block it."""
-        while not self._lwd_send(peer, message):
-            if self.shutdown_state != EngineShutdownState.RUNNING:
-                lwd_logger.error(
-                    "[cloud] %s to edge %s dropped: shutting down with the "
-                    "outbound queue full",
-                    type(message).__name__,
-                    peer,
-                )
-                return
-            time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        block it. An unregistered peer (its ROUTER is gone and the plane
+        already drops its payloads) drops the message instead of failing
+        the engine: the restarted edge's state is fresh and the stale
+        message has no receiver."""
+        try:
+            while not self._lwd_send(peer, message):
+                if self.shutdown_state != EngineShutdownState.RUNNING:
+                    lwd_logger.error(
+                        "[cloud] %s to edge %s dropped: shutting down with the "
+                        "outbound queue full",
+                        type(message).__name__,
+                        peer,
+                    )
+                    return
+                time.sleep(_LWD_SEND_RETRY_SLEEP_S)
+        except LwdPeerNotRegisteredError:
+            lwd_logger.error(
+                "[cloud] %s to edge %s dropped: peer unreachable",
+                type(message).__name__,
+                peer,
+            )
+            return
         _lwd_log_sent_to_edge(peer, message)
 
     def _lwd_send_prefix_ready(
@@ -929,8 +943,22 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if now - self._lwd_last_heartbeat_at < self._lwd_hello_interval_s:
             return
         self._lwd_last_heartbeat_at = now
+        live: list[LwdPeer] = []
         for peer in self._lwd_edges:
-            self._lwd_send(peer, LwdCloudHeartbeat(self._lwd_boot_id))
+            try:
+                self._lwd_send(peer, LwdCloudHeartbeat(self._lwd_boot_id))
+                live.append(peer)
+            except LwdPeerNotRegisteredError:
+                # A liveness probe must never kill the prober: the edge's
+                # ROUTER is gone (plane already unregistered it and drops
+                # its payloads). Stop probing it; re-registration re-adds
+                # it to _lwd_edges and the beats resume.
+                lwd_logger.error(
+                    "[cloud] edge %s unreachable; heartbeat paused until "
+                    "it re-registers",
+                    peer,
+                )
+        self._lwd_edges = set(live)
         lwd_logger.debug(
             "[cloud] heartbeat sent boot_id=%s edges=%d",
             self._lwd_boot_id,
