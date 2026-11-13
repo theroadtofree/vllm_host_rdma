@@ -1305,45 +1305,26 @@ class LwdUcxChannel:
                         self._early_count,
                     )
                     if not self._stuck_fired:
-                        # Debug fail-fast: the first stuck pre-post is a bug
-                        # symptom, not a recoverable condition -- dump every
-                        # thread's stack while the scene is intact, then kill the
-                        # IO thread so the failure surfaces immediately instead
-                        # of dragging on for minutes (the 11-13 incident ran
-                        # 40-80s/frame for 5+ minutes with only this periodic
-                        # ERROR as the trail). Set LWD_UCX_STUCK_RAISE=0 to
-                        # restore observe-only behaviour.
+                        # Observe-only on first stuck: dump every thread's
+                        # stack ONCE while the scene is intact, then stay
+                        # put -- no raise, no _fail_all_pending, the channel
+                        # keeps waiting for the frame. Killing the IO thread
+                        # here tears the connection down and floods the log
+                        # with exception chains (observed 11-13: fail-fast
+                        # turned a stall into a full cross-process crash
+                        # cascade); the stall is frozen in place instead, so
+                        # py-spy/stack dump on the live process remains
+                        # possible. The periodic ERROR line above keeps
+                        # ticking every 10s as the heartbeat.
                         self._stuck_fired = True
+                        _stuck_tags = sorted(self._expects)
                         _dump_all_threads(
                             f"[ucx-chan] {self._name}: FIRST recv expects stuck "
                             f"({now - self._expects_t0:.1f}s, tags="
-                            f"{len(self._expects)}, min_tag={min(self._expects)}, "
-                            f"early={self._early_count}); failing fast"
+                            f"{len(_stuck_tags)}, min_tag={min(_stuck_tags)}, "
+                            f"early={self._early_count}); observe-only "
+                            f"(thread dump once, waiting in place)"
                         )
-                        if os.environ.get("LWD_UCX_STUCK_RAISE", "1") != "0":
-                            # Capture everything BEFORE _fail_all_pending: it
-                            # clears _expects and resets _expects_t0 to 0, so
-                            # evaluating them afterwards reports the process
-                            # uptime instead of the stall duration (observed as
-                            # "waited 28023.1s" for a 13.1s stall).
-                            _stuck_tags = sorted(self._expects)
-                            _stuck_s = now - self._expects_t0
-                            _stuck_early = self._early_count
-                            self._fail_all_pending(
-                                RuntimeError(
-                                    f"ucx channel {self._name} first recv expects "
-                                    f"stuck ({_stuck_s:.1f}s) after "
-                                    f"tags={len(_stuck_tags)} "
-                                    f"min_tag={min(_stuck_tags)}"
-                                )
-                            )
-                            raise RuntimeError(
-                                f"[ucx-chan] {self._name} first recv expects stuck: "
-                                f"pre-posted tags={_stuck_tags} waited "
-                                f"{_stuck_s:.1f}s with "
-                                f"early={_stuck_early} -- fail-fast "
-                                f"(LWD_UCX_STUCK_RAISE=0 disables)"
-                            )
                 logger.warning(
                     "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
                     "early=%d broken=%s",
