@@ -285,3 +285,18 @@ as Phase 1 (standards: a replacement is done in one step, docs ride with it).
    because each mechanism was correct in isolation; the failing scenario
    was the INTERACTION (idle bring-up × first request). Regression tests
    must encode the default scenario shape, not just the mechanism.
+3. **An old-branch reference is only as good as the INVARIANTS extracted
+   from it.** All three machine incidents had full references in the old
+   branch's code and docs — and all three still happened, because the
+   behavior was ported while the invariant it rested on was not: the
+   heartbeat's host must run while idle (old pumps never slept; the
+   step-loop host does), a gated request must finish exactly once (the
+   old gate finished directly; the abort-channel rebuild double-added),
+   and a re-handshake must actually re-run after a peer restart (the
+   old `reannounce` existed precisely because "transport reconnect does
+   not re-run the handshake" — the new plane's tick gate defeated its
+   own documented intent). Rule: before adapting any old-branch
+   mechanism, translate its defect→fix table into an explicit invariant
+   list (host liveness, exactly-once settlement, must-reach-after-
+   trigger) and treat those invariants as the acceptance conditions of
+   the new implementation.
