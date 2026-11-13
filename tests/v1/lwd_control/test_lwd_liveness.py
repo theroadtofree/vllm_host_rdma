@@ -355,3 +355,20 @@ def test_edge_reregistration_resets_the_connection_seqno_books(
     assert engine._lwd_latest_seqnos == {}
     assert engine._lwd_pending_seqnos == {}
     assert len(sent) == 1  # scheduling limits still go out first
+
+
+def test_beat_survives_the_mid_assembly_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression (sixth incident): the control plane's IO thread dispatches
+    into the engine from the moment the plane starts, but assembly may still
+    be waiting on the handshake or the cloud params — a beat arriving in
+    that window must land in the (pre-seeded, empty) accounts instead of
+    raising AttributeError, whose _lwd_fail side effect queued an engine
+    failure."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [], notified)  # no connections seeded
+    # A beat for a connection the handshake has not even discovered yet.
+    engine._lwd_beat(CONNECTION, "boot-a")
+    assert engine._lwd_hello_last[CONNECTION] > 0
+    assert engine._lwd_hello_boot[CONNECTION] == "boot-a"
+    # The gate admits nothing-relevant with the still-empty view elsewhere.
+    assert engine._lwd_gate_reason("plain-req") is None

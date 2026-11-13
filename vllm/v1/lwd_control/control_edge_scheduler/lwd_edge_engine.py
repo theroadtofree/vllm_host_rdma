@@ -117,6 +117,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
         )
         self._lwd_cloud_params_received = threading.Event()
+        # Liveness state (peer-restart line) must exist BEFORE the control
+        # plane starts: its IO thread dispatches payloads into this engine
+        # immediately, and a heartbeat arriving mid-assembly (long handshake
+        # or params waits) hit a half-constructed object — the AttributeError
+        # spam, with each hit ALSO queueing an engine failure through
+        # on_message's _lwd_fail. Only the connection seeding below needs
+        # the handshake result; beats write into the dict directly.
+        self._lwd_hello_lock = threading.Lock()
+        self._lwd_hello_last: dict[LwdConnectionId, float] = {}
+        self._lwd_hello_boot: dict[LwdConnectionId, str] = {}
+        self._lwd_silent: set[LwdConnectionId] = set()
+        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
+        self._lwd_hello_silent_s = (
+            self.lwd_config.topology.control_plane.hello_silent_s
+        )
+        self._lwd_last_sweep = 0.0
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
@@ -124,20 +140,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
             handshake_timeout_s
         )
-        # Liveness accounts (peer-restart line): the control-plane IO thread
-        # beats, the engine thread sweeps; the frozenset snapshot is the
-        # admission gate's reader view.
-        self._lwd_hello_lock = threading.Lock()
-        self._lwd_hello_last = {
-            connection: time.monotonic() for connection in self._lwd_clouds
-        }
-        self._lwd_hello_boot: dict[LwdConnectionId, str] = {}
-        self._lwd_silent: set[LwdConnectionId] = set()
-        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
-        self._lwd_hello_silent_s = (
-            self._lwd_control_plane.spec.config.hello_silent_s
-        )
-        self._lwd_last_sweep = 0.0
+        # Seed the accounts for the discovered connections (a beat that
+        # already arrived mid-assembly wins over the seeding).
+        for connection in self._lwd_clouds:
+            self._lwd_hello_last.setdefault(connection, time.monotonic())
         expected = len(self._lwd_clouds)
         while len(self._lwd_cloud_params) < expected:
             if not self._lwd_cloud_params_received.wait(
