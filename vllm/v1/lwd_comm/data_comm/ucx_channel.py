@@ -76,10 +76,8 @@ import ctypes
 import os
 import queue
 import struct
-import sys
 import threading
 import time
-import traceback
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -102,21 +100,6 @@ from vllm.v1.lwd_comm.data_comm.ucx_ucp import (
 )
 
 logger = init_logger(__name__)
-
-
-def _dump_all_threads(reason: str) -> None:
-    """ERROR-level snapshot of every live thread's stack.
-
-    Debug fail-fast payload for the recv-stuck watchdog: the raise only
-    unwinds this IO thread, so the *rest* of the process (engine loop,
-    comm thread, sender threads) is captured here instead.
-    """
-    lines = [reason]
-    names = {t.ident: t.name for t in threading.enumerate()}
-    for tid, frame in sys._current_frames().items():
-        lines.append(f"---- thread {names.get(tid, '?')} (tid={tid}) ----")
-        lines.extend(traceback.format_stack(frame))
-    logger.error("\n".join(lines))
 
 
 class LwdHostDoneEvent:
@@ -1305,26 +1288,13 @@ class LwdUcxChannel:
                         self._early_count,
                     )
                     if not self._stuck_fired:
-                        # Observe-only on first stuck: dump every thread's
-                        # stack ONCE while the scene is intact, then stay
-                        # put -- no raise, no _fail_all_pending, the channel
-                        # keeps waiting for the frame. Killing the IO thread
-                        # here tears the connection down and floods the log
-                        # with exception chains (observed 11-13: fail-fast
-                        # turned a stall into a full cross-process crash
-                        # cascade); the stall is frozen in place instead, so
-                        # py-spy/stack dump on the live process remains
-                        # possible. The periodic ERROR line above keeps
-                        # ticking every 10s as the heartbeat.
+                        # First stuck: mark it and stay put. No thread-stack
+                        # dump (the ~200-line burst proved too noisy and is
+                        # unreliable anyway — an in-process dump was observed
+                        # truncated); forensics come from py-spy on the live
+                        # process. The periodic ERROR line above keeps
+                        # ticking every 10s as the heartbeat instead.
                         self._stuck_fired = True
-                        _stuck_tags = sorted(self._expects)
-                        _dump_all_threads(
-                            f"[ucx-chan] {self._name}: FIRST recv expects stuck "
-                            f"({now - self._expects_t0:.1f}s, tags="
-                            f"{len(_stuck_tags)}, min_tag={min(_stuck_tags)}, "
-                            f"early={self._early_count}); observe-only "
-                            f"(thread dump once, waiting in place)"
-                        )
                 logger.warning(
                     "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
                     "early=%d broken=%s",
