@@ -6,9 +6,12 @@
 The primary edge owns the engines and frontend client index zero. Every other
 edge starts one ordinary API-server child, binds its native ROUTER/PULL engine
 endpoints, and supplies those endpoints to the primary. The primary holds the
-``launch_core_engines`` startup barrier until all indices are present, so the
-existing engine handshake and ``request.client_index`` output grouping need no
-LWD-specific engine changes.
+``launch_core_engines`` startup barrier for a bounded grace window, then
+proceeds with whichever frontends registered (elastic partial start: the
+engine's frontend list is pre-seeded with the deterministic attach addresses,
+so a frontend that starts later binds the same address and joins through the
+transparent reconnection), so the existing engine handshake and
+``request.client_index`` output grouping need no LWD-specific engine changes.
 
 Wire messages are msgpack dictionaries over ZMQ ROUTER/DEALER:
 
@@ -51,6 +54,12 @@ _POLL_INTERVAL_S = 1.0
 # runtime).
 _REREGISTER_INTERVAL_S = 10.0
 _REREGISTER_TIMEOUT_S = 5.0
+# Startup grace window for attach frontends (elastic partial start). The
+# engine processes are already loading while the barrier waits, and a
+# model load takes minutes, so this window normally costs no wall-clock
+# time; after it the primary proceeds with the registered subset and a
+# late-starting frontend joins via its deterministic engine IO address.
+_ATTACH_GRACE_S = 60.0
 # Captured by run_attach_api_server for the re-register watchdog: the args
 # namespace and listen address are stable for the process lifetime.
 _WATCHDOG_ARGS: Any = None
@@ -263,6 +272,25 @@ def get_route_ip(target_ip: str) -> str:
     return get_ip()
 
 
+def engine_io_addresses(endpoint: str, client_index: int) -> tuple[str, str]:
+    """Deterministic native engine IO endpoints of one attach frontend:
+    ``rpc_port + 1000 + 2*idx`` (input ROUTER) and ``+1`` (output PULL) on
+    the route IP toward the registration endpoint.
+
+    Single source of truth for both sides: the attach command binds these,
+    and the primary pre-seeds the engine's frontend list with them for an
+    elastic partial start, so the two derivations can never drift. A
+    frontend that starts after the engine handshakes binds the same
+    address and the engine's DEALER/PUSH reconnect transparently."""
+    host, reg_port = parse_endpoint(endpoint, "--api-server-attach")
+    bind_ip = get_route_ip(host)
+    engine_io_base = reg_port + 1000 + 2 * client_index
+    return (
+        get_tcp_uri(bind_ip, engine_io_base),
+        get_tcp_uri(bind_ip, engine_io_base + 1),
+    )
+
+
 def _resolve_listen(args: Any) -> tuple[str, int]:
     return getattr(args, "host", None) or "0.0.0.0", args.port
 
@@ -298,6 +326,9 @@ class FrontendAttachServer:
     ):
         host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
         self.endpoint = get_tcp_uri(host, port)
+        # Raw "host:port" form: the elastic pre-seed derives every attach
+        # frontend's deterministic engine IO addresses from it.
+        self.raw_endpoint = endpoint
         self.client_count = client_count
         self.config_payload = config_payload
         self.frontend_args_payload = frontend_args or {}
@@ -322,10 +353,24 @@ class FrontendAttachServer:
     def wait_for_registrations(
         self, engine_manager: Any = None, timeout: float | None = None
     ) -> dict[int, tuple[str, str]]:
-        timeout = envs.VLLM_ENGINE_READY_TIMEOUT_S if timeout is None else timeout
+        """Soft startup barrier: collect endpoint reports for up to
+        ``timeout`` seconds (the grace window), then proceed with whoever
+        reported.
+
+        Elastic partial start: the primary must serve with the frontends
+        that exist — the engine's frontend list is pre-seeded with the
+        deterministic attach addresses (see
+        ``wait_for_attach_registrations``), so an index that never starts
+        costs nothing, and one that starts later binds the same address
+        and joins through the transparent reconnection. A registration
+        that lands inside the window still upgrades the seed to the
+        frontend's actual endpoints. Engine process death during the
+        window remains a startup failure."""
+        timeout = _ATTACH_GRACE_S if timeout is None else timeout
         deadline = time.monotonic() + timeout
         logger.info(
-            "LWD frontend attach: waiting for %d frontend(s) at %s",
+            "LWD frontend attach: waiting up to %.0fs for %d frontend(s) at %s",
+            timeout,
             self.expected_attaches,
             self.endpoint,
         )
@@ -335,10 +380,18 @@ class FrontendAttachServer:
                 missing = sorted(
                     set(range(1, self.client_count)) - set(self._reported)
                 )
-                raise RuntimeError(
-                    f"Timed out waiting for LWD attach frontends; missing "
-                    f"client indices: {missing}"
+                logger.warning(
+                    "LWD attach grace window elapsed; proceeding with the "
+                    "registered frontends (elastic partial start). Missing "
+                    "client indices %s will serve once they start and bind "
+                    "their deterministic engine IO addresses: %s",
+                    missing,
+                    {
+                        index: engine_io_addresses(self.raw_endpoint, index)
+                        for index in missing
+                    },
                 )
+                return dict(self._reported)
             events = self._socket.poll(min(_POLL_INTERVAL_S, remaining) * 1000)
             while events:
                 identity, payload = self._socket.recv_multipart()
@@ -671,22 +724,24 @@ def run_attach_api_server(args: Any) -> None:
         )
 
         listen_address, sock = setup_server(args, reuse_port=False)
-        bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
         # Deterministic engine IO ports (old-branch invariant): a restarted
         # attach frontend rebinds the SAME port, so the running engine's
         # DEALER/PUSH reconnect transparently — ephemeral ports would leave
         # the engine connected to the dead process's address. The primary's
         # index 0 uses the standard allocation; attach indices derive from
-        # the registration endpoint's port.
-        reg_port = parse_endpoint(plan.endpoint, "--api-server-attach")[1]
-        engine_io_base = reg_port + 1000 + 2 * plan.client_index
+        # the registration endpoint's port (single source:
+        # ``engine_io_addresses``, shared with the primary's elastic
+        # pre-seed).
+        input_address, output_address = engine_io_addresses(
+            plan.endpoint, plan.client_index
+        )
         manager = APIServerProcessManager(
             listen_address=listen_address,
             sock=sock,
             args=args,
             num_servers=1,
-            input_addresses=[get_tcp_uri(bind_ip, engine_io_base)],
-            output_addresses=[get_tcp_uri(bind_ip, engine_io_base + 1)],
+            input_addresses=[input_address],
+            output_addresses=[output_address],
             stats_update_address=accepted.get("stats_update_address"),
             client_count=client_count,
             client_indices=[plan.client_index],
@@ -788,6 +843,26 @@ def wait_for_attach_registrations(
     addresses: Any,
     engine_manager: Any,
 ) -> None:
+    """Elastic partial start: seed every planned attach slot with its
+    deterministic engine IO address, then let the grace-window barrier
+    upgrade the slots that actually registered to their reported
+    endpoints.
+
+    The engine therefore starts with the FULL planned frontend list and
+    serves with whichever frontends exist; a frontend that starts later
+    binds the same deterministic address and the engine's DEALER/PUSH
+    reconnect transparently (the READY re-send completes its client
+    handshake). Note the seed derives the address from THIS host's route
+    toward the registration endpoint — exact for the same-host
+    edge_share deployment (one engine host, N API frontends); a
+    cross-host attach frontend must register inside the grace window to
+    contribute its actual address."""
+    for client_index in range(1, registration_server.client_count):
+        seeded_input, seeded_output = engine_io_addresses(
+            registration_server.raw_endpoint, client_index
+        )
+        addresses.inputs[client_index] = seeded_input
+        addresses.outputs[client_index] = seeded_output
     reported = registration_server.wait_for_registrations(engine_manager)
     for client_index, (input_address, output_address) in reported.items():
         addresses.inputs[client_index] = input_address

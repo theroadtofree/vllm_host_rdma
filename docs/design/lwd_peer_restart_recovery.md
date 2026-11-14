@@ -191,6 +191,20 @@ has no runtime counterpart here (only the CLI/config validation of
    three-hop proof (client sent → engine received → output received). An input
    thread that dies escalates as a visible engine failure instead of leaving
    every frontend hanging silently.
+3. **Elastic partial start**: the yaml may plan more frontends than are
+   launched. The startup barrier became a grace window (default 60 s,
+   normally hidden under the engine's model load, which overlaps the
+   barrier): the primary proceeds with the registered subset, and the
+   engine's frontend list is pre-seeded with the deterministic attach
+   addresses (`engine_io_addresses` — the same derivation the attach
+   command binds, single source for both sides), so a frontend that
+   starts later binds the same address and joins through the transparent
+   DEALER/PUSH reconnection (the READY re-send completes its client
+   handshake). A registration inside the window upgrades its slot to the
+   actual endpoints. Boundary: the seed derives the host from this host's
+   route toward the registration endpoint — exact for the same-host
+   edge_share deployment (one engine host, N API frontends); a cross-host
+   attach frontend must register inside the grace window.
 
 ### 3.5 Logging discipline (standard 7.12)
 
@@ -239,7 +253,7 @@ introduced once each; the old `reannounce` is retired in favor of
 | --- | --- | --- |
 | 1 | Data-plane consumption side (§3.2) + registry skeleton | Unit tests in full; **idle-window drills**: kill the peer with zero in-flight traffic, restart it, new requests must flow with the error chains below and the survivor process NOT restarting |
 | 2 | Failure containment + control-plane liveness, linked teardown, gate (§3.3) | Traffic-window drills: survivor keeps serving through the outage, victim requests fail within the bounded window (no ~63 s zombie hang), gate admits/rejects/releases |
-| 3 | ROUTER handover + attach runtime (§3.4) | Primary-edge restart drill: attach frontend re-registers, engine revives, requests survive |
+| 3 | ROUTER handover + attach runtime (§3.4) | Primary-edge restart drill: attach frontend re-registers, engine revives, requests survive; partial-start drill: yaml plans N, launch 1 → instance 0 serves alone, launch the attach frontend later → it serves without a primary restart |
 
 The Phase 1 acceptance is deliberately narrow: the survivor's failure
 handling is fatal today (an edge transfer failure kills the engine; a cloud

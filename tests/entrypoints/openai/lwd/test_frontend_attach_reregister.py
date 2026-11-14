@@ -8,6 +8,12 @@ it, and a resident service must keep answering after the startup barrier
 (the barrier covers launch; runtime re-registrations are the watchdog's
 silent rounds or a restarted frontend's fresh attach). Endpoints
 re-report replaces the stale entry.
+
+Elastic partial start (yaml plans N frontends, fewer are launched): the
+grace-window barrier proceeds with the registered subset instead of
+failing, and the engine's frontend list is pre-seeded with the
+deterministic attach addresses so a late-starting frontend joins
+through the transparent reconnection.
 """
 
 from __future__ import annotations
@@ -16,7 +22,11 @@ from typing import Any
 
 import pytest
 
-from vllm.entrypoints.openai.lwd.frontend_attach import FrontendAttachServer
+import vllm.entrypoints.openai.lwd.frontend_attach as frontend_attach
+from vllm.entrypoints.openai.lwd.frontend_attach import (
+    FrontendAttachServer,
+    wait_for_attach_registrations,
+)
 
 
 def _server() -> FrontendAttachServer:
@@ -30,6 +40,8 @@ def _server() -> FrontendAttachServer:
     server._accepted_pids = {}
     server._reported = {}
     server._closed = False
+    server.endpoint = "tcp://127.0.0.1:23657"
+    server.raw_endpoint = "127.0.0.1:23657"
     return server
 
 
@@ -170,3 +182,76 @@ def test_attach_scope_does_not_close_the_registration_server() -> None:
     with attach_scope(server):
         pass
     assert not server._closed
+
+
+class _IdleSocket:
+    """Socket stub: an idle poller that never delivers events."""
+
+    def poll(self, timeout_ms: int) -> int:
+        return 0
+
+
+class _Addresses:
+    def __init__(self, count: int) -> None:
+        self.inputs = [f"tcp://127.0.0.1:{10000 + i}" for i in range(count)]
+        self.outputs = [f"tcp://127.0.0.1:{11000 + i}" for i in range(count)]
+
+
+def test_grace_window_proceeds_with_registered_subset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elastic partial start (yaml plans 2, only instance 0 launched): the
+    grace window elapses without frontend 1 and the barrier returns the
+    registered subset instead of failing startup."""
+    monkeypatch.setattr(frontend_attach, "_ATTACH_GRACE_S", 0.05)
+    server = _server()
+    server._socket = _IdleSocket()
+    reported = server.wait_for_registrations()
+    assert reported == {}
+    assert server._closed is False
+
+
+def test_partial_start_seeds_deterministic_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The engine's frontend list is pre-seeded with the deterministic
+    attach addresses, so the missing frontend's slot still carries a
+    bindable address and a late-starting instance joins through it."""
+    monkeypatch.setattr(frontend_attach, "_ATTACH_GRACE_S", 0.05)
+    monkeypatch.setattr(frontend_attach, "get_route_ip", lambda host: "127.0.0.1")
+    server = _server()
+    server._socket = _IdleSocket()
+    server._closed = True  # resident service is not exercised here
+    addresses = _Addresses(count=2)
+    wait_for_attach_registrations(server, addresses, engine_manager=None)
+    assert addresses.inputs[1] == "tcp://127.0.0.1:24659"
+    assert addresses.outputs[1] == "tcp://127.0.0.1:24660"
+
+
+def test_registration_within_grace_upgrades_the_seeded_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frontend that registers inside the grace window contributes its
+    actual endpoints; the deterministic seed is only the fallback for
+    whoever is missing."""
+    server = _server()
+    server._socket = _IdleSocket()
+    server._closed = True
+    # As if frontend 1 registered before the barrier was entered.
+    server._reported[1] = ("tcp://10.1.1.5:9001", "tcp://10.1.1.5:9002")
+    addresses = _Addresses(count=2)
+    wait_for_attach_registrations(server, addresses, engine_manager=None)
+    assert addresses.inputs[1] == "tcp://10.1.1.5:9001"
+    assert addresses.outputs[1] == "tcp://10.1.1.5:9002"
+
+
+def test_engine_io_addresses_derivation() -> None:
+    """The bind-side and pre-seed-side single source: port arithmetic is
+    rpc_port + 1000 + 2*idx / +1 on the route IP toward the endpoint."""
+    input_address, output_address = frontend_attach.engine_io_addresses(
+        "127.0.0.1:23657", client_index=1
+    )
+    # The host is the local route IP toward the endpoint; only the port
+    # arithmetic is asserted here.
+    assert input_address.rpartition(":")[2] == "24659"
+    assert output_address.rpartition(":")[2] == "24660"
