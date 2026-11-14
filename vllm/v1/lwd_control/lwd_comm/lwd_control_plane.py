@@ -657,15 +657,21 @@ class LwdEdgeControlPlane(LwdControlPlane):
             timeout_s = self.spec.config.handshake_timeout_s
 
         def _fail_or_wait(deadline: float) -> bool:
-            """Sleep toward ``deadline``; True when every handshake
-            settled in the meantime, raising on failure."""
+            """One poll slice toward ``deadline``: True while the window is
+            still open (keep waiting -- the caller's loop condition
+            re-checks settling and accepts after every slice), raising on
+            failure. False ONLY when the whole window elapsed -- a single
+            expired slice without a settle is not it (an accept routinely
+            needs several slices: DEALER connect + HELLO + the cloud's
+            reply)."""
             if self._handshake_error is not None:
                 self.shutdown()
                 raise LwdHandshakeError(self._handshake_error)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            return self._settled.wait(min(_LWD_STRAGGLER_POLL_S, remaining))
+            self._settled.wait(min(_LWD_STRAGGLER_POLL_S, remaining))
+            return True
 
         # Phase A: the first accept (the long window covers a cloud that
         # is still loading its model).

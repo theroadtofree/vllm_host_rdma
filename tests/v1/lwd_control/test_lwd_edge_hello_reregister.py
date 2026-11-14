@@ -142,6 +142,28 @@ def test_wait_until_ready_proceeds_with_the_accepted_subset(
     assert plane._handshakes[CONNECTION_C1].cloud is None
 
 
+def test_wait_until_ready_keeps_polling_for_a_delayed_accept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (first partial-start drill): one poll slice expiring
+    without a settle is NOT the window elapsing -- a real accept needs
+    DEALER connect + HELLO + the cloud's reply, several slices. A barrier
+    that gave up after the first slice failed with "0 hellos delivered"
+    before the up cloud ever had a chance to answer."""
+    import vllm.v1.lwd_control.lwd_comm.lwd_control_plane as plane_module
+
+    monkeypatch.setattr(plane_module, "_LWD_STRAGGLER_GRACE_S", 0.1)
+    plane = _barrier_plane(accepted=())
+
+    def accept_later() -> None:
+        time.sleep(0.3)
+        plane._handshakes[CONNECTION].cloud = SimpleNamespace(instance_id=0, dp_rank=0)
+
+    threading.Timer(0.3, accept_later).start()
+    peers = plane.wait_until_ready(10.0)
+    assert set(peers) == {CONNECTION}
+
+
 def test_wait_until_ready_fails_fast_when_nothing_accepted() -> None:
     """Zero accepts within the window is a deployment error, not a partial
     start: the barrier still fails fast."""
