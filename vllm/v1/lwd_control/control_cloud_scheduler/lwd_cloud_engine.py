@@ -18,6 +18,7 @@ publishing) unchanged.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -70,6 +71,11 @@ _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_RETIRED_ROUTE_CAP = 4096
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
+# Slow-step watchdog threshold (ms): one engine step past this logs the
+# [Lwd][step-split] phase breakdown (head_poll / head_drain / native_step,
+# with scheduler.schedule split out) so a stall names its slow phase from
+# the log. Healthy steps are tens of ms; 0 disables.
+_LWD_SLOW_STEP_MS = float(os.environ.get("LWD_SLOW_STEP_MS", "1000"))
 
 
 def _lwd_decode_structured_outputs(payload: str) -> StructuredOutputsParams | None:
@@ -901,12 +907,47 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def step_with_batch_queue(self):
         """Drain the early-recv watermark at the head of the step (done
-        MQ -> gate readiness predicate); the rest is native."""
+        MQ -> gate readiness predicate); the rest is native.
+
+        Step-phase timing (slow-step watchdog): the 11-13 dumps caught the
+        engine thread spinning in the step HEAD while prefill backlog sat
+        undrained for a minute -- but py-spy samples cannot say how the
+        whole step's time splits. Time the head phases we own (poll /
+        drain) and the native step separately; a step past the threshold
+        logs ONE ERROR naming the split, so the next stall identifies its
+        slow phase from the log alone:
+          head_poll   = coordination poll (probe commands)
+          head_drain  = done-MQ drain (early-recv completions)
+          native_step = schedule + execute_model submit + future.result
+                        (includes waiting on the worker's forward) --
+                        the scheduler's own schedule() cost is split out
+                        by LwdCloudScheduler._lwd_note_schedule_ms.
+        """
+        _t0 = time.monotonic()
         self._lwd_poll_coordination()
+        _t_poll = time.monotonic()
         self._lwd_drain_irecv_completions()
+        _t_drain = time.monotonic()
         engine_core_outputs, model_executed = super().step_with_batch_queue()
+        _t_native = time.monotonic()
         self._lwd_publish_finished_usage(engine_core_outputs)
         self._lwd_retire_finished_outputs(engine_core_outputs)
+        _total_ms = (time.monotonic() - _t0) * 1000.0
+        if _total_ms >= _LWD_SLOW_STEP_MS:
+            sched_ms = getattr(self.scheduler, "_lwd_last_schedule_ms", -1.0)
+            lwd_logger.error(
+                "[Lwd][step-split] slow step %.0fms: head_poll=%.1f "
+                "head_drain=%.1f native_step=%.0f (of which "
+                "scheduler.schedule=%.1f; the rest = execute submit + "
+                "future.result wait + update_from_output) "
+                "model_executed=%s",
+                _total_ms,
+                (_t_poll - _t0) * 1000.0,
+                (_t_drain - _t_poll) * 1000.0,
+                (_t_native - _t_drain) * 1000.0,
+                sched_ms,
+                model_executed,
+            )
         return engine_core_outputs, model_executed
 
     def step(self):

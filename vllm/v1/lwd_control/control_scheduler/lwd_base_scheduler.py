@@ -11,6 +11,7 @@ stay unchanged.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from enum import Enum, auto
 from typing import Any
@@ -56,8 +57,19 @@ class LwdBaseScheduler(AsyncScheduler):
         throttle_prefills positionally; the signature converges here, and
         edge/cloud subclasses implement only one-step role scheduling. The
         throttle hint is not consumed -- each role's dispatch gate decides
-        on its own (on par with mm)."""
-        return self._lwd_schedule_step()
+        on its own (on par with mm).
+
+        Timed for the cloud step-split watchdog: the duration lands in
+        ``_lwd_last_schedule_ms`` and LwdCloudEngineCoreMixin's
+        [Lwd][step-split] ERROR line reports it as its own phase (a slow
+        schedule() with a fast forward = the backlog sits in scheduling,
+        not compute).
+        """
+        _t0 = time.monotonic()
+        try:
+            return self._lwd_schedule_step()
+        finally:
+            self._lwd_last_schedule_ms = (time.monotonic() - _t0) * 1000.0
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         """One role-specific scheduling step; edge/cloud subclasses own it."""
