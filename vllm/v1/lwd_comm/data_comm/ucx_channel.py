@@ -537,8 +537,6 @@ class LwdUcxChannel:
         # went from empty to non-empty (used for stuck detection)
         self._expects: dict[int, deque[LwdUcxOp]] = {}
         self._expects_t0 = 0.0
-        # recv-stuck watchdog has fired (one dump+raise per channel lifetime)
-        self._stuck_fired = False
         # early frames (arrived before the post): tag -> FIFO of bytes (one tag
         # sent repeatedly loses nothing, arrivals pair up with posts one by one);
         # total count bounded by _early_max
@@ -1287,14 +1285,6 @@ class LwdUcxChannel:
                         min(self._expects),
                         self._early_count,
                     )
-                    if not self._stuck_fired:
-                        # First stuck: mark it and stay put. No thread-stack
-                        # dump (the ~200-line burst proved too noisy and is
-                        # unreliable anyway — an in-process dump was observed
-                        # truncated); forensics come from py-spy on the live
-                        # process. The periodic ERROR line above keeps
-                        # ticking every 10s as the heartbeat instead.
-                        self._stuck_fired = True
                 logger.warning(
                     "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
                     "early=%d broken=%s",
