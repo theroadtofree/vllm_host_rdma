@@ -133,13 +133,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.lwd_config.topology.control_plane.hello_silent_s
         )
         self._lwd_last_sweep = 0.0
+        # Adopted-cloud state must exist before the control plane starts:
+        # a cloud's scheduling limits can arrive mid-assembly (the startup
+        # wait below is exactly that arrival), and the params handler
+        # adopts into these — same reason the liveness accounts live here.
+        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = {}
+        self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {}
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
         deadline = time.monotonic() + handshake_timeout_s
-        self._lwd_clouds: dict[LwdConnectionId, LwdPeer] = plane.wait_until_ready(
-            handshake_timeout_s
-        )
+        self._lwd_clouds.update(plane.wait_until_ready(handshake_timeout_s))
         # Seed the accounts for the discovered connections (a beat that
         # already arrived mid-assembly wins over the seeding).
         for connection in self._lwd_clouds:
@@ -157,19 +161,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{handshake_timeout_s}s"
                 )
             self._lwd_cloud_params_received.clear()
-        for dp_idx, params in self._lwd_cloud_params.items():
-            self._lwd_check_cloud_params(dp_idx, params)
+        for connection, params in self._lwd_cloud_params.items():
+            self._lwd_adopt_cloud(connection, self._lwd_clouds[connection], params)
         self._lwd_configure_prefix_cache()
-        self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {
-            dp_idx: LwdCoordClient(dp_idx.dp_idx, params.dp_coordinator_addr)
-            for dp_idx, params in self._lwd_cloud_params.items()
-            if params.dp_coordinator_addr
-        }
-        for dp_idx, params in self._lwd_cloud_params.items():
-            if params.prefix_hash_block_size > 0:
-                self._lwd_probe_manager._hash_sizes[dp_idx.cloud_id] = (
-                    params.prefix_hash_block_size
-                )
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
@@ -244,6 +238,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if isinstance(msg, LwdCloudParamsNotify):
             connection = self._lwd_connection_of(peer)
             self._lwd_cloud_params[connection] = msg
+            # Elastic partial start: a cloud that started after the edge
+            # adopts here — the periodic HELLO kept its handshake alive
+            # and these limits are the cloud's first runtime traffic.
+            self._lwd_adopt_cloud(connection, peer, msg)
             self.scheduler.lwd_update_cloud_params(connection, msg)
             self._lwd_cloud_params_received.set()
             return True
@@ -262,6 +260,32 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
             return True
         return False
+
+    def _lwd_adopt_cloud(
+        self, connection: LwdConnectionId, peer: LwdPeer, params: LwdCloudParamsNotify
+    ) -> None:
+        """Register one accepted cloud with the runtime engine state:
+        validated scheduling limits, the probe coordinator client when the
+        cloud runs one, prefix hash sizes, the sendable peer, and a
+        liveness account seed.
+
+        Init adopts the accepted subset this way; a cloud that starts
+        later is adopted on the control-plane IO thread when its
+        scheduling limits arrive — its handshake keeps being retried by
+        the periodic HELLO (elastic partial start). Idempotent: a
+        re-arrival just refreshes the state."""
+        self._lwd_check_cloud_params(connection, params)
+        self._lwd_clouds[connection] = peer
+        with self._lwd_hello_lock:
+            self._lwd_hello_last.setdefault(connection, time.monotonic())
+        if params.dp_coordinator_addr:
+            self._lwd_coord_clients[connection] = LwdCoordClient(
+                connection.dp_idx, params.dp_coordinator_addr
+            )
+        if params.prefix_hash_block_size > 0:
+            self._lwd_probe_manager._hash_sizes[connection.cloud_id] = (
+                params.prefix_hash_block_size
+            )
 
     def _lwd_check_cloud_params(
         self, dp_idx: LwdConnectionId, params: LwdCloudParamsNotify

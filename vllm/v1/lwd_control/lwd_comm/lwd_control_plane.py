@@ -59,6 +59,17 @@ logger = init_lwd_logger(__name__)
 
 # Upper bound of IO thread latency for hello retries and shutdown.
 _LWD_IO_POLL_TICK_MS = 100
+
+# Elastic partial start (cloud side): once the FIRST cloud accepted the
+# handshake, the remaining planned clouds get this grace window to show
+# up, then the edge proceeds with the accepted subset (the yaml may plan
+# more clouds than are launched). The first-accept window stays the long
+# ``handshake_timeout_s`` — a co-started cloud needs its whole model load
+# before it can accept. A missing cloud keeps receiving periodic HELLOs
+# and is adopted by the engine at runtime when it finally accepts
+# (the edge engine's params handler); zero accepts still fails fast.
+_LWD_STRAGGLER_GRACE_S = 60.0
+_LWD_STRAGGLER_POLL_S = 0.1
 # Retry period of a payload held back by a full link.
 _LWD_HOLD_RETRY_TICK_MS = 10
 _LWD_STARTUP_TIMEOUT_S = 30.0
@@ -618,7 +629,16 @@ class LwdEdgeControlPlane(LwdControlPlane):
     def wait_until_ready(
         self, timeout_s: float | None = None
     ) -> dict[LwdConnectionId, LwdPeer]:
-        """Block until every cloud DP rank accepted; shuts down on failure.
+        """Block until the clouds accepted, then return the accepted subset.
+
+        Elastic partial start: the yaml may plan more clouds than are
+        launched. The FIRST accept is given the full ``timeout_s`` (a
+        co-started cloud accepts only after its model load); every
+        remaining handshake then gets a short straggler grace and the
+        edge proceeds with whoever accepted. A cloud that never shows
+        keeps getting periodic HELLOs and is adopted by the engine at
+        runtime when its scheduling limits arrive. Zero accepts is a
+        deployment error and still fails fast.
 
         Must run on the thread that called `start()`.
 
@@ -626,14 +646,38 @@ class LwdEdgeControlPlane(LwdControlPlane):
             timeout_s: Defaults to the configured `handshake_timeout_s`.
 
         Returns:
-            The cloud peers by dp_rank to send to.
+            The cloud peers by connection to send to (the accepted
+            subset).
 
         Raises:
-            LwdHandshakeError: Timeout, rejection, or IO thread failure.
+            LwdHandshakeError: Timeout with zero accepts, rejection, or IO
+            thread failure.
         """
         if timeout_s is None:
             timeout_s = self.spec.config.handshake_timeout_s
-        if not self._settled.wait(timeout_s):
+
+        def _fail_or_wait(deadline: float) -> bool:
+            """Sleep toward ``deadline``; True when every handshake
+            settled in the meantime, raising on failure."""
+            if self._handshake_error is not None:
+                self.shutdown()
+                raise LwdHandshakeError(self._handshake_error)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            return self._settled.wait(min(_LWD_STRAGGLER_POLL_S, remaining))
+
+        # Phase A: the first accept (the long window covers a cloud that
+        # is still loading its model).
+        first_deadline = time.monotonic() + timeout_s
+        while not self._settled.is_set() and not self._accepted_peers():
+            if not _fail_or_wait(first_deadline):
+                break
+        clouds = self._accepted_peers()
+        if self._handshake_error is not None:
+            self.shutdown()
+            raise LwdHandshakeError(self._handshake_error)
+        if not clouds:
             missing = self._missing_handshakes()
             self.shutdown()
             raise LwdHandshakeError(
@@ -642,15 +686,35 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 f"({self._num_hellos_sent} hellos delivered); missing connections "
                 f"{sorted(missing)}"
             )
+        # Phase B: straggler grace for the remaining planned clouds.
+        grace_deadline = time.monotonic() + _LWD_STRAGGLER_GRACE_S
+        while not self._settled.is_set():
+            if not _fail_or_wait(grace_deadline):
+                break
         if self._handshake_error is not None:
             self.shutdown()
             raise LwdHandshakeError(self._handshake_error)
-        clouds: dict[LwdConnectionId, LwdPeer] = {}
-        for connection_id, handshake in self._handshakes.items():
-            cloud = handshake.cloud
-            assert cloud is not None, "settled without every cloud accepted"
-            clouds[connection_id] = cloud
+        clouds = self._accepted_peers()
+        missing = self._missing_handshakes()
+        if missing:
+            logger.warning(
+                "control plane %s: proceeding with %d of %d accepted cloud "
+                "DP ranks (elastic partial start); missing connections %s "
+                "will serve once they start -- periodic HELLOs keep retrying "
+                "and the engine adopts them at runtime",
+                self._label,
+                len(clouds),
+                len(self._handshakes),
+                sorted(missing),
+            )
         return clouds
+
+    def _accepted_peers(self) -> dict[LwdConnectionId, LwdPeer]:
+        return {
+            connection_id: handshake.cloud
+            for connection_id, handshake in self._handshakes.items()
+            if handshake.cloud is not None
+        }
 
     def _missing_handshakes(self) -> set[LwdConnectionId]:
         return {

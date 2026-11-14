@@ -5,7 +5,9 @@ rank of its instance.
 
 Real ZMQ sockets on loopback, no engine: the checks cover the handshake to
 every cloud, directed sends, per-link inbound attribution, the per-peer
-hold of full links and the startup failure when a cloud is missing.
+hold of full links, the elastic partial start (a missing planned cloud
+proceeds with the accepted subset) and the startup failure when no cloud
+accepts at all.
 """
 
 from __future__ import annotations
@@ -111,10 +113,45 @@ def test_edge_serves_every_cloud_dp_rank() -> None:
             cloud.shutdown()
 
 
-def test_edge_fails_fast_when_a_cloud_is_missing() -> None:
+def test_edge_fails_fast_when_no_cloud_accepts() -> None:
+    """Zero accepts within the window is a deployment error: the edge
+    still fails fast (elastic partial start only tolerates a MISSING
+    cloud, not a cloud-less edge)."""
     edge = _edge(_LWD_TEST_PORTS[:1] + (_LWD_TEST_PORTS[2],))
     try:
         with pytest.raises(LwdHandshakeError, match="did not accept"):
             edge.wait_until_ready(2.0)
     finally:
         edge.shutdown()
+
+
+def test_edge_proceeds_with_accepted_subset_when_a_cloud_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elastic partial start: the yaml plans two clouds but only one is
+    launched -- the edge proceeds with the accepted subset after the
+    straggler grace, and the accepted cloud is fully served."""
+    import vllm.v1.lwd_control.lwd_comm.lwd_control_plane as plane_module
+
+    monkeypatch.setattr(plane_module, "_LWD_STRAGGLER_GRACE_S", 0.2)
+    ports = _LWD_TEST_PORTS[:2]
+    clouds = [_cloud(0, ports[0], 2)]
+    recorders = [_Recorder()]
+    clouds[0].start(recorders[0])
+    edge = _edge(ports)
+    edge_recorder = _Recorder()
+    edge_sender = edge.start(edge_recorder)
+    try:
+        peers = edge.wait_until_ready(_LWD_WAIT_S)
+        assert len(peers) == 1
+        assert not edge_recorder.fatal
+        # The accepted subset is fully served.
+        (peer,) = peers.values()
+        assert edge_sender.send(peer, b"to-dp0")
+        _drain(recorders, 1, _LWD_WAIT_S)
+        assert [p for _peer, p in recorders[0].payloads] == [b"to-dp0"]
+        assert not recorders[0].fatal
+    finally:
+        edge.shutdown()
+        for cloud in clouds:
+            cloud.shutdown()

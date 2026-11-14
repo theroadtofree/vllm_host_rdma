@@ -206,6 +206,18 @@ has no runtime counterpart here (only the CLI/config validation of
    edge_share deployment (one engine host, N API frontends); a cross-host
    attach frontend must register inside the grace window.
 
+   The same partial-start semantics cover the CLOUD dimension (the yaml
+   plans N clouds, fewer are launched): the edge's data-plane warm-up and
+   control-plane barrier give the first link/accept the long window (a
+   co-started cloud binds its listener only partway into its own init)
+   and the remainder a 60 s straggler grace, then proceed with the
+   connected/accepted subset; zero accepts is still a startup failure.
+   A cloud that starts later reconnects through its supervision thread,
+   its handshake keeps being retried by the periodic HELLO, and its
+   scheduling limits adopt it into the running edge (validated limits,
+   sendable peer, liveness seed, probe hash sizes — the same
+   `_lwd_adopt_cloud` routine the init path uses).
+
 ### 3.5 Logging discipline (standard 7.12)
 
 Event chains at error level, one line per event; steady-state probes at debug.
@@ -253,7 +265,7 @@ introduced once each; the old `reannounce` is retired in favor of
 | --- | --- | --- |
 | 1 | Data-plane consumption side (§3.2) + registry skeleton | Unit tests in full; **idle-window drills**: kill the peer with zero in-flight traffic, restart it, new requests must flow with the error chains below and the survivor process NOT restarting |
 | 2 | Failure containment + control-plane liveness, linked teardown, gate (§3.3) | Traffic-window drills: survivor keeps serving through the outage, victim requests fail within the bounded window (no ~63 s zombie hang), gate admits/rejects/releases |
-| 3 | ROUTER handover + attach runtime (§3.4) | Primary-edge restart drill: attach frontend re-registers, engine revives, requests survive; partial-start drill: yaml plans N, launch 1 → instance 0 serves alone, launch the attach frontend later → it serves without a primary restart |
+| 3 | ROUTER handover + attach runtime (§3.4) | Primary-edge restart drill: attach frontend re-registers, engine revives, requests survive; partial-start drills: yaml plans N, launch edge 0 + cloud 0 only → instance 0 serves alone; launch the attach frontend later → it serves without a primary restart; start cloud 1 later → its connection is adopted while the edge keeps serving |
 
 The Phase 1 acceptance is deliberately narrow: the survivor's failure
 handling is fatal today (an edge transfer failure kills the engine; a cloud
