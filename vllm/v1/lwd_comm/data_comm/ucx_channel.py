@@ -544,6 +544,10 @@ class LwdUcxChannel:
         self._early_count = 0
         # request pointer -> completion routing (send/put: (op, tag, size))
         self._send_reqs: dict[int, tuple[LwdUcxOp, int, int]] = {}
+        # request pointer -> post time: feeds the send-side stuck watchdog
+        # (a rendezvous send completes only when the peer posts the matching
+        # recv; a long-stuck oldest send names the head-of-line blocker)
+        self._send_reqs_t0: dict[int, float] = {}
         # request pointer -> (block, pool kind), used to re-post
         self._recv_reqs: dict[int, tuple[LwdUcxBlock, str]] = {}
         self._q: queue.Queue[Any | None] = queue.Queue()
@@ -906,6 +910,7 @@ class LwdUcxChannel:
         self._early.clear()
         self._early_count = 0
         self._send_reqs.clear()
+        self._send_reqs_t0.clear()
 
     def _cancel_posted_recvs(self) -> None:
         """Withdraw unfinished pre-posted receives before close: an ep
@@ -1276,6 +1281,26 @@ class LwdUcxChannel:
                         min(self._expects),
                         self._early_count,
                     )
+                if self._send_reqs_t0:
+                    # mirror of the recv watchdog: a tagged send in flight >5s
+                    # means the peer has not posted the matching receive (under
+                    # rndv the buffer -- staging or caller memory -- is held
+                    # until it does). A stuck oldest send is the head-of-line
+                    # blocker: every later frame queues behind it in the
+                    # assembly layer while the peer's consumer sits in a wait.
+                    _stuck_s = now - min(self._send_reqs_t0.values())
+                    if _stuck_s > 5.0:
+                        _oldest = min(self._send_reqs_t0, key=self._send_reqs_t0.get)
+                        _ent = self._send_reqs.get(_oldest)
+                        logger.error(
+                            "[ucx-chan] %s sends stuck %.1fs: sends=%d "
+                            "min_tag=%d early=%d",
+                            self._name,
+                            _stuck_s,
+                            len(self._send_reqs),
+                            _ent[1] if _ent else -1,
+                            self._early_count,
+                        )
                 logger.warning(
                     "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
                     "early=%d broken=%s",
@@ -1340,9 +1365,11 @@ class LwdUcxChannel:
             self._fail_all_pending(RuntimeError("ucx send post failed"))
             return
         self._send_reqs[int(req)] = (op, tag, size)
+        self._send_reqs_t0[int(req)] = time.monotonic()
 
     def _on_send_done(self, request, status, user_data=None) -> None:  # noqa: ANN001
         ent = self._send_reqs.pop(int(request), None)
+        self._send_reqs_t0.pop(int(request), None)
         with contextlib.suppress(Exception):
             self._require_link().request_free(int(request))
         if ent is None:
@@ -1398,9 +1425,11 @@ class LwdUcxChannel:
             self._fail_all_pending(RuntimeError("ucx put post failed"))
             return
         self._send_reqs[int(req)] = (op, tag, size)
+        self._send_reqs_t0[int(req)] = time.monotonic()
 
     def _on_put_done(self, request, status, user_data=None) -> None:  # noqa: ANN001
         ent = self._send_reqs.pop(int(request), None)
+        self._send_reqs_t0.pop(int(request), None)
         with contextlib.suppress(Exception):
             self._require_link().request_free(int(request))
         if ent is None:
@@ -1609,6 +1638,7 @@ class LwdUcxChannel:
             with contextlib.suppress(Exception):
                 op._finish(error=error)
         self._send_reqs.clear()
+        self._send_reqs_t0.clear()
         self._recv_reqs.clear()
         for q in self._expects.values():
             for op in q:
