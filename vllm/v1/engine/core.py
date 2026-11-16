@@ -1327,14 +1327,28 @@ class EngineCoreProc(EngineCore):
                 # machine, dummy batches, DP collectives) on the DP engine
                 # base; non-MoE engines stay independent. The edge runs one
                 # process for all its DP connections.
+                #
+                # The DP layout is checked here because this is the last point
+                # that still sees the launch value: an independent non-MoE DP
+                # engine resets `data_parallel_size` to 1 below, and derived
+                # configs are rebuilt from the reset object afterwards. The
+                # rule is the same for the host and device data planes.
                 lwd_dp_size = parallel_config.data_parallel_size
+                lwd_dp_count = len(lwd.instance.dp)
+                if lwd.role == "edge" and lwd_dp_size > 1:
+                    raise ValueError(
+                        "[LWD] one edge process serves every DP "
+                        "connection; start the edge with data parallel "
+                        f"size 1, got {lwd_dp_size}"
+                    )
+                if lwd.role == "cloud" and lwd_dp_size != lwd_dp_count:
+                    raise ValueError(
+                        "[LWD] one cloud engine runs per DP: this topology "
+                        f"declares {lwd_dp_count} cloud DPs, start the cloud "
+                        f"with data parallel size {lwd_dp_count}, got "
+                        f"{lwd_dp_size}"
+                    )
                 if lwd.role == "edge":
-                    if lwd_dp_size > 1:
-                        raise ValueError(
-                            "[LWD] one edge process serves every DP "
-                            "connection; start the edge with data parallel "
-                            f"size 1, got {lwd_dp_size}"
-                        )
                     from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (  # noqa: E501
                         LwdEdgeEngineCore,
                     )

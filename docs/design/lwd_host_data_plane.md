@@ -48,7 +48,7 @@ qos:
 | `dp[].data_port` | Cloud-only, required on every cloud DP in host mode; the edge never listens |
 | `deployment.hccl_world_size`, `dp[].ranks` | Must be omitted in host mode |
 
-`LwdTopology.validate_layout` dispatches to `_validate_host_layout`, which fails startup when ranks or `hccl_world_size` are present, when an edge declares `data_port`, when a cloud DP lacks it, or when one address repeats a `data_port`. `lwd_check_parallel_config` then requires `parallel_config.data_parallel_size == len(instance.dp)`: each DP is its own engine launch. In host mode it also rejects an edge with `tensor_parallel_size > 1`, because only edge TP rank 0 holds the host links and there is no cross-TP aggregation path: the failure lands at startup instead of a later missing-IO error. Cloud tensor parallelism is unaffected.
+`LwdTopology.validate_layout` dispatches to `_validate_host_layout`, which fails startup when ranks or `hccl_world_size` are present, when an edge declares `data_port`, when a cloud DP lacks it, or when one address repeats a `data_port`. The DP layout follows the role on both data planes: the engine dispatch requires `data_parallel_size == 1` for the edge (one process serves every DP connection) and `data_parallel_size == len(instance.dp)` for the cloud, and the control plane re-checks it with the launched DP size. `lwd_check_parallel_config` only keeps the host-only rule: an edge with `tensor_parallel_size > 1` is rejected, because only edge TP rank 0 holds the host links and there is no cross-TP aggregation path, so the failure lands at startup instead of a later missing-IO error. Cloud tensor parallelism is unaffected.
 
 ## Link model
 
