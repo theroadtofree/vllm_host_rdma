@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing import Lock
 from typing import Any
 
@@ -73,6 +73,8 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+        # Lazy single-worker pool for non_block RPCs (see collective_rpc).
+        self._rpc_thread: ThreadPoolExecutor | None = None
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -105,16 +107,30 @@ class UniProcExecutor(Executor):
                 result = result.get_output()
             return result if single_value else [result]
 
-        try:
+        # Async path: run on the single background worker, never inline.
+        # The previous inline + already-done future silently degraded
+        # step_with_batch_queue into synchronous stepping: every batch's
+        # full cost -- including host-blocking comm waits (the LWD edge's
+        # DOWN frame waits) -- serialized on the engine thread, and
+        # multi-instance throughput halved. One worker keeps strict FIFO
+        # submission, which is the overlapped scheduler's harvest-order
+        # contract (futures complete in dispatch order).
+        if self._rpc_thread is None:
+            self._rpc_thread = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="UniprocExecutorRpc"
+            )
+
+        def _rpc() -> Any:
+            # Same resolution semantics as the sync branch above, just on
+            # the pool thread: an AsyncModelRunnerOutput blocks the pool
+            # worker until its output is ready (ordering preserved), the
+            # engine's harvest sees a plain ModelRunnerOutput as before.
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
-                return AsyncOutputFuture(result, single_value)
-            future = Future[Any]()
-            future.set_result(result if single_value else [result])
-        except Exception as e:
-            future = Future[Any]()
-            future.set_exception(e)
-        return future
+                result = result.get_output()
+            return result if single_value else [result]
+
+        return self._rpc_thread.submit(_rpc)
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False
@@ -150,6 +166,11 @@ class UniProcExecutor(Executor):
         return
 
     def shutdown(self) -> None:
+        rpc_thread = getattr(self, "_rpc_thread", None)
+        if rpc_thread is not None:
+            self._rpc_thread = None
+            # Let queued RPCs finish before the worker they target goes away.
+            rpc_thread.shutdown(wait=True)
         if worker := self.driver_worker:
             worker.shutdown()
 
