@@ -155,6 +155,56 @@ def test_gate_uses_live_staleness_before_the_first_sweep(
     assert engine._lwd_gate_reason("plain-req") is not None
 
 
+def test_gate_rejects_when_the_requests_edge_has_no_adopted_cloud(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Elastic partial start: instance 1's cloud starts later — its
+    frontend's request must fail fast at the gate, never reach a routing
+    layer that would address the un-adopted connection (the KeyError on
+    the shared engine's first drill)."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)  # edge 0 adopted
+    reason = engine._lwd_gate_reason("e1-wrapped-req")
+    assert reason is not None
+    assert "not started" in reason
+    # The adopted edge still admits.
+    assert engine._lwd_gate_reason("plain-req") is None
+
+
+def test_routing_to_an_unadopted_cloud_fails_the_request_not_the_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-cloud residual: when routing still scores an un-adopted
+    sibling, the admission is cancelled and the request aborted (fast,
+    retryable) — the notify must never address a cloud the engine cannot
+    send to."""
+    from types import SimpleNamespace
+
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION_E1], notified)
+    engine.aborts_queue = _RecordingQueue()
+    cancelled: list = []
+    unadopted = LwdConnectionId(1, 2, 0)
+    engine.scheduler = SimpleNamespace(
+        lwd_admit_request=lambda request, preferred: unadopted,
+        lwd_edge_cancel_admission=cancelled.append,
+    )
+    engine._lwd_admit_and_notify(SimpleNamespace(request_id="e1-wrapped-req"))
+    assert cancelled == ["e1-wrapped-req"]
+    assert engine.aborts_queue.items == [["e1-wrapped-req"]]
+
+
+def test_send_to_an_unadopted_cloud_drops_instead_of_raising() -> None:
+    """Last line of defense: a message still landing on an un-adopted
+    connection drops with a log — the KeyError killed the shared engine
+    (instance 0's requests went down with it)."""
+    from types import SimpleNamespace
+
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine._lwd_clouds = {}
+    engine._lwd_send_to_cloud(CONNECTION_E1, SimpleNamespace())
+
+
 def test_gate_rejection_uses_the_abort_channel_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

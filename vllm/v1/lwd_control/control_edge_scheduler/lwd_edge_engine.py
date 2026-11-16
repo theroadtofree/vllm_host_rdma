@@ -314,7 +314,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         the payloads) drops the message instead of failing the engine:
         the restarted cloud's state is fresh, the request fails through
         the data-plane containment path."""
-        cloud = self._lwd_clouds[dp_idx]
+        cloud = self._lwd_clouds.get(dp_idx)
+        if cloud is None:
+            # Elastic partial start residual: the connection's cloud is
+            # planned but not adopted yet (adoption happens when its
+            # scheduling limits arrive). The admission gate rejects such
+            # requests up front; anything that still lands here drops
+            # with a log like the unregistered path — a KeyError would
+            # kill the shared engine.
+            lwd_logger.error(
+                "[edge] %s to cloud %s dropped: connection not adopted "
+                "yet",
+                type(message).__name__,
+                dp_idx,
+            )
+            return
         try:
             for attempt in range(_LWD_SEND_RETRY_STEPS):
                 if self._lwd_send(cloud, message):
@@ -378,6 +392,20 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.aborts_queue.put_nowait([request.request_id])
             return
         dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+        if dp_idx not in self._lwd_clouds:
+            # Elastic partial start: routing scored a planned connection
+            # whose cloud is not adopted yet (a multi-cloud-per-edge pick
+            # of the un-adopted sibling, or a race with adoption). Same
+            # fast, retryable rejection as the gate — cancel the
+            # admission, never notify an unaddressable cloud.
+            lwd_logger.error(
+                "[edge] request rejected req=%s: %s not adopted yet",
+                request.request_id,
+                dp_idx,
+            )
+            self.scheduler.lwd_edge_cancel_admission(request.request_id)
+            self.aborts_queue.put_nowait([request.request_id])
+            return
         client = self._lwd_coord_clients.get(dp_idx)
         try:
             if client is not None:
@@ -572,7 +600,20 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         step head, so a cloud that went silent while the engine idled must
         not admit the very request that wakes it. All routes silent rejects
         everything; a wrapped id (the edge_share per-frontend prefix)
-        rejects when every connection of its source edge is silent."""
+        rejects when every connection of its source edge is silent.
+        Elastic partial start adds the not-yet-adopted case: a request
+        whose source edge has NO adopted cloud (the planned cloud starts
+        later, or is still loading) is rejected the same way — fail fast
+        and retryably. Letting it through would route it to an
+        unaddressable connection and kill the shared engine."""
+        edge_id, _ = parse_edge_id(request_id)
+        scoped = {c for c in self._lwd_clouds if c.edge_id == edge_id}
+        if not scoped:
+            return (
+                f"cloud unavailable (no adopted connection for edge "
+                f"{edge_id}; the planned cloud has not started/registered "
+                f"yet)"
+            )
         with self._lwd_hello_lock:
             now = time.monotonic()
             silent = self._lwd_silent_routes | {
@@ -582,8 +623,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             }
         if not silent:
             return None
-        edge_id, _ = parse_edge_id(request_id)
-        scoped = {c for c in self._lwd_clouds if c.edge_id == edge_id}
         if set(self._lwd_clouds) <= silent or (
             scoped and scoped <= silent
         ):

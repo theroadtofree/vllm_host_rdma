@@ -216,7 +216,12 @@ has no runtime counterpart here (only the CLI/config validation of
    its handshake keeps being retried by the periodic HELLO, and its
    scheduling limits adopt it into the running edge (validated limits,
    sendable peer, liveness seed, probe hash sizes — the same
-   `_lwd_adopt_cloud` routine the init path uses).
+   `_lwd_adopt_cloud` routine the init path uses). Until adoption, the
+   availability gate rejects the requesting frontend's requests with
+   "no adopted connection" (fast, retryable, the same client-visible
+   shape as the silent-route rejection), a post-route check cancels any
+   admission that still scored an un-adopted connection, and the send
+   path drops with a log instead of crashing the shared engine.
 
 ### 3.5 Logging discipline (standard 7.12)
 
