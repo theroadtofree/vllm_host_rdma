@@ -67,7 +67,7 @@ from vllm.v1.request import Request
 # sitting in a DOWN frame wait, so the wait hides behind the forwards
 # instead of serializing with them on one thread (depth 2 left no margin
 # and dual-instance collapsed to ~half throughput).
-LWD_EDGE_BATCH_QUEUE_DEPTH = 2
+LWD_EDGE_BATCH_QUEUE_DEPTH = 4
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
