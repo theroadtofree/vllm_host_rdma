@@ -5,9 +5,11 @@
 each cloud's scheduling limits and the request entry (edge admission +
 announcement to the routed cloud DP rank; communication stays in the engine).
 
-Stepping is the native step_with_batch_queue, adapted at construction: depth
-2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
-normally completed batch returning None becomes a placeholder).
+Stepping is the native step_with_batch_queue, adapted at construction: host
+comm sizes the queue for dynamic scale-out (8 instances x 2 slots), device
+comm keeps the depth-2 native baseline; is_pooling_model=True (no native
+sample_tokens) and an executor proxy (a normally completed batch returning
+None becomes a placeholder).
 
 Startup blocks until every cloud DP rank accepted the handshake and sent its
 scheduling limits, within one handshake timeout; any failure stops the
@@ -62,12 +64,17 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 from vllm.v1.request import Request
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
-# reaped. 4 matches the performance-proven reference branch: with truly
-# async execution the queue lets embed batches run ahead of an unembed
-# sitting in a DOWN frame wait, so the wait hides behind the forwards
-# instead of serializing with them on one thread (depth 2 left no margin
-# and dual-instance collapsed to ~half throughput).
-LWD_EDGE_BATCH_QUEUE_DEPTH = 4
+# reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
+# conservative, validate performance with 2 first.
+LWD_EDGE_BATCH_QUEUE_DEPTH = 2
+# Host comm (UCX) scales the instance count dynamically, so the queue is
+# sized once for the maximum deployment instead of the assembly-time
+# connection count: 8 instances x 2 slots. 2 slots is the per-connection
+# end-to-end window (the cloud's early-recv pump caps in-flight UP chunks
+# per connection at 2); deeper per-connection queuing only accumulates
+# behind its backpressure.
+LWD_EDGE_HOST_MAX_INSTANCES = 8
+LWD_EDGE_HOST_SLOTS_PER_INSTANCE = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
@@ -140,7 +147,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
-        self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
+        if self.lwd_config.topology.is_host_comm:
+            # Host comm scales instances dynamically, so size for the
+            # maximum once (see LWD_EDGE_HOST_MAX_INSTANCES); the queue
+            # survives scale-out without re-assembly.
+            self.batch_queue_size = (
+                LWD_EDGE_HOST_MAX_INSTANCES * LWD_EDGE_HOST_SLOTS_PER_INSTANCE
+            )
+        else:
+            self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
