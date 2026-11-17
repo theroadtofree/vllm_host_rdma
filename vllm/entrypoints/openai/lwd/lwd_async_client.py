@@ -20,19 +20,18 @@ Carried over from the old branch's primary-restart line:
   criteria — a normal output frame (the replacement engine already
   produced output) or the READY re-send buffered on the input ROUTER,
   probed from the send path when the dead marker intercepts a request;
-* a frontend-side ROUTER connection monitor (drill-log chain) and
-  rate-limited message-path probes (debug).
+* a frontend-side ROUTER connection monitor (drill-log chain).
 
 The factory wrapper (``apply_lwd_async_client_patch``) routes frontend
-client construction through this class when the LWD config is active;
-non-LWD deployments and DP>1 shapes keep the native factory untouched.
+client construction through this class when the LWD host-comm config is
+active (data_plane_comm=host only); non-LWD deployments, device-comm (HCCL)
+and DP>1 shapes keep the native factory untouched.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-import time
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
@@ -56,37 +55,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 logger = init_logger(__name__)
 
 Thread = threading.Thread
-
-# Message-path probes (debug, rate-limited): paired with the engine-side
-# probes they prove the three hops of a request ("client sent -> engine
-# received -> client got output") during restart drills. At most one line
-# per interval under load, silent in normal operation.
-_TRACE_INTERVAL_S = 5.0
-_trace_send_last = 0.0
-_trace_output_last = 0.0
-
-
-def _trace_request_send(request_type: Any, request: Any, engine: Any) -> None:
-    global _trace_send_last
-    now = time.monotonic()
-    if now - _trace_send_last < _TRACE_INTERVAL_S:
-        return
-    _trace_send_last = now
-    logger.debug(
-        "[Core-client] request SENT type=%s req=%s engine=%s",
-        getattr(request_type, "name", request_type),
-        getattr(request, "request_id", None),
-        engine.hex() if isinstance(engine, (bytes, bytearray)) else repr(engine),
-    )
-
-
-def _trace_output_received(nframes: int) -> None:
-    global _trace_output_last
-    now = time.monotonic()
-    if now - _trace_output_last < _TRACE_INTERVAL_S:
-        return
-    _trace_output_last = now
-    logger.debug("[Core-client] output frame received frames=%d", nframes)
 
 
 class LwdAsyncMPClient(AsyncMPClient):
@@ -216,7 +184,6 @@ class LwdAsyncMPClient(AsyncMPClient):
             try:
                 while True:
                     frames = await output_socket.recv_multipart(copy=False)
-                    _trace_output_received(len(frames))
                     try:
                         resources.validate_alive(frames)
                     except EngineDeadError:
@@ -294,22 +261,7 @@ class LwdAsyncMPClient(AsyncMPClient):
         )
 
     # ------------------------------------------------------------------ #
-    # Send path                                                           #
-    # ------------------------------------------------------------------ #
-
-    def _send_input(
-        self,
-        request_type: Any,
-        request: Any,
-        engine: Any = None,
-    ) -> Any:
-        if engine is None:
-            engine = self.core_engine
-        _trace_request_send(request_type, request, engine)
-        return super()._send_input(request_type, request, engine)
-
-    # ------------------------------------------------------------------ #
-    # Drill-log chain: engine connect/disconnect as seen from this ROUTER  #
+    # Router connection monitor (drill-log chain)                          #
     # ------------------------------------------------------------------ #
 
     def _lwd_start_router_monitor(self) -> None:
