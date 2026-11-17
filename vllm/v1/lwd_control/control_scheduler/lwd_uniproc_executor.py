@@ -16,17 +16,13 @@ keep the native executor untouched.
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from vllm.logger import init_logger
 from vllm.v1.executor.uniproc_executor import UniProcExecutor
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.serial_utils import run_method
-
-logger = init_logger(__name__)
 
 
 class LwdHostUniProcExecutor(UniProcExecutor):
@@ -36,8 +32,6 @@ class LwdHostUniProcExecutor(UniProcExecutor):
         super()._init_executor()
         # Lazy single-worker pool for non_block RPCs (see collective_rpc).
         self._rpc_thread: ThreadPoolExecutor | None = None
-        # One-shot executor-identity proof logs (see collective_rpc).
-        self._rpc_proof_logged: set[str] = set()
 
     def collective_rpc(  # type: ignore[override]
         self,
@@ -59,19 +53,6 @@ class LwdHostUniProcExecutor(UniProcExecutor):
                 kwargs=kwargs,
                 non_block=False,
                 single_value=single_value,
-            )
-
-        # One-shot ERROR proof: names the executor answering this RPC
-        # (grep [exec-proof]; multiproc prints its twin from the worker).
-        proof = getattr(method, "__name__", str(method))
-        if proof not in self._rpc_proof_logged:
-            self._rpc_proof_logged.add(proof)
-            logger.error(
-                "[exec-proof] %s collective_rpc method=%r non_block=True "
-                "on thread=%s",
-                type(self).__name__,
-                proof,
-                threading.current_thread().name,
             )
 
         # Async path: run on the single background worker, never inline.
