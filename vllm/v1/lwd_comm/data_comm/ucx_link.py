@@ -26,6 +26,7 @@ from vllm.v1.lwd_comm.data_comm.ucx_ucp import (
     _UCP_EP_PARAM_FIELD_REMOTE_ADDRESS,
     _UCP_FEATURE_RMA,
     _UCP_FEATURE_TAG,
+    _UCP_FEATURE_WAKEUP,
     _UCP_INIT_MAJOR,
     _UCP_INIT_MINOR,
     _UCP_MEM_PARAM_FIELD_ADDRESS,
@@ -117,8 +118,13 @@ class _UcxLink:
         self._err_cb = _ErrCb(self._on_ep_err)
         params = _UcpParams()
         params.field_mask = _UCP_PARAM_FIELD_FEATURES
-        params.features = _UCP_FEATURE_TAG | (
-            getattr(owner, "_put_thresh", 0) > 0 and _UCP_FEATURE_RMA or 0
+        # WAKEUP is always on: the IO thread's event loop sleeps on the
+        # worker fd (data-arrival notification); per ucp.h the transports
+        # only signal that fd if the feature was requested at init.
+        params.features = (
+            _UCP_FEATURE_TAG
+            | _UCP_FEATURE_WAKEUP
+            | (getattr(owner, "_put_thresh", 0) > 0 and _UCP_FEATURE_RMA or 0)
         )
         # UCT-level settings (e.g. IB_TRAFFIC_CLASS/IB_SL) are injected from
         # code: read (including env defaults) -> modify each item -> init ->

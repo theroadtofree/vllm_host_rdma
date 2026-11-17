@@ -59,6 +59,11 @@ def _ptr_status(p: int) -> int:
 
 _UCP_FEATURE_TAG = 1 << 0
 _UCP_FEATURE_RMA = 1 << 1
+# Required by the event-notification IO loop: without WAKEUP the
+# transports selected at ucp_init may never signal the worker fd
+# (ucp.h: "UCP features have to be triggered with UCP_FEATURE_WAKEUP
+# to select proper transport"), and ucp_worker_arm/efd are unreliable.
+_UCP_FEATURE_WAKEUP = 1 << 4
 _UCP_PARAM_FIELD_FEATURES = 1 << 0
 _UCP_EP_PARAM_FIELD_REMOTE_ADDRESS = 1 << 0
 _UCP_EP_PARAM_FIELD_ERR_HANDLER = 1 << 2
@@ -307,6 +312,18 @@ def _bind_ucp() -> None:
     ucp.ucp_request_free.argtypes = [ctypes.c_void_p]
     ucp.ucp_worker_progress.argtypes = [ctypes.c_void_p]
     ucp.ucp_worker_progress.restype = ctypes.c_uint
+    # Wake-up (event notification) progress: get the worker's event fd, then
+    # the IO thread sleeps on it (epoll) and only progresses when it fires
+    # -- data-arrival notification instead of a timed progress spin. arm()
+    # re-arms after every wakeup and returns UCS_ERR_BUSY when events
+    # arrived in between (then progress again instead of sleeping).
+    ucp.ucp_worker_get_efd.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    ucp.ucp_worker_get_efd.restype = ctypes.c_int
+    ucp.ucp_worker_arm.argtypes = [ctypes.c_void_p]
+    ucp.ucp_worker_arm.restype = ctypes.c_int
     # RMA put path: local mem_map + memh_pack (the blob must be freed with
     # ucp_memh_buffer_release, never libc free); the peer runs
     # ep_rkey_unpack to get an rkey usable with its own ep

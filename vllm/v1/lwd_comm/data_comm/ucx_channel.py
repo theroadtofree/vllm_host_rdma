@@ -75,6 +75,7 @@ import contextlib
 import ctypes
 import os
 import queue
+import select
 import struct
 import threading
 import time
@@ -456,6 +457,7 @@ class _ChanLink(_UcxLink):
     def __init__(self, owner: LwdUcxChannel) -> None:
         super().__init__(owner)
         self.peer_max_msg = 0  # set by the handshake (peer per-message ceiling)
+        self._efd: int | None = None  # cached worker event fd (see efd())
 
     def recv_masked_nb(
         self, addr: int, length: int, tag: int, mask: int, cb: Any
@@ -471,6 +473,28 @@ class _ChanLink(_UcxLink):
             mask,
             ctypes.byref(_req_param(cb)),
         )
+
+    def efd(self) -> int:
+        """The worker's event fd (UCX wake-up mode). Only the IO thread may
+        call this: the fd is only valid to wait on from the single thread
+        that owns the worker (and ucp_worker_get_efd itself touches the
+        worker). Cached per link."""
+        if self._efd is None:
+            fd = ctypes.c_int(-1)
+            rc = _require_ucp().ucp_worker_get_efd(
+                ctypes.c_void_p(self._worker), ctypes.byref(fd)
+            )
+            if rc != _UCS_OK:
+                raise RuntimeError(f"ucp_worker_get_efd failed status={rc}")
+            self._efd = fd.value
+        return self._efd
+
+    def arm(self) -> int:
+        """Re-arm event notification after a wakeup. UCS_OK: safe to sleep
+        on the efd. UCS_ERR_BUSY: events arrived in the meantime -- do NOT
+        sleep, loop back to progress first (per ucp.h wake-up contract:
+        drain all events with progress() first, arm only once quiet)."""
+        return _require_ucp().ucp_worker_arm(ctypes.c_void_p(self._worker))
 
     def _on_ep_err(self, arg, ep, status) -> None:  # noqa: ANN001
         # Override the base-class route: the owner is a LwdUcxChannel and does not
@@ -581,6 +605,14 @@ class LwdUcxChannel:
         self._recv_cb = _RecvCb(self._on_recv_done)
         self._put_cb = _SendCb(self._on_put_done)
         self._db_cb = _SendCb(self._on_db_done)
+        # Task-queue wakeup pipe (data-arrival notification design): every
+        # submission (or a link arrival / stop) writes one byte so the IO
+        # thread's epoll wakes immediately -- no timed spin, and a send
+        # posted from another thread never waits out a poll period. The
+        # writer is non-blocking; an EAGAIN just means a wakeup byte is
+        # already pending (level-triggered drain reads everything at once).
+        self._task_rfd, self._task_wfd = os.pipe()
+        os.set_blocking(self._task_wfd, False)
         # threads
         self._sup_thread: threading.Thread | None = None
         self._acc_thread: threading.Thread | None = None
@@ -590,6 +622,18 @@ class LwdUcxChannel:
             target=self._run, name=f"ucx-chan-io-{self._name}", daemon=True
         )
         self._thread.start()
+
+    def _wake(self) -> None:
+        """Wake the IO thread from its epoll (any thread may call)."""
+        wfd = self._task_wfd
+        if wfd is None:
+            return  # already torn down (shutdown)
+        try:
+            os.write(wfd, b"x")
+        except BlockingIOError:
+            pass  # a wakeup byte is already pending
+        except OSError:
+            pass  # shutdown race: the reader end is gone, nothing to wake
 
     # ------------------------------------------------------------------ #
     # Channel creation                                                   #
@@ -716,6 +760,7 @@ class LwdUcxChannel:
             )
         op = LwdUcxOp(tag, cb=cb, ref=ref)
         self._q.put(("send", tag, addr, size, op))
+        self._wake()
         return op
 
     def send_bytes(
@@ -729,6 +774,7 @@ class LwdUcxChannel:
         addr = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value
         op = LwdUcxOp(tag, cb=cb, ref=data)
         self._q.put(("send", tag, addr, len(data), op))
+        self._wake()
         return op
 
     def acquire_staging(self) -> LwdUcxBlock:
@@ -773,6 +819,7 @@ class LwdUcxChannel:
         _check_tag(tag)
         op = LwdUcxOp(tag, cb=cb)
         self._q.put(("recv", tag, op))
+        self._wake()
         return op
 
     def recv_into(
@@ -793,6 +840,7 @@ class LwdUcxChannel:
             raise ValueError(f"cap {cap} <= 0")
         op = LwdUcxOp(tag, cb=cb, into_addr=addr, into_cap=cap)
         self._q.put(("recv", tag, op))
+        self._wake()
         return op
 
     def on_broken(self, cb: Callable[[BaseException], None]) -> None:
@@ -824,6 +872,9 @@ class LwdUcxChannel:
             return
         err = reason if isinstance(reason, BaseException) else RuntimeError(str(reason))
         self._fail_all_pending(err)
+        # Cross-thread fail: wake the IO thread so queued tasks hit the
+        # fail-fast path now instead of after the epoll safety tick.
+        self._wake()
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Wait for the first link; False means timeout (still retrying)."""
@@ -872,11 +923,18 @@ class LwdUcxChannel:
         self._broken_event.set()  # wake the supervisor/accept threads to exit
         with contextlib.suppress(queue.Full):
             self._q.put_nowait(None)
+        self._wake()  # break the IO thread out of its epoll immediately
         if self._thread is not None:
             self._thread.join(timeout=timeout)
         for th in (self._sup_thread, self._acc_thread):
             if th is not None:
                 th.join(timeout=timeout)
+        # wakeup pipe teardown (post-join: no one can wake into a closed fd)
+        for fd in (self._task_wfd, self._task_rfd):
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        self._task_wfd = self._task_rfd = None
         if self._srv_fd is not None:
             with contextlib.suppress(Exception):
                 _sock.c_close(self._srv_fd)
@@ -992,6 +1050,7 @@ class LwdUcxChannel:
             tries = 0
             backoff = 0.2
             self._linkq.put(link)
+            self._wake()
             link.adopted.wait(timeout=10.0)
 
     def _accept_loop(self, port: int) -> None:
@@ -1011,6 +1070,7 @@ class LwdUcxChannel:
                 continue
             try:
                 self._linkq.put(self._build_from_fd(fd))
+                self._wake()
                 logger.warning(
                     "[ucx-chan] %s accepted from %s port %d", self._name, peer, port
                 )
@@ -1100,6 +1160,7 @@ class LwdUcxChannel:
         handshake and hand the link to the IO thread to adopt."""
         link = self._build_from_fd(fd, hdr)
         self._linkq.put(link)
+        self._wake()
         logger.warning(
             "[ucx-chan] %s accepted from %s port %d",
             self._name,
@@ -1217,101 +1278,206 @@ class LwdUcxChannel:
     # IO main loop                                                       #
     # ------------------------------------------------------------------ #
     def _run(self) -> None:
+        """Data-arrival notification loop (no timed spin).
+
+        The old loop slept 5ms per iteration and called progress() each
+        round -- 200 wakeups/s per channel and up to 5ms of pickup latency
+        on every frame. This loop drives the SAME state machine (link
+        swap -> dispatch -> progress -> watchdog) from three notification
+        sources instead:
+          * the task pipe: send/recv submissions (and link arrivals / stop)
+            from other threads write one byte, so a posted send is picked
+            up immediately;
+          * the worker event fd (ucp_worker_get_efd): UCX signals it when
+            progress is needed (rx, send completions, rndv steps);
+          * a 250ms safety tick: ONLY for UCX's internal protocol timers
+            (rndv pacing, keepalive, retransmit) -- the latency path never
+            waits for it.
+        Sleep discipline (per ucp.h wake-up contract): progress() is drained
+        to zero BEFORE every arm(); ucp_worker_arm returning BUSY means
+        events arrived in between, so the loop re-drains instead of
+        sleeping. The fd is level-triggered and only cleared by the
+        drain-to-zero + arm cycle, so no wakeup can be lost.
+        """
         last_log = 0.0
-        while True:
-            # link swap first: a link produced by the supervisor/accept thread takes
-            # over before anything else
-            with contextlib.suppress(queue.Empty):
-                link = self._linkq.get_nowait()
-                if link is not None:
-                    self._adopt_link(link)
-            task = None
-            # tasks stay off the queue until the first link arrives (FIFO, order
-            # kept); only once ready does a break fail fast
-            if self._ready.is_set() or self._broken or self._stopped:
+        epoll = select.epoll()
+        task_rfd = self._task_rfd
+        epoll.register(task_rfd, select.EPOLLIN)
+        worker_fd: int | None = None
+        # Safety-tick upper bound: only services UCX internal timers.
+        _SAFETY_TICK_S = 0.25
+        # Defensive yield after consecutive BUSY arms (contract: BUSY means
+        # progress has work; a repeat with zero progress would spin -- yield
+        # 1ms and retry, never burning a core on a library anomaly).
+        _arm_busy_streak = 0
+        try:
+            while True:
+                # 1) link swap first: a link produced by the supervisor/
+                #    accept thread takes over before anything else.
                 with contextlib.suppress(queue.Empty):
-                    task = self._q.get(timeout=0.005)
-            else:
-                time.sleep(0.005)
-            if task is None and self._stopped:
-                break
-            if task is not None:
-                if not self._ready.is_set() or self._broken:
-                    task[-1]._finish(
-                        error=RuntimeError(
-                            f"ucx channel {self._name} not available ("
-                            + (
-                                "first connect pending)"
-                                if not self._ready.is_set()
-                                else "reconnecting"
-                                + (
-                                    f", last ep status={self._ep_err})"
-                                    if self._ep_err
-                                    else ")"
+                    link = self._linkq.get_nowait()
+                    if link is not None:
+                        self._adopt_link(link)
+                        worker_fd = None  # new worker: re-register its fd
+                # 2) dispatch every queued task (FIFO). Tasks stay queued
+                #    (fail-fast on break) until the first link is ready.
+                active = self._ready.is_set() or self._broken or self._stopped
+                if active:
+                    while True:
+                        try:
+                            task = self._q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if task is None:
+                            # close() sentinel: exit without failing it
+                            self._stopped = True
+                            break
+                        if not self._ready.is_set() or self._broken:
+                            task[-1]._finish(
+                                error=RuntimeError(
+                                    f"ucx channel {self._name} not available ("
+                                    + (
+                                        "first connect pending)"
+                                        if not self._ready.is_set()
+                                        else "reconnecting"
+                                        + (
+                                            f", last ep status={self._ep_err})"
+                                            if self._ep_err
+                                            else ")"
+                                        )
+                                    )
                                 )
                             )
-                        )
-                    )
-                    continue
+                            continue
+                        try:
+                            self._dispatch(task)
+                        except Exception as exc:  # noqa: BLE001
+                            self._broken = True
+                            self._broken_event.set()
+                            task[-1]._finish(error=exc)
+                            logger.error(
+                                "[ucx-chan] %s broken: %r", self._name, exc
+                            )
+                if self._stopped:
+                    break
+                # 3) drain progress to zero (completions/callbacks fire here)
                 try:
-                    self._dispatch(task)
+                    progressed = self._progress_link_until_quiet()
                 except Exception as exc:  # noqa: BLE001
-                    self._broken = True
-                    self._broken_event.set()
-                    task[-1]._finish(error=exc)
-                    logger.error("[ucx-chan] %s broken: %r", self._name, exc)
-            try:
-                self._progress_link()
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "[ucx-chan] %s progress error (continuing): %r", self._name, exc
-                )
-            now = time.monotonic()
-            if now - last_log >= 10.0:
-                if self._expects and self._expects_t0 and now - self._expects_t0 > 5.0:
-                    # pre-posts dangling >5s: the frame never came (the peer never sent
-                    # it, or the wire dropped it) or consumption stalled -- frames
-                    # normally arrive in milliseconds, so a persistent gap is odd
                     logger.error(
-                        "[ucx-chan] %s recv expects stuck %.1fs: tags=%d "
-                        "min_tag=%d early=%d",
+                        "[ucx-chan] %s progress error (continuing): %r",
                         self._name,
-                        now - self._expects_t0,
-                        len(self._expects),
-                        min(self._expects),
-                        self._early_count,
+                        exc,
                     )
-                if self._send_reqs_t0:
-                    # mirror of the recv watchdog: a tagged send in flight >5s
-                    # means the peer has not posted the matching receive (under
-                    # rndv the buffer -- staging or caller memory -- is held
-                    # until it does). A stuck oldest send is the head-of-line
-                    # blocker: every later frame queues behind it in the
-                    # assembly layer while the peer's consumer sits in a wait.
-                    _stuck_s = now - min(self._send_reqs_t0.values())
-                    if _stuck_s > 5.0:
-                        _oldest = min(self._send_reqs_t0, key=self._send_reqs_t0.get)
-                        _ent = self._send_reqs.get(_oldest)
-                        logger.error(
-                            "[ucx-chan] %s sends stuck %.1fs: sends=%d "
-                            "min_tag=%d early=%d",
-                            self._name,
-                            _stuck_s,
-                            len(self._send_reqs),
-                            _ent[1] if _ent else -1,
-                            self._early_count,
-                        )
-                logger.warning(
-                    "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
-                    "early=%d broken=%s",
+                    progressed = True  # do not arm/sleep on an error state
+                # 4) watchdog (wall-clock driven, same 10s cadence as before)
+                now = time.monotonic()
+                if now - last_log >= 10.0:
+                    self._watchdog_log(now)
+                    last_log = now
+                if progressed:
+                    continue  # callbacks fired: re-drain before sleeping
+                # 5) arm and sleep on notifications
+                if self._link is not None and self._ready.is_set():
+                    if worker_fd is None:
+                        new_fd = self._link.efd()
+                        try:
+                            epoll.register(new_fd, select.EPOLLIN)
+                        except OSError:
+                            # fd-number reuse race with a not-yet-reaped old
+                            # worker: drop the stale registration and retry
+                            with contextlib.suppress(OSError):
+                                epoll.unregister(new_fd)
+                            epoll.register(new_fd, select.EPOLLIN)
+                        worker_fd = new_fd
+                        _arm_busy_streak = 0
+                        continue  # one clean drain-then-register cycle
+                    if self._link.arm() != _UCS_OK:
+                        _arm_busy_streak += 1
+                        if _arm_busy_streak >= 3:
+                            time.sleep(0.001)
+                            _arm_busy_streak = 0
+                        continue  # BUSY: events arrived, do not sleep
+                    _arm_busy_streak = 0
+                events = epoll.poll(timeout=_SAFETY_TICK_S)
+                # drain the pipe fully (level-triggered; any writer byte
+                # pending keeps it readable, one read clears all bytes)
+                task_readable = False
+                for fd, _ev in events:
+                    if fd == task_rfd:
+                        task_readable = True
+                if task_readable:
+                    try:
+                        os.read(task_rfd, 65536)
+                    except OSError:
+                        pass  # torn down concurrently
+                # worker_fd readable: nothing to do here -- the loop head
+                # re-drains progress (step 3), which clears the fd level.
+        finally:
+            with contextlib.suppress(OSError):
+                epoll.close()
+
+    def _progress_link_until_quiet(self) -> bool:
+        """progress() until a call advances nothing; returns whether any
+        op advanced (any callback may have fired). Draining to zero is a
+        precondition for arming the worker fd (ucp.h wake-up contract)."""
+        if self._link is None or not self._ready.is_set():
+            return False
+        progressed = False
+        for _ in range(1024):
+            n = self._link.progress()
+            if n == 0:
+                break
+            progressed = True
+        if self._ep_err is not None and not self._broken:
+            self._fail_all_pending(RuntimeError(f"ucx ep error status={self._ep_err}"))
+        return progressed
+
+    def _watchdog_log(self, now: float) -> None:
+        """Wall-clock watchdog (10s cadence): same probes as before."""
+        if self._expects and self._expects_t0 and now - self._expects_t0 > 5.0:
+            # pre-posts dangling >5s: the frame never came (the peer never sent
+            # it, or the wire dropped it) or consumption stalled -- frames
+            # normally arrive in milliseconds, so a persistent gap is odd
+            logger.error(
+                "[ucx-chan] %s recv expects stuck %.1fs: tags=%d "
+                "min_tag=%d early=%d",
+                self._name,
+                now - self._expects_t0,
+                len(self._expects),
+                min(self._expects),
+                self._early_count,
+            )
+        if self._send_reqs_t0:
+            # mirror of the recv watchdog: a tagged send in flight >5s
+            # means the peer has not posted the matching receive (under
+            # rndv the buffer -- staging or caller memory -- is held
+            # until it does). A stuck oldest send is the head-of-line
+            # blocker: every later frame queues behind it in the
+            # assembly layer while the peer's consumer sits in a wait.
+            _stuck_s = now - min(self._send_reqs_t0.values())
+            if _stuck_s > 5.0:
+                _oldest = min(self._send_reqs_t0, key=self._send_reqs_t0.get)
+                _ent = self._send_reqs.get(_oldest)
+                logger.error(
+                    "[ucx-chan] %s sends stuck %.1fs: sends=%d "
+                    "min_tag=%d early=%d",
                     self._name,
+                    _stuck_s,
                     len(self._send_reqs),
-                    sum(len(q) for q in self._expects.values()),
-                    len(self._expects),
+                    _ent[1] if _ent else -1,
                     self._early_count,
-                    self._broken,
                 )
-                last_log = now
+        logger.warning(
+            "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
+            "early=%d broken=%s",
+            self._name,
+            len(self._send_reqs),
+            sum(len(q) for q in self._expects.values()),
+            len(self._expects),
+            self._early_count,
+            self._broken,
+        )
 
     def _progress_link(self) -> None:
         if self._link is None or not self._ready.is_set():
