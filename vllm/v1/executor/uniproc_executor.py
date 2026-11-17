@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from multiprocessing import Lock
+import threading
 from typing import Any
 
 import torch
@@ -27,6 +28,11 @@ from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+# One-shot executor-identity proof: RPC method names already logged once.
+# ERROR on purpose -- grep [exec-proof] to confirm which executor (uni-
+# vs multi-proc) carries the LWD data plane (UCX now, HCCL on device).
+_EXEC_PROOF_LOGGED: set[str] = set()
 
 
 class AsyncOutputFuture(Future):
@@ -100,6 +106,19 @@ class UniProcExecutor(Executor):
     ) -> Any:
         if kwargs is None:
             kwargs = {}
+
+        # One-shot ERROR proof: this RPC is answered by UniProcExecutor
+        # (multiproc prints its twin from the worker process).
+        proof = getattr(method, "__name__", str(method))
+        if proof not in _EXEC_PROOF_LOGGED:
+            _EXEC_PROOF_LOGGED.add(proof)
+            logger.error(
+                "[exec-proof] UniProcExecutor collective_rpc method=%r "
+                "non_block=%s on thread=%s",
+                proof,
+                non_block,
+                threading.current_thread().name,
+            )
 
         if not non_block:
             result = run_method(self.driver_worker, method, args, kwargs)

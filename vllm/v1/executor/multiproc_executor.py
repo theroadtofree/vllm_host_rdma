@@ -598,6 +598,12 @@ class WorkerProcHandle:
         )
 
 
+# One-shot executor-identity proof: (rank, method) RPCs already logged.
+# ERROR on purpose -- grep [exec-proof] to see which executor (uni- vs
+# multi-proc) actually runs each RPC, incl. LWD data-plane work.
+_EXEC_PROOF_LOGGED: set[tuple[int, str]] = set()
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -1097,6 +1103,19 @@ class WorkerProc:
     ) -> None:
         """Execute one RPC in a separate frame from the dequeue loop."""
         method, args, kwargs, output_rank = rpc_request
+        # One-shot ERROR proof: multiproc-side twin of the uniproc print --
+        # whichever [exec-proof] lines appear while UCX (host) or HCCL
+        # (device) traffic runs name the executor carrying that transport.
+        proof = (self.rank, method if isinstance(method, str) else "<pickled>")
+        if proof not in _EXEC_PROOF_LOGGED:
+            _EXEC_PROOF_LOGGED.add(proof)
+            logger.error(
+                "[exec-proof] multiproc worker rank=%s executing rpc=%r on "
+                "thread=%s",
+                self.rank,
+                proof[1],
+                threading.current_thread().name,
+            )
         try:
             if isinstance(method, str):
                 func = getattr(self.worker, method)
