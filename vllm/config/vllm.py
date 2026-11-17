@@ -1297,6 +1297,23 @@ class VllmConfig:
             from vllm.distributed.lwd import lwd_check_parallel_config
 
             lwd_check_parallel_config(self)
+            # Host comm swaps the pool-backed LWD uniproc variant in for
+            # engines that would run native UniProcExecutor (world_size==1,
+            # e.g. the tp=1 edge): the LWD edge's host-blocking comm waits
+            # must overlap the engine thread's scheduling. The tp>1 cloud
+            # keeps its multiproc workers either way; device comm and
+            # non-LWD engines keep the native executor untouched.
+            if (
+                self.lwd_config.topology.is_host_comm
+                and self.parallel_config.distributed_executor_backend == "uni"
+            ):
+                from vllm.v1.lwd_control.control_scheduler.lwd_uniproc_executor import (
+                    LwdHostUniProcExecutor,
+                )
+
+                self.parallel_config.distributed_executor_backend = (
+                    LwdHostUniProcExecutor
+                )
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
