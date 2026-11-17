@@ -437,16 +437,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
         def _run_batch(scheduler_output: Any) -> None:
             nonlocal executed
-            # non_block=True is a CONTRACT with the executor proxy, not an
-            # optimization: uniproc's sync path returns a bare
-            # ModelRunnerOutput (not a Future) and the proxy's
-            # NoneSafeFuture would crash calling .result() on it. With
-            # non_block=True uniproc executes inline and returns a done
-            # Future -- the result() below then never blocks (same for
-            # multiproc, where it waits on the real future).
-            future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
+            future = self.model_executor.execute_model(scheduler_output)
             model_output = future.result()
             merged = self.scheduler.update_from_output(
                 scheduler_output, model_output
