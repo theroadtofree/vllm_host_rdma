@@ -172,10 +172,22 @@ has no runtime counterpart here (only the CLI/config validation of
    requests evaporate silently.
 2. **Attach runtime**: persistent registration server (barrier for startup,
    resident service for runtime), re-register watchdog, READY resend on DEALER
-   socket-monitor reconnects, client-side engine revival. The old deterministic
-   engine IO ports (`rpc_port+1000+2*idx`) are already structurally covered here:
-   the primary's frontend endpoint is explicit `IP:port` config, so a restart
-   rebinds the same address by construction and libzmq reconnects transparently.
+   socket-monitor reconnects, client-side engine revival. The deterministic
+   engine IO ports come from the topology yaml: `deployment.api_bind_base_port`
+   (edge_share-only field, default 61000) — attach frontend `idx` binds
+   `base + 2*idx` (input ROUTER) and `+1` (output PULL), and the whole
+   16-port band `[base, base+2*8-1]` is reserved for up to
+   `LWD_API_MAX_FRONTENDS = 8` frontends. The capacity cap is enforced at
+   port-occupation time — the `engine_io_addresses` derivation raises for
+   an index without a reserved pair, and the bind side, the primary's
+   pre-seed and the registration authority all derive through it — not at
+   config time: the yaml may describe larger plans. The field itself is
+   rejected outright for other scenes. A restart rebinds
+   the same address by construction and libzmq reconnects transparently.
+   Bidirectional conflict checks keep deployment ports out of the band: the
+   attach command and the primary each verify their own configured ports
+   (HTTP listen, registration, master/rpc) at startup, and the authority
+   rejects any registration whose HTTP listen port falls inside the band.
 
    The engine-revival contract, as implemented in `core_client.py`: the output
    reader survives the old engine's `ENGINE_CORE_DEAD` broadcast (an exited

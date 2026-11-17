@@ -37,6 +37,10 @@ import zmq
 import vllm.envs as envs
 from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
 from vllm.config.lwd.api import parse_endpoint
+from vllm.config.lwd.topology import (
+    LWD_API_BIND_BASE_PORT_DEFAULT,
+    LWD_API_MAX_FRONTENDS,
+)
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_ip, get_tcp_uri, make_zmq_socket
 
@@ -141,6 +145,7 @@ class FrontendAttachPlan:
     client_index: int
     client_count: int
     endpoint: str
+    api_bind_base_port: int
     topology_digest: str
     additional_config: dict[str, Any]
 
@@ -176,6 +181,7 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
         client_index=lwd.instance_id,
         client_count=count,
         endpoint=endpoint,
+        api_bind_base_port=lwd.topology.deployment.api_bind_base_port,
         topology_digest=lwd.topology.digest,
         additional_config=_additional_config_dict(args),
     )
@@ -272,23 +278,65 @@ def get_route_ip(target_ip: str) -> str:
     return get_ip()
 
 
-def engine_io_addresses(endpoint: str, client_index: int) -> tuple[str, str]:
+def engine_io_addresses(
+    endpoint: str, base_port: int, client_index: int
+) -> tuple[str, str]:
     """Deterministic native engine IO endpoints of one attach frontend:
-    ``rpc_port + 1000 + 2*idx`` (input ROUTER) and ``+1`` (output PULL) on
-    the route IP toward the registration endpoint.
+    ``api_bind_base_port + 2*idx`` (input ROUTER) and ``+1`` (output
+    PULL) from the topology yaml's reserved band, on the route IP toward
+    the registration endpoint (the same-host edge_share model).
 
-    Single source of truth for both sides: the attach command binds these,
-    and the primary pre-seeds the engine's frontend list with them for an
-    elastic partial start, so the two derivations can never drift. A
-    frontend that starts after the engine handshakes binds the same
-    address and the engine's DEALER/PUSH reconnect transparently."""
-    host, reg_port = parse_endpoint(endpoint, "--api-server-attach")
-    bind_ip = get_route_ip(host)
-    engine_io_base = reg_port + 1000 + 2 * client_index
+    Single source of truth for both sides: the attach command binds
+    these, and the primary pre-seeds the engine's frontend list with
+    them for an elastic partial start, so the two derivations can never
+    drift. A frontend that starts after the engine handshakes binds the
+    same address and the engine's DEALER/PUSH reconnect transparently.
+
+    The band capacity check lives HERE — where ports are actually
+    occupied — not at config time: the bind side, the pre-seed and the
+    registration authority all derive through this function, so an
+    oversized plan fails loudly at startup instead of silently running
+    past the reserved band."""
+    if client_index >= LWD_API_MAX_FRONTENDS:
+        band = _engine_io_port_band(base_port)
+        raise ValueError(
+            f"[LWD] attach frontend {client_index} has no reserved engine "
+            f"IO port in the band {band.start}-{band.stop - 1} "
+            f"(deployment.api_bind_base_port={base_port} holds at most "
+            f"{LWD_API_MAX_FRONTENDS} frontends)"
+        )
+    bind_ip = get_route_ip(parse_endpoint(endpoint, "--api-server-attach")[0])
+    engine_io_base = base_port + 2 * client_index
     return (
         get_tcp_uri(bind_ip, engine_io_base),
         get_tcp_uri(bind_ip, engine_io_base + 1),
     )
+
+
+def _engine_io_port_band(base_port: int) -> range:
+    """The reserved engine IO band: two ports per frontend, for up to
+    LWD_API_MAX_FRONTENDS frontends — the spec reserves the whole band,
+    not just the configured slice."""
+    return range(base_port, base_port + 2 * LWD_API_MAX_FRONTENDS)
+
+
+def _assert_ports_outside_engine_io_band(
+    base_port: int, ports: dict[str, int], owner: str
+) -> None:
+    """Startup side of the bidirectional conflict check: this command's
+    own configured ports must stay out of the reserved engine IO band the
+    frontends bind into (a collision is at best an EADDRINUSE crash, at
+    worst a wrong-service connection). The authority side re-checks every
+    registration's listen port."""
+    band = _engine_io_port_band(base_port)
+    hits = {name: port for name, port in ports.items() if port in band}
+    if hits:
+        raise ValueError(
+            f"[LWD] {owner} port(s) {hits} fall inside the reserved engine "
+            f"IO band {band.start}-{band.stop - 1} "
+            f"(deployment.api_bind_base_port={base_port}); move the "
+            "conflicting port or the base"
+        )
 
 
 def _resolve_listen(args: Any) -> tuple[str, int]:
@@ -323,12 +371,17 @@ class FrontendAttachServer:
         config_payload: dict[str, Any],
         main_listen: tuple[str, int],
         frontend_args: dict[str, Any] | None = None,
+        api_bind_base_port: int = LWD_API_BIND_BASE_PORT_DEFAULT,
     ):
         host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
         self.endpoint = get_tcp_uri(host, port)
         # Raw "host:port" form: the elastic pre-seed derives every attach
         # frontend's deterministic engine IO addresses from it.
         self.raw_endpoint = endpoint
+        # Reserved engine IO band base (deployment.api_bind_base_port): the
+        # pre-seed and the bidirectional registration-side conflict check
+        # derive from the same value the attach frontends bind.
+        self.api_bind_base_port = api_bind_base_port
         self.client_count = client_count
         self.config_payload = config_payload
         self.frontend_args_payload = frontend_args or {}
@@ -387,7 +440,9 @@ class FrontendAttachServer:
                     "their deterministic engine IO addresses: %s",
                     missing,
                     {
-                        index: engine_io_addresses(self.raw_endpoint, index)
+                        index: engine_io_addresses(
+                            self.raw_endpoint, self.api_bind_base_port, index
+                        )
                         for index in missing
                     },
                 )
@@ -488,6 +543,23 @@ class FrontendAttachServer:
             listen_port, int
         ):
             reply({"type": _MSG_ERROR, "reason": "invalid API listen address"})
+            return
+        if listen_port in _engine_io_port_band(self.api_bind_base_port):
+            # Bidirectional conflict check, authority side: a registered
+            # frontend's HTTP listen must stay out of the band its engine
+            # IO pair binds into.
+            band = _engine_io_port_band(self.api_bind_base_port)
+            reply(
+                {
+                    "type": _MSG_ERROR,
+                    "reason": (
+                        f"API listen port {listen_port} for client {index} "
+                        f"falls inside the reserved engine IO band "
+                        f"{band.start}-{band.stop - 1}; move --port or "
+                        "deployment.api_bind_base_port"
+                    ),
+                }
+            )
             return
         for other_index, (other_host, other_port) in self._listen_addresses.items():
             if _listen_addresses_conflict(
@@ -672,12 +744,23 @@ def create_frontend_registration_server(
     assert plan is not None and plan.mode == "primary"
     if client_count != plan.client_count:
         raise ValueError("[LWD] API server count does not match edge_share topology")
+    # Bidirectional conflict check, authority side: the primary's own
+    # configured ports must stay out of the band its frontends bind into.
+    ports = {
+        "api listen": _resolve_listen(args)[1],
+        "registration": parse_endpoint(plan.endpoint, "--api-server-rpc-port")[1],
+    }
+    for name in ("master_port", "data_parallel_rpc_port"):
+        if (value := getattr(args, name, None)) is not None:
+            ports[name] = int(value)
+    _assert_ports_outside_engine_io_band(plan.api_bind_base_port, ports, "primary")
     return FrontendAttachServer(
         endpoint=plan.endpoint,
         client_count=client_count,
         config_payload=compute_attach_config_payload(args, plan),
         main_listen=_resolve_listen(args),
         frontend_args=compute_frontend_args_payload(args),
+        api_bind_base_port=plan.api_bind_base_port,
     )
 
 
@@ -724,16 +807,28 @@ def run_attach_api_server(args: Any) -> None:
         )
 
         listen_address, sock = setup_server(args, reuse_port=False)
+        # Bidirectional conflict check, bind side: the attach command's own
+        # configured ports (its HTTP listen and the registration endpoint)
+        # must stay out of the band it is about to bind.
+        _assert_ports_outside_engine_io_band(
+            plan.api_bind_base_port,
+            {
+                "api listen": _resolve_listen(args)[1],
+                "registration": parse_endpoint(plan.endpoint, "--api-server-attach")[
+                    1
+                ],
+            },
+            f"attach frontend {plan.client_index}",
+        )
         # Deterministic engine IO ports (old-branch invariant): a restarted
         # attach frontend rebinds the SAME port, so the running engine's
         # DEALER/PUSH reconnect transparently — ephemeral ports would leave
-        # the engine connected to the dead process's address. The primary's
-        # index 0 uses the standard allocation; attach indices derive from
-        # the registration endpoint's port (single source:
+        # the engine connected to the dead process's address. The ports
+        # come from the topology yaml's reserved band (single source:
         # ``engine_io_addresses``, shared with the primary's elastic
         # pre-seed).
         input_address, output_address = engine_io_addresses(
-            plan.endpoint, plan.client_index
+            plan.endpoint, plan.api_bind_base_port, plan.client_index
         )
         manager = APIServerProcessManager(
             listen_address=listen_address,
@@ -859,7 +954,9 @@ def wait_for_attach_registrations(
     contribute its actual address."""
     for client_index in range(1, registration_server.client_count):
         seeded_input, seeded_output = engine_io_addresses(
-            registration_server.raw_endpoint, client_index
+            registration_server.raw_endpoint,
+            registration_server.api_bind_base_port,
+            client_index,
         )
         addresses.inputs[client_index] = seeded_input
         addresses.outputs[client_index] = seeded_output

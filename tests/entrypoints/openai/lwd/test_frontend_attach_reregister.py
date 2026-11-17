@@ -42,6 +42,7 @@ def _server() -> FrontendAttachServer:
     server._closed = False
     server.endpoint = "tcp://127.0.0.1:23657"
     server.raw_endpoint = "127.0.0.1:23657"
+    server.api_bind_base_port = 61000
     return server
 
 
@@ -224,8 +225,8 @@ def test_partial_start_seeds_deterministic_addresses(
     server._closed = True  # resident service is not exercised here
     addresses = _Addresses(count=2)
     wait_for_attach_registrations(server, addresses, engine_manager=None)
-    assert addresses.inputs[1] == "tcp://127.0.0.1:24659"
-    assert addresses.outputs[1] == "tcp://127.0.0.1:24660"
+    assert addresses.inputs[1] == "tcp://127.0.0.1:61002"
+    assert addresses.outputs[1] == "tcp://127.0.0.1:61003"
 
 
 def test_registration_within_grace_upgrades_the_seeded_address(
@@ -247,11 +248,54 @@ def test_registration_within_grace_upgrades_the_seeded_address(
 
 def test_engine_io_addresses_derivation() -> None:
     """The bind-side and pre-seed-side single source: port arithmetic is
-    rpc_port + 1000 + 2*idx / +1 on the route IP toward the endpoint."""
+    api_bind_base_port + 2*idx / +1 on the route IP toward the endpoint."""
     input_address, output_address = frontend_attach.engine_io_addresses(
-        "127.0.0.1:23657", client_index=1
+        "127.0.0.1:23657", base_port=61000, client_index=1
     )
     # The host is the local route IP toward the endpoint; only the port
     # arithmetic is asserted here.
-    assert input_address.rpartition(":")[2] == "24659"
-    assert output_address.rpartition(":")[2] == "24660"
+    assert input_address.rpartition(":")[2] == "61002"
+    assert output_address.rpartition(":")[2] == "61003"
+
+
+def test_engine_io_addresses_caps_at_the_reserved_band() -> None:
+    """The band holds two ports per frontend for at most 8 frontends. The
+    cap is enforced where ports are OCCUPIED (the derivation itself — the
+    bind side, the pre-seed and the registration authority all pass
+    through it), not at config time: the yaml may describe larger plans,
+    and an oversized one fails loudly at startup instead of silently
+    running past the band."""
+    input_address, output_address = frontend_attach.engine_io_addresses(
+        "127.0.0.1:23657", base_port=61000, client_index=7
+    )
+    assert input_address.rpartition(":")[2] == "61014"
+    assert output_address.rpartition(":")[2] == "61015"
+    with pytest.raises(ValueError, match="reserved engine"):
+        frontend_attach.engine_io_addresses(
+            "127.0.0.1:23657", base_port=61000, client_index=8
+        )
+
+
+def test_engine_io_band_conflict_fails_the_command_loudly() -> None:
+    """Bind-side check: a configured port inside the reserved band is a
+    startup error naming the band, not a runtime EADDRINUSE."""
+    with pytest.raises(ValueError, match="reserved engine IO band"):
+        frontend_attach._assert_ports_outside_engine_io_band(
+            61000, {"api listen": 61003}, "attach frontend 1"
+        )
+    # Ports outside the band pass.
+    frontend_attach._assert_ports_outside_engine_io_band(
+        61000, {"api listen": 8000, "registration": 23657}, "attach frontend 1"
+    )
+
+
+def test_registration_rejects_a_listen_port_inside_the_band() -> None:
+    """Authority-side check: a frontend registering an HTTP listen port
+    inside the reserved engine IO band is rejected with a pointed
+    error; the default 8100 stays fine."""
+    server = _server()
+    inside = _attach_message(pid=111, listen_port=61002)
+    response = _handle(server, inside)
+    assert response["type"] == "LWD_FRONTEND_ERROR"
+    assert "reserved engine IO band" in response["reason"]
+    assert _handle(server, _attach_message(pid=111))["type"] == "LWD_FRONTEND_ACCEPT"

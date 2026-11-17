@@ -322,3 +322,26 @@ def test_device_layout_requires_ranks_and_world_size(fault: str, match: str) -> 
         raw["deployment"].pop("hccl_world_size")
     with pytest.raises(ValueError, match=match):
         LwdTopology.from_dict(raw)
+
+
+def test_api_bind_base_port_defaults_to_the_reserved_band() -> None:
+    """The edge_share engine IO band base defaults to 61000 (16 reserved
+    ports, two per frontend, for up to 8 frontends)."""
+    topology = LwdTopology.from_dict(topology_payload("s2_edge_share_2dp.yaml"))
+    assert topology.deployment.api_bind_base_port == 61000
+
+
+def test_api_bind_base_port_is_configurable_in_edge_share() -> None:
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    raw["deployment"]["api_bind_base_port"] = 62000
+    topology = LwdTopology.from_dict(raw)
+    assert topology.deployment.api_bind_base_port == 62000
+
+
+def test_api_bind_base_port_rejected_outside_edge_share() -> None:
+    """Only edge_share may configure the band base: any other scene gets a
+    loud config error instead of silently ignoring it."""
+    raw = topology_payload("s3_cloud_share_2dp.yaml")
+    raw["deployment"]["api_bind_base_port"] = 62000
+    with pytest.raises(ValueError, match="edge_share setting"):
+        LwdTopology.from_dict(raw)

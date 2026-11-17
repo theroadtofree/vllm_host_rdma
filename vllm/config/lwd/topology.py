@@ -91,6 +91,19 @@ class LwdHostDataPlane:
     of a link must match."""
 
 
+LWD_API_BIND_BASE_PORT_DEFAULT = 61000
+"""Default ``deployment.api_bind_base_port``: the reserved edge_share
+engine IO band then occupies [61000, 61015]."""
+
+LWD_API_MAX_FRONTENDS = 8
+"""Frontend capacity of the edge_share engine IO band: two reserved
+ports per frontend (``api_bind_base_port + 2*idx / +1``), 16 in total.
+The cap is enforced where ports are actually occupied (the
+``engine_io_addresses`` derivation: bind side, pre-seed and
+registration authority all derive through it), NOT at config time —
+the yaml may describe larger plans."""
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
@@ -103,6 +116,31 @@ class LwdDeployment:
     """Host-comm settings block, required when ``data_plane_comm: host``
     and omitted otherwise — the extension point for future host-plane
     properties."""
+    api_bind_base_port: Annotated[int, Field(strict=True, ge=1024, le=65520)] = (
+        LWD_API_BIND_BASE_PORT_DEFAULT
+    )
+    """Base of the reserved edge_share engine IO port band. Attach
+    frontend ``idx`` binds ``base + 2*idx`` (input ROUTER) and ``+1``
+    (output PULL); the whole band ``[base, base + 2*8 - 1]`` is reserved
+    for up to ``LWD_API_MAX_FRONTENDS`` frontends, so deployment ports
+    (``--port``, master/registration ports) must stay out of it. The
+    fixed derivation is what makes a frontend restart rebind the SAME
+    ports, letting the running engine's DEALER/PUSH reconnect
+    transparently. Only meaningful — and only configurable — for
+    ``scene: edge_share``."""
+
+    @model_validator(mode="after")
+    def _validate_api_bind_base_port(self) -> "LwdDeployment":
+        if (
+            self.scene != "edge_share"
+            and self.api_bind_base_port != LWD_API_BIND_BASE_PORT_DEFAULT
+        ):
+            raise ValueError(
+                "[LWD] deployment.api_bind_base_port is an edge_share "
+                f"setting and must not be configured for scene="
+                f"{self.scene!r}"
+            )
+        return self
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
