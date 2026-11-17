@@ -62,12 +62,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 from vllm.v1.request import Request
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
-# reaped. 4 matches the performance-proven reference branch: with truly
-# async execution the queue lets embed batches run ahead of an unembed
-# sitting in a DOWN frame wait, so the wait hides behind the forwards
-# instead of serializing with them on one thread (depth 2 left no margin
-# and dual-instance collapsed to ~half throughput).
-LWD_EDGE_BATCH_QUEUE_DEPTH = 4
+# reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
+# conservative, validate performance with 2 first.
+LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
