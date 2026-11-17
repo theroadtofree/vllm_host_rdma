@@ -2,6 +2,8 @@
 
 > Porting design for the peer-restart recovery line implemented on the old branch
 > (`host_rdma_self_process`, workspace `C:\unify`) into this baseline. Source design
+> and defect-to-fix tables live there; the committed file-by-file inventory of this
+> port lives in `lwd_porting_change_inventory.md`.
 > docs: old-branch `lwd_动态建链实现整理.md` (base mechanisms) and
 > `lwd_多实例动态建链修改整理.md` (multi-instance scenarios). This document restates
 > both against THIS repo's architecture, vocabulary and team standards. Related:
