@@ -5,12 +5,8 @@
 each cloud's scheduling limits and the request entry (edge admission +
 announcement to the routed cloud DP rank; communication stays in the engine).
 
-Stepping is the reference-branch damped step (_lwd_step_damped): per step,
-EMBED batches dispatch first under a reserved budget (4), then the queued
-UNEMBED batches under the remaining quota (step depth 4 + 2 * (N - 1),
-N = cloud DP ranks) popped round-robin per connection; uniproc executes
-synchronously, so each batch runs and harvests inline within the step.
-is_pooling_model=True (no native sample_tokens) and an executor proxy (a
+Stepping is the native step_with_batch_queue, adapted at construction: depth
+2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
 normally completed batch returning None becomes a placeholder).
 
 Startup blocks until every cloud DP rank accepted the handshake and sent its
@@ -44,7 +40,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_probe import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
     LwdEdgeScheduler,
-    lwd_build_unembed_batch,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
@@ -66,18 +61,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.request import Request
 
-# Damped-step budgets, ported from the performance-proven reference branch
-# (its own formula: depth = 4 + 2 * (N - 1), N = cloud instance count; N=1
-# keeps the historical 4). Per step: EMBEDs claim up to the base 4 FIRST,
-# whatever the unembed backlog -- an unembed flood can never cut the UP
-# prefill supply; UNEMBEDs spend the remaining quota round-robin per
-# instance -- one instance's flood can never starve the other's token
-# delivery. With inline (synchronous) execution the notify backlog then
-# drains inside ONE step call with ~0 frame waits (the frames landed while
-# the embeds ran), the damping the pre-fix one-batch-per-iteration
-# stepping lacked.
-_LWD_STEP_EMBED_BUDGET = 4
-_LWD_STEP_UNEMBED_PER_INSTANCE = 2
+# Native batch queue depth: dispatched (embed + unembed) batches not yet
+# reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
+# conservative, validate performance with 2 first.
+LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
@@ -150,24 +137,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
-        # Reference-branch damped stepping: embed-reserved budget +
-        # per-instance round-robin unembed quota + multi-batch drain per
-        # step (see _lwd_step_damped). The native batch_queue stays EMPTY
-        # (every batch executes and harvests inline inside one step call --
-        # uniproc executes synchronously); it only remains as a has_work()
-        # source for the base engine.
-        self._lwd_step_depth = _LWD_STEP_EMBED_BUDGET + (
-            _LWD_STEP_UNEMBED_PER_INSTANCE * max(0, len(self._lwd_clouds) - 1)
-        )
-        self.batch_queue = deque()
-        self.step_fn = self._lwd_step_damped
+        self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
+        self.batch_queue = deque(maxlen=self.batch_queue_size)
+        self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
         lwd_logger.info(
-            "[edge] engine assembled: %d cloud DP ranks, damped stepping "
-            "embed_budget=%d step_depth=%d",
+            "[edge] engine assembled: %d cloud DP ranks, native batch-queue "
+            "stepping depth=%d",
             len(self._lwd_clouds),
-            _LWD_STEP_EMBED_BUDGET,
-            self._lwd_step_depth,
+            self.batch_queue_size,
         )
 
     def _lwd_configure_prefix_cache(self) -> None:
@@ -409,69 +387,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
         self._lwd_drain_probe_completions()
         return super().step_with_batch_queue()
-
-    def _lwd_step_damped(self) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        """Reference-branch damped edge step, adapted to inline execution.
-
-        Three properties ported from the performance-proven old branch,
-        where they kept the same synchronous single-threaded loop healthy
-        under dual-instance load while the native one-batch-per-iteration
-        stepping collapsed to half throughput:
-        1. multi-batch drain: several batches run in ONE step call, so a
-           notify backlog drains inside a single step with ~0 frame waits
-           (their frames landed long before) instead of stretching over
-           many engine iterations;
-        2. embed-reserved budget: up to _LWD_STEP_EMBED_BUDGET EMBED
-           batches dispatch FIRST, whatever the unembed backlog -- the UP
-           prefill supply never stops, so the clouds keep stepping and
-           DOWN frames keep flowing (the pre-fix collapse entered exactly
-           where unembed waits squeezed embed dispatch out);
-        3. per-instance round-robin unembed quota: the remaining step
-           budget is spent round-robin across connections.
-        uniproc executes synchronously, so each batch executes inline and
-        is harvested immediately; outputs merge across the whole step.
-        """
-        self._lwd_drain_probe_completions()
-        outputs_by_client: dict[int, EngineCoreOutputs] = {}
-        executed = False
-
-        def _run_batch(scheduler_output: Any) -> None:
-            nonlocal executed
-            future = self.model_executor.execute_model(scheduler_output)
-            model_output = future.result()
-            merged = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
-            for client_index, step_outputs in merged.items():
-                existing = outputs_by_client.get(client_index)
-                if existing is None:
-                    outputs_by_client[client_index] = step_outputs
-                    continue
-                existing.outputs.extend(step_outputs.outputs)
-                if step_outputs.finished_requests:
-                    if existing.finished_requests is None:
-                        existing.finished_requests = list(
-                            step_outputs.finished_requests
-                        )
-                    else:
-                        existing.finished_requests.extend(
-                            step_outputs.finished_requests
-                        )
-            executed = True
-
-        embeds = 0
-        for _ in range(_LWD_STEP_EMBED_BUDGET):
-            scheduler_output = self.scheduler.schedule_embed_only()
-            if scheduler_output is None:
-                break
-            _run_batch(scheduler_output)
-            embeds += 1
-        for _ in range(max(0, self._lwd_step_depth - embeds)):
-            item = self.scheduler.lwd_pop_unembed_rr()
-            if item is None:
-                break
-            _run_batch(lwd_build_unembed_batch(item[0], item[1]))
-        return (outputs_by_client or None), executed
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """Notify each request's original cloud DP, then finish natively."""

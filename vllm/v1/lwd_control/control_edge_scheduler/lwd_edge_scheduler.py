@@ -143,9 +143,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # delivering link's dp_idx, consumed within a scheduling step to
         # produce an UNEMBED batch
         self.unembed_notify_queue: deque[tuple[LwdConnectionId, LwdC2eNotify]] = deque()
-        # Round-robin cursor for lwd_pop_unembed_rr: the connection whose
-        # notify was popped last (None before the first pop).
-        self._lwd_unembed_rr_last: LwdConnectionId | None = None
         # Whole-prompt mrope positions for multimodal requests ([3,N] CPU
         # tensor, computed once at admission and sent in RequestNotify);
         # removed on embedding completion/abort. Key present = has_mrope is
@@ -363,45 +360,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             dp_idx, notify = self.unembed_notify_queue.popleft()
             return lwd_build_unembed_batch(dp_idx, notify)
         return SchedulerOutput.make_empty()
-
-    def schedule_embed_only(self) -> SchedulerOutput | None:
-        """EMBED/refill batch only; None when nothing is dispatchable.
-
-        The engine's damped step (embed-reserved budget, ported from the
-        reference branch) relies on this entry NEVER falling through to an
-        unembed batch: unembeds are popped by the engine from the notify
-        queue under their own quota, so an embed slot can never be claimed
-        by a decode result batch -- under an unembed flood the UP prefill
-        supply still dispatches first."""
-        if self._lwd_pending_refills:
-            return self._lwd_dispatch_refill(self._lwd_pending_refills.popleft())
-        LwdControlDiag.edge_step_activity(
-            len(self.running),
-            sum(1 for _ in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)),
-        )
-        return self._lwd_schedule_embed()
-
-    def lwd_pop_unembed_rr(self) -> tuple[LwdConnectionId, LwdC2eNotify] | None:
-        """Pop the next unembed notify, round-robin across connections.
-
-        Ported from the reference branch's per-instance c2e buckets ("each
-        round takes at most one entry per bucket"): after serving a
-        connection, the next pop prefers a DIFFERENT connection, so one
-        instance's notify flood cannot monopolize the other instance's
-        token delivery quota."""
-        q = self.unembed_notify_queue
-        if not q:
-            return None
-        last = self._lwd_unembed_rr_last
-        for index, item in enumerate(q):
-            if last is None or item[0] != last:
-                del q[index]
-                self._lwd_unembed_rr_last = item[0]
-                return item
-        # Every queued entry belongs to the last-served connection.
-        item = q.popleft()
-        self._lwd_unembed_rr_last = item[0]
-        return item
 
     def update_from_output(self, scheduler_output, model_runner_output):
         """LWD harvest (the return value is the engine step output; none of
