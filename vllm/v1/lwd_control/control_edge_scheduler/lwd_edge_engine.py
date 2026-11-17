@@ -77,6 +77,14 @@ LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 # Liveness sweep rate limit: the verdict's latency granularity.
 _LWD_SWEEP_INTERVAL_S = 1.0
+# Seconds without a cloud heartbeat before the edge tears that cloud DP's
+# data-plane links down and gates new requests to it; the next heartbeat
+# releases the gate. Also bounds the in-flight failure latency of the
+# teardown. This threshold and the cloud's heartbeat cadence
+# (LWD_HELLO_INTERVAL_S in lwd_cloud_engine) are the two halves of ONE
+# liveness contract — the judge's threshold and the sender's pace — so
+# any change must consider both files together.
+LWD_HELLO_SILENT_S = 10.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
 # total) before failing: by then the cloud stopped reading or is gone.
@@ -129,9 +137,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_hello_boot: dict[LwdConnectionId, str] = {}
         self._lwd_silent: set[LwdConnectionId] = set()
         self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
-        self._lwd_hello_silent_s = (
-            self.lwd_config.topology.control_plane.hello_silent_s
-        )
+        self._lwd_hello_silent_s = LWD_HELLO_SILENT_S
         self._lwd_last_sweep = 0.0
         # Adopted-cloud state must exist before the control plane starts:
         # a cloud's scheduling limits can arrive mid-assembly (the startup

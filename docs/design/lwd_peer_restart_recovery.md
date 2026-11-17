@@ -92,11 +92,11 @@ flowchart LR
    enumerate the detection source (`session fingerprint`, `heartbeat silent`,
    `boot_id changed`).
 5. **Bounded submit wait** (old `VLLM_ASCEND_LWD_UCX_SUBMIT_WAIT_READY_S`, default
-   5 s): submit waits for the reconnect window before failing. Per standard 7.9
-   this becomes topology config, not an env: a
-   `deployment.data_plane_host.submit_wait_ready_s` field (default 5). Extending
-   the grandfathered `VLLM_ASCEND_LWD_UCX_*` env family instead needs review
-   approval; the doc's choice is config.
+   5 s): submit waits for the reconnect window before failing. This is a code
+   constant, `LWD_SUBMIT_WAIT_READY_S` at its use site (the host channel
+   wiring, `lwd_host_channels.py`), not an env and not yaml — the single
+   wiring feeds both peers, so the value is identical on both by
+   construction.
 6. **Boundary carried from the old branch**: in sidecar/daemon transport the
    peer-restart event does not cross the ctl/cpl protocol, so Phase 1 covers the
    embedded mode only; sidecar keeps the whole-deployment-restart semantics until
@@ -133,8 +133,8 @@ on **one** receive path.
 - The edge keeps per-`(cloud_id, dp_idx)` accounts — `hello_last`, `hello_boot`,
   a silent set with `frozenset` snapshots (single-writer on the receive thread,
   main thread reads snapshots — the old branch's concurrency shape);
-- Silent beyond the threshold (new `LwdControlPlaneConfig.hello_silent_s`,
-  default 10 s, floor 3 s) fires `notify_cloud_restarted(cloud_id, dp_idx,
+- Silent beyond the threshold (code constant `LWD_HELLO_SILENT_S`, 10 s)
+  fires `notify_cloud_restarted(cloud_id, dp_idx,
   reason="heartbeat silent Ns")` → the registry → **linked teardown** of that
   cloud DP's data-plane links (force reconnect; in-flight ops fail fast), closing
   the "control plane recovered, data plane still zombie" window;
@@ -152,8 +152,12 @@ on **one** receive path.
   rejects only requests whose target group is silent). The gate releases on the
   next heartbeat. Rejection is a client-visible failure, retryable — not a hang.
 
-Config lands in `LwdControlPlaneConfig` (`hello_interval_s`, `hello_silent_s`),
-config-file-first per standard 7.9; the silent threshold doubles as both the
+The heartbeat cadence and the silent threshold are code constants at
+their use sites — `LWD_HELLO_INTERVAL_S` in the cloud engine,
+`LWD_HELLO_SILENT_S` in the edge engine. They are the two halves of one
+liveness contract (the sender's pace and the judge's threshold); each
+constant's comment names the other's file, so a change to either
+considers both; the silent threshold doubles as both the
 gate latency and the in-flight failure latency, so it must be reviewed against
 `handshake_timeout_s`.
 
@@ -271,7 +275,7 @@ edge restart (cloud side):
 | `reannounce` re-handshake | absorbed by registration retry (verify; else silent-triggered re-register) |
 | `frontend_attach.py` persistent registration + watchdog + READY resend | no counterpart yet — Phase 3 builds it in this repo's terms |
 | `core_client.py` ROUTER_HANDOVER unconditional, engine revival | `v1/engine/core_client.py` near 1:1 |
-| envs `HELLO_INTERVAL_S` / `HELLO_SILENT_S` / `UCX_SUBMIT_WAIT_READY_S` | `LwdControlPlaneConfig` / `deployment.data_plane_host` fields (standard 7.9) |
+| envs `HELLO_INTERVAL_S` / `HELLO_SILENT_S` / `UCX_SUBMIT_WAIT_READY_S` | code constants `LWD_HELLO_INTERVAL_S` / `LWD_HELLO_SILENT_S` / `LWD_SUBMIT_WAIT_READY_S` at their use sites (cloud engine / edge engine / host channel wiring) |
 
 Vocabulary (one concept, one word — standard 7.5): `on_peer_restart` and
 `force reconnect` keep their transport names; `silent` and `lazy baseline` are

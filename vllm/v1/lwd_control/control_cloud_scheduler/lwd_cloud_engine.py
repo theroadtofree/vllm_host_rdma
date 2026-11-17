@@ -75,6 +75,12 @@ _LWD_SEND_RETRY_SLEEP_S = 0.05
 _LWD_RETIRED_ROUTE_CAP = 4096
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
+# Seconds between one cloud DP's liveness heartbeats to its edges. This
+# cadence and the edge's silent threshold (LWD_HELLO_SILENT_S in
+# lwd_edge_engine) are the two halves of ONE liveness contract — the
+# sender's pace and the judge's threshold — so any change must consider
+# both files together.
+LWD_HELLO_INTERVAL_S = 1.0
 
 
 class _LwdHeartbeatTick:
@@ -305,9 +311,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # Liveness epoch (peer-restart line): random per process launch; the
         # edge treats a change of it as "this cloud DP restarted".
         self._lwd_boot_id = uuid.uuid4().hex[:16]
-        self._lwd_hello_interval_s = (
-            self._lwd_control_plane.spec.config.hello_interval_s
-        )
+        self._lwd_hello_interval_s = LWD_HELLO_INTERVAL_S
         self._lwd_last_heartbeat_at = 0.0
         self._lwd_heartbeat_stop = threading.Event()
         threading.Thread(

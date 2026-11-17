@@ -78,12 +78,6 @@ class LwdHostDataPlane:
     down_buffer_size: LwdCount = 32
     """DOWN (cloud->edge) block size in MB; identical on both peers."""
 
-    submit_wait_ready_s: LwdPositiveSeconds = 5.0
-    """Bounded submit-time wait for a link to leave a broken/reconnect
-    window (peer restart, network break): a send landing inside the gap
-    fails fail-fast, so it waits this long first and then proceeds either
-    way. Identical on both peers."""
-
     deployment: Literal["in_process", "sidecar"] = "in_process"
     """"in_process" = the transport runs inside each engine process;
     "sidecar" = one dedicated transport daemon per host owns the
@@ -195,13 +189,6 @@ class LwdControlPlaneConfig:
     send_queue_max: Annotated[int, Field(strict=True, ge=1)] = 1000
     """Outbound messages buffered per DP rank before sending reports
     backpressure."""
-    hello_interval_s: LwdPositiveSeconds = 1.0
-    """Seconds between one cloud DP's liveness heartbeats to its edges."""
-    hello_silent_s: LwdPositiveSeconds = 10.0
-    """Seconds without a cloud heartbeat before the edge tears that cloud
-    DP's data-plane links down and gates new requests to it; the next
-    heartbeat releases the gate. Also bounds the in-flight failure
-    latency of the teardown."""
     hello_retry_interval_s: LwdPositiveSeconds = 5.0
     """Seconds between edge registration attempts until the cloud answers."""
     handshake_timeout_s: LwdPositiveSeconds = 1800.0
