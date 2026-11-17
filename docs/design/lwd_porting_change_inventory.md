@@ -128,3 +128,23 @@ fec16e0b8 fix: add error logs for dropped abort requests in cloud worker
 27d4e8021 fix(lwd): 修复边缘共享模式下主机数据通道连接获取错误
 357381c1f fix(lwd): map host comm UP connections to the TP0 endpoint rank
 ```
+
+---
+
+## 后记：实现形态重构（原生文件零改动）
+
+前端三节（`v1/engine/core.py`、`v1/engine/core_client.py`）中的自愈改动此后迁移至
+LWD 侧子类实现，两个 vllm 原生文件已还原为移植前基线：
+
+* **引擎侧**：`vllm/v1/lwd_control/control_scheduler/lwd_base_engine.py` 的
+  `LwdBaseEngineCore.process_input_sockets` 全方法重写（READY 重发、DEALER
+  三态连接探针、地址自证日志、输入线程死亡兜底——线程 target 绑定 self，子类
+  版本自然生效）。
+* **客户端侧**：`vllm/entrypoints/openai/lwd/lwd_async_client.py` 的
+  `LwdAsyncMPClient(AsyncMPClient)`（ROUTER_HANDOVER 后置开启、init 期 READY
+  去重、读循环 DEAD 存活 + 双复活判据、探针与 ROUTER monitor）与工厂包装
+  `apply_lwd_async_client_patch`；由 vllm-ascend `platform.py` 的 LWD 配置段
+  应用（前端 worker 不 import 任何 LWD 模块，平台配置口是其唯一必经点；非
+  LWD 与 DP>1 自动回退原生工厂）。
+* 测试随之迁移：`tests/v1/engine/test_lwd_client_engine_revival.py` →
+  `tests/entrypoints/openai/lwd/test_lwd_async_client.py`。

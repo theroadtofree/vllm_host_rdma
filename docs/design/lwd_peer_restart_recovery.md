@@ -163,17 +163,24 @@ gate latency and the in-flight failure latency, so it must be reviewed against
 
 ### 3.4 Phase 3 — frontend and primary-edge restart
 
-Touches vllm core (`v1/engine/core_client.py`, `core.py`) and is the most
-intrusive phase; it starts with an audit because the old `frontend_attach.py`
-has no runtime counterpart here (only the CLI/config validation of
-`config/lwd/api.py` exists).
+Implemented by INHERITANCE so vllm's native `v1/engine/core.py` and
+`core_client.py` stay pristine: the engine input-thread override lives on
+`LwdBaseEngineCore` (`control_scheduler/lwd_base_engine.py` — the thread
+target is self-bound, so the subclass method runs), and the frontend
+client is `LwdAsyncMPClient` (`entrypoints/openai/lwd/lwd_async_client.py`)
+with its factory routing applied from the ascend platform's config pass
+(frontend workers import no LWD module of their own; the wrapper
+delegates to the native factory for non-LWD and DP>1). The phase started
+with an audit because the old `frontend_attach.py` has no runtime
+counterpart here (only the CLI/config validation of `config/lwd/api.py`
+exists).
 
-1. **ROUTER handover unconditional**: this repo's `core_client.py` still gates
-   `router_handover` on `enable_elastic_ep`; the old branch's final fix makes it
-   unconditional — "it only takes effect on duplicate identity, zero impact on
-   the normal path". Without it, a restarted primary edge's same-identity DEALER
-   connects but is unaddressable behind the dead engine's identity table entry:
-   requests evaporate silently.
+1. **ROUTER handover unconditional**: the client's input ROUTER enables
+   `ROUTER_HANDOVER` unconditionally — "it only takes effect on duplicate
+   identity, zero impact on the normal path". Without it, a restarted
+   primary edge's same-identity DEALER connects but is unaddressable
+   behind the dead engine's identity table entry: requests evaporate
+   silently. Set post-bind on the LWD client.
 2. **Attach runtime**: persistent registration server (barrier for startup,
    resident service for runtime), re-register watchdog, READY resend on DEALER
    socket-monitor reconnects, client-side engine revival. The deterministic
@@ -193,7 +200,7 @@ has no runtime counterpart here (only the CLI/config validation of
    (HTTP listen, registration, master/rpc) at startup, and the authority
    rejects any registration whose HTTP listen port falls inside the band.
 
-   The engine-revival contract, as implemented in `core_client.py`: the output
+   The engine-revival contract, as implemented in `LwdAsyncMPClient`: the output
    reader survives the old engine's `ENGINE_CORE_DEAD` broadcast (an exited
    reader means every later output is unread and requests hang with no error),
    and the dead flag clears on either of two complementary criteria — a normal
@@ -274,7 +281,8 @@ edge restart (cloud side):
 | three-path heartbeat accounting + availability gate | single-path accounts on `LwdControlPlane` + gate in the edge engine |
 | `reannounce` re-handshake | absorbed by registration retry (verify; else silent-triggered re-register) |
 | `frontend_attach.py` persistent registration + watchdog + READY resend | no counterpart yet — Phase 3 builds it in this repo's terms |
-| `core_client.py` ROUTER_HANDOVER unconditional, engine revival | `v1/engine/core_client.py` near 1:1 |
+| `core_client.py` ROUTER_HANDOVER unconditional, engine revival | `LwdAsyncMPClient` (`entrypoints/openai/lwd/lwd_async_client.py`) + ascend-platform factory routing; native `core_client.py` untouched |
+| `core.py` READY resend + input-thread containment | `LwdBaseEngineCore.process_input_sockets` override (`control_scheduler/lwd_base_engine.py`); native `core.py` untouched |
 | envs `HELLO_INTERVAL_S` / `HELLO_SILENT_S` / `UCX_SUBMIT_WAIT_READY_S` | code constants `LWD_HELLO_INTERVAL_S` / `LWD_HELLO_SILENT_S` / `LWD_SUBMIT_WAIT_READY_S` at their use sites (cloud engine / edge engine / host channel wiring) |
 
 Vocabulary (one concept, one word — standard 7.5): `on_peer_restart` and
