@@ -177,7 +177,39 @@ and non-edge refusal, partial-build rollback, missing data_port.
 registry contract (empty refuses, a raising hook survives the caller,
 a working hook reports the build).
 
-## 5. Processing order (caller flow, Phase A)
+## 5. Item 11: the frontend digest split (attach dimension)
+
+Decided 2026-11-18 (option "narrow the compared digest"): the attach
+config check compares a **`frontend_digest`** — the canonical digest
+over everything EXCEPT the instance inventory (edges, clouds, links and
+the `edges_num`/`clouds_num` declarations) — while the full
+`LwdTopology.digest` stays observability-only.
+
+* **Why**: the previous comparison used the full digest, so a frontend
+  launched with the grown yaml could never attach to the primary that
+  started with the smaller one ("value mismatch: lwd_topology_digest")
+  — the elastic scale-out chain would dead-end at the frontend. An
+  addition changes only the inventory, so the narrowed digest is stable
+  across increments; a change outside it (deployment block, qos, scene)
+  still refuses the attach with the key named in the reason.
+* **What the subset is**: exactly the R1-frozen blocks plus the scene —
+  the same invariants the increment contract enforces on the running
+  engine, now enforced symmetrically on the frontend dimension. `qos`
+  is included deliberately: the deployment guarantee says it will not
+  change, and a violating change SHOULD refuse the attach.
+* **Where**:
+  * `LwdTopology.frontend_digest`, computed beside `digest` in
+    `from_dict` (the shared encoding lives in `_canonical_json`);
+  * `FrontendAttachPlan` carries both digests; the payload key switches
+    `lwd_topology_digest` → `lwd_frontend_digest` (both sides run the
+    same build, so the rename is synchronized by construction);
+  * the authority logs both at startup ("LWD registration authority:
+    frontend digest X (topology Y)").
+* **Unchanged consumers**: the file watcher's dedup and
+  `diff_topology`'s no-op check keep the FULL digest — they must notice
+  every content change; only the frontend comparison narrows.
+
+## 6. Processing order (caller flow, Phase A)
 
 ```text
 trigger (host + edge_share + edge gate)
@@ -194,7 +226,7 @@ Standard validation runs **first**, so count mismatches, id gaps and port
 collisions never reach the diff — they fail at parse with the existing
 messages.
 
-## 6. Rules (all must hold to accept)
+## 7. Rules (all must hold to accept)
 
 | Rule | Content | Why |
 | --- | --- | --- |
@@ -208,7 +240,7 @@ Ids are append-only by construction: layout validation requires instance
 ids unique and contiguous from 0, so a valid addition can only append the
 next id.
 
-## 7. Interface
+## 8. Interface
 
 ```python
 # vllm/config/lwd/topology.py
@@ -231,7 +263,7 @@ def diff_topology(old: LwdTopology, new: LwdTopology
 Empty `new_connections` on an accepted verdict = no-op (the file was
 touched but its semantics did not change; the digest fast path catches it).
 
-## 8. Snapshot semantics
+## 9. Snapshot semantics
 
 * The engine holds a **realized snapshot** — the topology its current
   links were built from (initial: the startup yaml).
@@ -240,7 +272,7 @@ touched but its semantics did not change; the digest fast path catches it).
 * A rejected update never advances it; the verdict is deterministic, so
   re-reading the same file yields the same result.
 
-## 9. Rejection messages
+## 10. Rejection messages
 
 Pattern `[LWD] topology update rejected: <rule>: <detail>`:
 
@@ -255,7 +287,7 @@ link removed: edge 0 - cloud 0
 new link crosses old and new instances: edge 2 - cloud 0
 ```
 
-## 10. Tests
+## 11. Tests
 
 `tests/config/lwd/test_topology_update.py` — 13 cases: no-op (digest fast
 path, deepcopy), +1 pair, +2 pairs, scene change, frozen deployment /

@@ -184,3 +184,33 @@ def test_a_deepcopied_update_is_still_a_no_op() -> None:
     verdict = diff_topology(old, new)
     assert not isinstance(verdict, LwdTopologyUpdateRejected)
     assert verdict.new_connections == ()
+
+
+def test_frontend_digest_is_stable_across_additions() -> None:
+    """Item 11: the compared digest covers everything except the
+    instance inventory — an elastic addition must NOT flip it (a
+    frontend launched with the grown yaml still attaches to the primary
+    that started with the smaller one), while the full digest moves."""
+    one = LwdTopology.from_dict(_payload(1))
+    two = LwdTopology.from_dict(_payload(2))
+    three = LwdTopology.from_dict(_payload(3))
+    assert one.frontend_digest == two.frontend_digest == three.frontend_digest
+    assert len({one.digest, two.digest, three.digest}) == 3
+
+
+def test_frontend_digest_tracks_the_frozen_blocks() -> None:
+    """A change outside the instance inventory still flips the compared
+    digest: the attach refuses a genuinely different deployment."""
+    base = LwdTopology.from_dict(_payload(2))
+    moved_port = _payload(2)
+    moved_port["deployment"]["api_bind_base_port"] = 62000
+    assert (
+        LwdTopology.from_dict(moved_port).frontend_digest
+        != base.frontend_digest
+    )
+    qos_moved = _payload(2)
+    qos_moved["qos"] = {"data_plane": {"traffic_class": 100, "sl": 1}}
+    assert (
+        LwdTopology.from_dict(qos_moved).frontend_digest
+        != base.frontend_digest
+    )

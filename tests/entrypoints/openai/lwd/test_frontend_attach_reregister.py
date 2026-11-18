@@ -389,3 +389,22 @@ def test_authority_accepts_attach_beyond_the_plan_within_capacity() -> None:
     response = _handle(server, beyond)
     assert response["type"] == "LWD_FRONTEND_ERROR"
     assert f"client_index must be in [1, {LWD_API_MAX_FRONTENDS})" in response["reason"]
+
+
+def test_the_attach_matches_on_the_frontend_digest_not_the_inventory() -> None:
+    """Item 11: the config diff compares `lwd_frontend_digest` — stable
+    across elastic additions, so a frontend launched with the grown yaml
+    attaches to the primary that started with the smaller one; a
+    genuinely different deployment (different digest) still refuses with
+    the key named in the reason."""
+    server = _server()
+    server.config_payload = {"lwd_frontend_digest": "fd-stable"}
+    same = _attach_message(pid=111)
+    same["config_payload"] = {"lwd_frontend_digest": "fd-stable"}
+    assert _handle(server, same)["type"] == "LWD_FRONTEND_ACCEPT"
+    drifted = _attach_message(pid=112)
+    drifted["config_payload"] = {"lwd_frontend_digest": "fd-different"}
+    response = _handle(server, drifted)
+    assert response["type"] == "LWD_FRONTEND_ERROR"
+    assert "lwd_frontend_digest" in response["reason"]
+    assert "fd-stable" in response["reason"] and "fd-different" in response["reason"]

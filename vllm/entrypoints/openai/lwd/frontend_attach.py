@@ -147,6 +147,11 @@ class FrontendAttachPlan:
     endpoint: str
     api_bind_base_port: int
     topology_digest: str
+    """Full topology digest, observability only (the authority logs it)."""
+    frontend_digest: str
+    """The compared digest: stable across elastic additions (it covers
+    everything except the instance inventory), so a frontend launched
+    with the grown yaml still attaches to the running primary."""
     additional_config: dict[str, Any]
     host_comm: bool
     """Whether the primary must run the attach pipeline: the serve
@@ -188,6 +193,7 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
         endpoint=endpoint,
         api_bind_base_port=lwd.topology.deployment.api_bind_base_port,
         topology_digest=lwd.topology.digest,
+        frontend_digest=lwd.topology.frontend_digest,
         additional_config=_additional_config_dict(args),
         host_comm=lwd.topology.is_host_comm,
     )
@@ -213,7 +219,7 @@ def compute_attach_config_payload(
     payload = jsonify_non_default_args(
         args, exclude=set(_ATTACH_CONFIG_EXCLUDE_KEYS)
     )
-    payload["lwd_topology_digest"] = plan.topology_digest
+    payload["lwd_frontend_digest"] = plan.frontend_digest
     payload["lwd_additional_config"] = _canonical_additional_config(plan)
     return payload
 
@@ -772,6 +778,11 @@ def create_frontend_registration_server(
         if (value := getattr(args, name, None)) is not None:
             ports[name] = int(value)
     _assert_ports_outside_engine_io_band(plan.api_bind_base_port, ports, "primary")
+    logger.info(
+        "LWD registration authority: frontend digest %s (topology %s)",
+        plan.frontend_digest,
+        plan.topology_digest,
+    )
     return FrontendAttachServer(
         endpoint=plan.endpoint,
         client_count=client_count,

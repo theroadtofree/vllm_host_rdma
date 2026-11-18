@@ -32,6 +32,19 @@ LwdString = Annotated[StrictStr, Field(pattern=r"\S")]
 LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
+def _canonical_json(payload: dict[str, Any]) -> bytes:
+    """Deterministic encoding of a validated semantic snapshot: hashing
+    this (never the YAML spelling) is what makes the digests stable under
+    formatting and key order."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def _address(value: str) -> str:
     address = ip_address(value)
     if address.is_unspecified or address.is_multicast:
@@ -323,6 +336,12 @@ class LwdTopology:
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
     """First 16 hex characters of the canonical topology SHA-256 digest."""
+    frontend_digest: str = Field(default="", init=False)
+    """First 16 hex of the canonical SHA-256 over everything EXCEPT the
+    instance inventory (edges, clouds, links and the instance-count
+    declarations): the subset every attached frontend must match. An
+    elastic addition changes only the inventory, so this digest stays
+    stable across increments while ``digest`` moves with them."""
 
     @classmethod
     def from_file(cls, path: str) -> "LwdTopology":
@@ -338,21 +357,32 @@ class LwdTopology:
         topology = TypeAdapter(cls).validate_python(raw)
         topology.validate_layout()
         # Hash the validated semantic snapshot, never YAML spelling/layout.
-        # Exclude the derived digest field itself from the canonical payload.
+        # Exclude the derived digest fields themselves from the payload.
         canonical = asdict(topology)
         canonical.pop("digest", None)
+        canonical.pop("frontend_digest", None)
         canonical["instance_links"] = sorted(
             canonical["instance_links"],
             key=lambda link: (link["edge"], link["cloud"]),
         )
-        encoded = json.dumps(
-            canonical,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        ).encode("utf-8")
-        object.__setattr__(topology, "digest", sha256(encoded).hexdigest()[:16])
+        object.__setattr__(
+            topology, "digest", sha256(_canonical_json(canonical)).hexdigest()[:16]
+        )
+        frontend = {
+            key: value
+            for key, value in canonical.items()
+            if key not in ("edges", "clouds", "instance_links")
+        }
+        frontend["deployment"] = {
+            key: value
+            for key, value in canonical["deployment"].items()
+            if key not in ("edges_num", "clouds_num")
+        }
+        object.__setattr__(
+            topology,
+            "frontend_digest",
+            sha256(_canonical_json(frontend)).hexdigest()[:16],
+        )
         return topology
 
     @property
