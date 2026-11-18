@@ -31,7 +31,9 @@ from vllm.config.lwd import (
     LwdTopologyUpdateRejected,
     diff_topology,
 )
+from vllm.config.lwd.topology import LwdDPConnection
 from vllm.lwd_logger import lwd_logger
+from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
     LwdCoordClient,
@@ -126,6 +128,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # calls it from the except branch), so the watch stop event must
         # predate every fallible step below.
         self._lwd_topology_watch_stop = threading.Event()
+        # Runtime-added connections (elastic scale-out), keyed by
+        # (cloud_id, dp_idx): the engine thread puts, the control-plane IO
+        # thread only gets — a keyed read cannot observe a half-applied add.
+        self._lwd_runtime_connections: dict[tuple[int, int], LwdDPConnection] = {}
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
@@ -288,13 +294,55 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return None
         lwd_logger.info(
             "[LWD] topology increment detected: +%d pair(s), edges=%s "
-            "clouds=%s, %d connection(s) (apply is a later phase)",
+            "clouds=%s, %d connection(s)",
             len(verdict.new_edge_ids),
             list(verdict.new_edge_ids),
             list(verdict.new_cloud_ids),
             len(verdict.new_connections),
         )
+        self._lwd_apply_increment(verdict)
         return verdict
+
+    def _lwd_apply_increment(self, increment: LwdTopologyIncrement) -> None:
+        """Phase B: build the control-plane half of every new connection
+        (DEALER + handshake + bookkeeping). The data-plane half is a later
+        phase — the admission gate keeps rejecting these connections
+        until it exists, so a request never reaches a link that cannot
+        carry it. Idempotent per connection: a re-detected increment
+        replays the already-added ones silently."""
+        plane = self._lwd_control_plane
+        assert isinstance(plane, LwdEdgeControlPlane)
+        for connection in increment.new_connections:
+            key = (connection.cloud_id, connection.dp_idx)
+            if key in self._lwd_runtime_connections:
+                continue
+            if connection.cloud.ctrl_port is None:
+                lwd_logger.error(
+                    "[LWD] topology increment %s dropped: the cloud DP has "
+                    "no ctrl_port",
+                    connection.connection_id,
+                )
+                continue
+            self._lwd_runtime_connections[key] = connection
+            self.scheduler.lwd_add_runtime_connection(connection.connection_id)
+            plane.add_link(
+                make_zmq_path(
+                    "tcp", connection.cloud.addr, connection.cloud.ctrl_port
+                ),
+                connection.connection_id,
+                len(
+                    increment.new_topology.instance(
+                        "cloud", connection.cloud_id
+                    ).dp
+                ),
+            )
+            lwd_logger.info(
+                "[LWD] topology increment applied (control plane): "
+                "connection %s -> %s:%s",
+                connection.connection_id,
+                connection.cloud.addr,
+                connection.cloud.ctrl_port,
+            )
 
     def _lwd_configure_prefix_cache(self) -> None:
         capabilities: set[tuple[int, int, bool, bool]] = set()
@@ -346,6 +394,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return lwd_decode_cloud_to_edge(payload)
 
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
+        # Runtime-added connections first (keyed read on the IO thread),
+        # then the immutable planned set.
+        runtime = self._lwd_runtime_connections.get(
+            (peer.instance_id, peer.dp_rank)
+        )
+        if runtime is not None:
+            return runtime.connection_id
         return next(
             connection
             for connection in self.lwd_config.connections
@@ -775,6 +830,20 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"cloud unavailable (no adopted connection for edge "
                 f"{edge_id}; the planned cloud has not started/registered "
                 f"yet)"
+            )
+        # Phase B of elastic scale-out: a runtime-added connection carries
+        # no data-plane link yet — reject fast with the real reason instead
+        # of letting routing score a link that cannot carry traffic. Must
+        # sit before the silence check: the silence block returns None
+        # (admit) whenever nothing is silent, and this connection is
+        # never a routing candidate until its data plane exists.
+        if all(
+            (c.cloud_id, c.dp_idx) in self._lwd_runtime_connections
+            for c in scoped
+        ):
+            return (
+                "cloud unavailable (adopted on the control plane only; the "
+                "data-plane link arrives with the next phase)"
             )
         with self._lwd_hello_lock:
             now = time.monotonic()

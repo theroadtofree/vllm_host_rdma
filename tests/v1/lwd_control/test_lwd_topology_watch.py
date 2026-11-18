@@ -21,11 +21,39 @@ from typing import Any
 import yaml
 
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
+from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
+
+
+class _RecordingPlane:
+    """Stands in for the edge control plane: records add_link calls."""
+
+    def __init__(self) -> None:
+        self.links: list[tuple[str, LwdConnectionId, int]] = []
+
+    def add_link(
+        self,
+        endpoint: str,
+        connection_id: LwdConnectionId,
+        cloud_dp_size: int,
+        *,
+        done: threading.Event | None = None,
+    ) -> None:
+        self.links.append((endpoint, connection_id, cloud_dp_size))
+
+
+class _RecordingScheduler:
+    """Stands in for the scheduler: records runtime-connection seeds."""
+
+    def __init__(self) -> None:
+        self.connections: list[LwdConnectionId] = []
+
+    def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        self.connections.append(connection_id)
 
 
 def _payload(instances: int) -> dict[str, Any]:
@@ -77,6 +105,9 @@ def _engine(path: Path) -> LwdEdgeEngineCore:
         path=str(path), topology=LwdTopology.from_dict(_payload(1))
     )
     engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
+    engine._lwd_control_plane = _RecordingPlane()
+    engine.scheduler = _RecordingScheduler()
+    engine._lwd_runtime_connections = {}
     return engine
 
 
@@ -91,6 +122,29 @@ def test_an_added_pair_is_detected(tmp_path: Path) -> None:
     assert verdict.new_edge_ids == (1,)
     assert verdict.new_cloud_ids == (1,)
     assert len(verdict.new_connections) == 1
+    # Phase B applied the control-plane half: one queued link with the
+    # cloud's endpoint and DP size, the runtime registry seeded, the
+    # scheduler bookkeeping created.
+    assert engine._lwd_control_plane.links == [
+        ("tcp://16.32.2.2:5551", LwdConnectionId(1, 1, 0), 1)
+    ]
+    assert (1, 0) in engine._lwd_runtime_connections
+    assert engine.scheduler.connections == [LwdConnectionId(1, 1, 0)]
+
+
+def test_applying_the_same_increment_twice_adds_each_link_once(
+    tmp_path: Path,
+) -> None:
+    """A re-detected increment (the realized snapshot never advances in
+    phase B) replays silently: the registry skips the connection."""
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _payload(1))
+    engine = _engine(topology_file)
+    _write(topology_file, _payload(2))
+    first = engine._lwd_process_topology_reload()
+    assert first is not None and not isinstance(first, LwdTopologyUpdateRejected)
+    engine._lwd_apply_increment(first)
+    assert len(engine._lwd_control_plane.links) == 1
 
 
 def test_an_illegal_update_is_rejected_without_repeats(tmp_path: Path) -> None:
@@ -163,3 +217,30 @@ def test_the_watch_thread_queues_one_tick_per_change(
     (request_type, tick) = engine.input_queue.items[0]
     assert request_type == EngineCoreRequestType.WAKEUP
     assert tick is lwd_edge_engine._LWD_TOPOLOGY_RELOAD_TICK
+
+
+def test_the_gate_rejects_a_control_plane_only_connection(
+    tmp_path: Path,
+) -> None:
+    """Phase B semantics: a runtime-added connection is adopted on the
+    control plane but carries no data-plane link yet — the admission
+    gate rejects it with the real reason instead of letting routing
+    score a link that cannot carry traffic. A planned, adopted, healthy
+    connection still admits."""
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _payload(1))
+    engine = _engine(topology_file)
+    engine._lwd_hello_lock = threading.Lock()
+    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
+    engine._lwd_hello_boot = {}
+    engine._lwd_silent = set()
+    engine._lwd_silent_routes = frozenset()
+    engine._lwd_hello_silent_s = 10.0
+    engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
+    engine._lwd_runtime_connections = {(1, 0): None}
+    reason = engine._lwd_gate_reason("e1-wrapped-req")
+    assert reason is not None
+    assert "control plane only" in reason
+    # The planned connection is not runtime: a fresh heartbeat admits it.
+    engine._lwd_clouds = {LwdConnectionId(0, 0, 0): None}
+    assert engine._lwd_gate_reason("plain-req") is None

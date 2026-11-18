@@ -20,6 +20,8 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from queue import Empty as QueueEmpty
+from queue import SimpleQueue
 from typing import Protocol
 
 import msgspec
@@ -255,6 +257,17 @@ class LwdControlSender:
         self._socket = None
 
 
+@dataclass(frozen=True)
+class _LwdPendingLink:
+    """One queued runtime link addition: the engine thread enqueues, the
+    IO thread opens the DEALER and registers it with its poller."""
+
+    endpoint: str
+    connection_id: LwdConnectionId
+    cloud_dp_size: int
+    done: threading.Event | None
+
+
 class LwdControlPlane(ABC):
     """Common IO thread, framing, outbound queue and shutdown.
 
@@ -396,6 +409,7 @@ class LwdControlPlane(ABC):
             if self._stop.is_set():
                 return
             self._drain_outbound(transport, outbound)
+            self._drain_pending(transport, poller)
             self._on_tick(transport, time.monotonic())
 
     def _drain_inbound(self, transport: LwdControlTransport) -> None:
@@ -570,6 +584,16 @@ class LwdControlPlane(ABC):
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
         return None
 
+    def _drain_pending(
+        self, transport: LwdControlTransport, poller: zmq.Poller
+    ) -> None:
+        """Role hook, IO thread: apply queued runtime link additions at a
+        poll-gap so the poller registration and every grown structure stay
+        single-writer on this thread. The default is nothing — a plane
+        that receives no additions never allocates a queue (device-comm
+        deployments are untouched by construction)."""
+        return None
+
 
 class LwdEdgeControlPlane(LwdControlPlane):
     """Edge side: DEALERs that register with every cloud DP rank it serves.
@@ -591,7 +615,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             connection_id: index
             for index, connection_id in enumerate(self._connection_ids)
         }
-        session_id = uuid.uuid4().hex
+        self._session_id = uuid.uuid4().hex
         # Each DEALER registers with one explicit (edge, cloud, engine) link.
         self._handshakes: dict[LwdConnectionId, LwdEdgeHandshake] = {
             connection_id: LwdEdgeHandshake(
@@ -601,7 +625,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
                     instance_id=connection_id.edge_id,
                     dp_rank=connection_id.dp_idx,
                     dp_size=cloud_dp_size,
-                    session_id=session_id,
+                    session_id=self._session_id,
                 ),
                 spec.config.hello_retry_interval_s,
             )
@@ -612,6 +636,96 @@ class LwdEdgeControlPlane(LwdControlPlane):
         self._settled = threading.Event()  # Every handshake settled, or a failure.
         self._handshake_error: str | None = None
         self._num_hellos_sent = 0
+        # Runtime link additions (elastic scale-out): the engine thread
+        # enqueues, the IO thread executes. Empty in every deployment that
+        # never adds links at runtime (device comm included), so the drain
+        # hook stays a no-op there.
+        self._pending_links: SimpleQueue[_LwdPendingLink] = SimpleQueue()
+
+    def add_link(
+        self,
+        endpoint: str,
+        connection_id: LwdConnectionId,
+        cloud_dp_size: int,
+        *,
+        done: threading.Event | None = None,
+    ) -> None:
+        """Queue one cloud link for the IO thread to open at the next poll
+        gap (within one IO tick). Any thread may call this; the handshake
+        (same session id) starts with the next HELLO retry. Idempotent:
+        a duplicate connection id is dropped with a log. `done`, when
+        given, is set once the command is applied (or refused), for
+        callers that need to synchronize; the engine path is
+        fire-and-forget."""
+        if not endpoint or cloud_dp_size < 1:
+            raise ValueError(
+                f"[LWD] cannot add link {connection_id}: endpoint={endpoint!r} "
+                f"cloud_dp_size={cloud_dp_size}"
+            )
+        self._pending_links.put(
+            _LwdPendingLink(endpoint, connection_id, cloud_dp_size, done)
+        )
+
+    def _drain_pending(
+        self, transport: LwdControlTransport, poller: zmq.Poller
+    ) -> None:
+        assert isinstance(transport, LwdEdgeTransport)
+        while True:
+            try:
+                pending = self._pending_links.get_nowait()
+            except QueueEmpty:
+                return
+            self._open_pending_link(transport, poller, pending)
+
+    def _open_pending_link(
+        self,
+        transport: LwdEdgeTransport,
+        poller: zmq.Poller,
+        pending: "_LwdPendingLink",
+    ) -> None:
+        if pending.connection_id in self._handshakes:
+            # Idempotent replay of an already-added link (a re-detected
+            # topology increment): drop, do not disturb the live session.
+            logger.debug(
+                "control plane %s: link for %s already exists; add ignored",
+                self._label,
+                pending.connection_id,
+            )
+            if pending.done is not None:
+                pending.done.set()
+            return
+        index = len(self._connection_ids)
+        identity = lwd_edge_identity(
+            pending.connection_id.edge_id,
+            pending.connection_id.dp_idx,
+            self._session_id,
+        )
+        link = transport.open_link(self._ctx, pending.endpoint, identity)
+        poller.register(link, zmq.POLLIN)
+        self._endpoints = (*self._endpoints, pending.endpoint)
+        self._connection_ids = (*self._connection_ids, pending.connection_id)
+        self._link_indices[pending.connection_id] = index
+        self._handshakes[pending.connection_id] = LwdEdgeHandshake(
+            LwdLinkHello(
+                link_version=LWD_LINK_PROTOCOL_VERSION,
+                message_version=LWD_MESSAGE_VERSION,
+                instance_id=pending.connection_id.edge_id,
+                dp_rank=pending.connection_id.dp_idx,
+                dp_size=pending.cloud_dp_size,
+                session_id=self._session_id,
+            ),
+            self.spec.config.hello_retry_interval_s,
+        )
+        logger.info(
+            "control plane %s: link %d added to %s (connection %s); "
+            "handshake retrying",
+            self._label,
+            index,
+            pending.endpoint,
+            pending.connection_id,
+        )
+        if pending.done is not None:
+            pending.done.set()
 
     def _create_transport(self) -> LwdControlTransport:
         identities = tuple(

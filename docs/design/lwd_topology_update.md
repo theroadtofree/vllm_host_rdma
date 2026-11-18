@@ -49,7 +49,69 @@ and no separate database:
   never advances until Phase B/C exist. The last-seen file digest
   suppresses repeat verdicts for unchanged content.
 
-## 3. Processing order (caller flow, Phase A)
+## 3. Phase B: runtime link addition on the control plane (item 3)
+
+Decided 2026-11-18: **SimpleQueue + IO-tick drain** for the command
+channel, and runtime connections are **"control-plane ready, gate
+rejecting"** until their data-plane link exists (Phase C).
+
+### 3.1 Command channel
+
+* `LwdEdgeControlPlane.add_link(endpoint, connection_id, cloud_dp_size,
+  *, done=None)` — any thread may call (the engine's reload handler
+  does, fire-and-forget); the command lands in a `SimpleQueue` and the
+  IO thread applies it in the next poll gap (≤ one IO tick, 100 ms).
+  `done` is set once applied (or refused) for callers that synchronize.
+* The IO thread is the **single writer** of everything it grows: the
+  transport's DEALER list, the poller, the endpoint/connection tuples,
+  the link-index map and the handshake table. No new locks.
+* Idempotent: a replayed connection id is dropped with a debug log (the
+  live session is never disturbed).
+* HCCL neutrality: the queue's only producer is `add_link`; the only
+  caller is the reload handler, gated on
+  `is_host_comm && scene == edge_share`. Device-comm planes never
+  enqueue — the base-class drain hook is a no-op by construction.
+
+### 3.2 Transport
+
+`LwdEdgeTransport.open_link(ctx, endpoint, identity)` opens one more
+DEALER mid-run with the same per-link options — `IMMEDIATE=1` keeps
+sends to a cloud that has not started at EAGAIN, so the periodic HELLO
+keeps retrying until it appears (the same contract a planned-but-absent
+cloud has at startup).
+
+### 3.3 Engine and scheduler glue
+
+* `LwdEdgeEngineCore._lwd_apply_increment(increment)`: for each new
+  connection — seed the runtime registry
+  (`dict[(cloud_id, dp_idx) -> LwdDPConnection]`, engine thread puts,
+  IO thread only key-gets), seed the scheduler bookkeeping
+  (`lwd_add_runtime_connection`: account + abort list — must exist
+  BEFORE the link opens, because the cloud's limits can arrive on the
+  IO thread one hello-retry after registration and
+  `lwd_update_cloud_params` subscripts them), then queue the plane's
+  `add_link`. Idempotent per connection.
+* `_lwd_connection_of` resolves runtime connections first (keyed read),
+  then the immutable planned set — heartbeats and limits of a runtime
+  peer attribute correctly and `_lwd_adopt_cloud` adopts as usual.
+* **Gate semantics (Phase B)**: a scoped set whose connections are all
+  runtime is rejected with "adopted on the control plane only; the
+  data-plane link arrives with the next phase" — before the silence
+  check, because the silence block admits whenever nothing is silent,
+  and a runtime connection is never a routing candidate until Phase C
+  arms it.
+
+### 3.4 Tests
+
+`tests/v1/lwd_control/test_lwd_control_plane_add_link.py` (real ZMQ on
+loopback): an added link registers with its cloud and carries directed
+payloads; a replayed add is a no-op. `test_lwd_topology_watch.py`
+additionally covers the engine glue (reload → add_link with the
+cloud's endpoint and DP size, registry and scheduler seeding,
+idempotent replay) and the gate rejection of a control-plane-only
+connection.
+
+## 4. Processing order (caller flow, Phase A)
 
 ```text
 trigger (host + edge_share + edge gate)
@@ -66,7 +128,7 @@ Standard validation runs **first**, so count mismatches, id gaps and port
 collisions never reach the diff — they fail at parse with the existing
 messages.
 
-## 4. Rules (all must hold to accept)
+## 5. Rules (all must hold to accept)
 
 | Rule | Content | Why |
 | --- | --- | --- |
@@ -80,7 +142,7 @@ Ids are append-only by construction: layout validation requires instance
 ids unique and contiguous from 0, so a valid addition can only append the
 next id.
 
-## 5. Interface
+## 6. Interface
 
 ```python
 # vllm/config/lwd/topology.py
@@ -103,7 +165,7 @@ def diff_topology(old: LwdTopology, new: LwdTopology
 Empty `new_connections` on an accepted verdict = no-op (the file was
 touched but its semantics did not change; the digest fast path catches it).
 
-## 6. Snapshot semantics
+## 7. Snapshot semantics
 
 * The engine holds a **realized snapshot** — the topology its current
   links were built from (initial: the startup yaml).
@@ -112,7 +174,7 @@ touched but its semantics did not change; the digest fast path catches it).
 * A rejected update never advances it; the verdict is deterministic, so
   re-reading the same file yields the same result.
 
-## 7. Rejection messages
+## 8. Rejection messages
 
 Pattern `[LWD] topology update rejected: <rule>: <detail>`:
 
@@ -127,7 +189,7 @@ link removed: edge 0 - cloud 0
 new link crosses old and new instances: edge 2 - cloud 0
 ```
 
-## 8. Tests
+## 9. Tests
 
 `tests/config/lwd/test_topology_update.py` — 13 cases: no-op (digest fast
 path, deepcopy), +1 pair, +2 pairs, scene change, frozen deployment /
