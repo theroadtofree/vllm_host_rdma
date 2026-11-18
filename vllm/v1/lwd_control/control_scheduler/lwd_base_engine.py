@@ -172,7 +172,13 @@ class LwdBaseEngineCore(EngineCoreProc):
         to the parent so the device plane runs the stock vLLM frontend
         path.
         """
-        if not self.lwd_config.topology.is_host_comm:
+        # Read the config off vllm_config, NOT self.lwd_config: this thread
+        # starts INSIDE super().__init__(), before this subclass assigns
+        # self.lwd_config a few statements after the super call — the
+        # thread can reach this gate first (startup race, AttributeError
+        # on the drill machine). self.vllm_config is set before the thread
+        # starts, and lwd_config is always present on an LWD engine.
+        if not self.vllm_config.lwd_config.topology.is_host_comm:
             return super().process_input_sockets(
                 input_addresses, coord_input_address, identity, ready_event
             )
