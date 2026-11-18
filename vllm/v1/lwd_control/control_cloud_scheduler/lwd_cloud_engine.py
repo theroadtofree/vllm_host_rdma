@@ -636,27 +636,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             for request_id in request_ids
         ]
         if any(prompt_len <= 0 for prompt_len in prompt_lens):
-            # Old-branch invariant: a hint without its metadata is SKIPPED,
-            # never fatal. The hint is only the early-recv optimization —
-            # the consumption point falls back to posting from the socket
-            # metadata, so the worst case loses one beat of pre-posting.
-            # The fatal variant (this repo's baseline) killed the freshly
-            # restarted cloud one second after startup: an edge request
-            # straddling the restart sends its continuation RangeNotify
-            # here while its RequestNotify was recorded by the OLD
-            # incarnation only.
-            lwd_logger.error(
-                "[cloud] RangeNotify seqno=%s skipped: missing prompt_lens "
-                "for %s (orphaned by a restart, or a protocol ordering "
-                "violation)",
-                notify.seqno,
-                [
-                    request_id
-                    for request_id in request_ids
-                    if self._lwd_prompt_lens.get(request_id, 0) <= 0
-                ],
+            raise RuntimeError(
+                f"[LWD] RangeNotify seqno={notify.seqno} arrived before "
+                "RequestNotify prompt lengths were recorded"
             )
-            return
         self._lwd_track_range(connection_id, notify.seqno, request_ids)
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             make_recv_hint,

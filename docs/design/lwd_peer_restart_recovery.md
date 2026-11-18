@@ -122,14 +122,6 @@ never get to matter under traffic:
    path exists). Containment means a transient drop for mere link errors —
    the Phase 1 reset then re-enables the connection when the peer returns.
 
-   Restart-boundary remnant, old-branch tolerance: an edge request that
-   straddles a cloud restart sends its continuation RangeNotify to the
-   fresh cloud while the RequestNotify that recorded its prompt length was
-   consumed by the old incarnation. The hint is SKIPPED with an error log
-   and the cloud survives — the hint is only the early-recv optimization
-   (the fatal variant of this check, this baseline's original, killed the
-   freshly restarted cloud one second after startup).
-
 The liveness layer then makes the containment window fast and observable:
 
 The old branch plumbed heartbeat accounting into three ZMQ receive paths (one per
