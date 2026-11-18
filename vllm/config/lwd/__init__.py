@@ -9,7 +9,13 @@ from .coordination import LwdCoordinationConfig
 from .entry import LwdConfig
 from .legacy import has_legacy_lwd_args, resolve_legacy_lwd_config
 from .logging import log_lwd_config
-from .topology import LwdConnectionId, LwdTopology
+from .topology import (
+    LwdConnectionId,
+    LwdTopology,
+    LwdTopologyIncrement,
+    LwdTopologyUpdateRejected,
+    diff_topology,
+)
 
 __all__ = [
     "LwdAPIConfig",
@@ -17,6 +23,9 @@ __all__ = [
     "LwdConnectionId",
     "LwdCoordinationConfig",
     "LwdTopology",
+    "LwdTopologyIncrement",
+    "LwdTopologyUpdateRejected",
+    "diff_topology",
     "log_lwd_config",
     "has_legacy_lwd_args",
     "resolve_legacy_lwd_config",

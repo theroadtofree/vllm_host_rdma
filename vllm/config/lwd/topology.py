@@ -594,3 +594,163 @@ class LwdTopology:
         raise ValueError(
             f"[LWD] Instance not found: role={role}, instance_id={instance_id}"
         )
+
+
+# --------------------------------------------------------------------- #
+# Runtime topology update (host-comm edge_share elastic scale-out)       #
+# --------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LwdTopologyIncrement:
+    """A validated pure-addition update for a running shared edge engine.
+
+    The engine's realized links correspond to the ``old`` snapshot;
+    ``new_connections`` are everything Phase B/C must build, and
+    ``new_topology`` becomes the realized snapshot once the increment is
+    fully applied. An empty ``new_connections`` is a no-op (the file was
+    touched but its semantics did not change)."""
+
+    new_edge_ids: tuple[int, ...]
+    new_cloud_ids: tuple[int, ...]
+    new_connections: tuple[LwdDPConnection, ...]
+    new_topology: LwdTopology
+
+
+@dataclass(frozen=True)
+class LwdTopologyUpdateRejected:
+    """A runtime topology update that violates the increment contract.
+
+    ``reason`` names the broken rule and the exact field. The engine keeps
+    serving on its realized snapshot; the verdict is deterministic, so
+    re-reading the same file yields the same result."""
+
+    reason: str
+
+
+def _first_change(path: str, old: Any, new: Any) -> str | None:
+    """Deepest differing field of two ``asdict`` trees, as ``path: a -> b``."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        for key in sorted(set(old) | set(new)):
+            if key not in old:
+                return f"{path}.{key}: <absent> -> {new[key]!r}"
+            if key not in new:
+                return f"{path}.{key}: {old[key]!r} -> <absent>"
+            if old[key] != new[key]:
+                return _first_change(f"{path}.{key}", old[key], new[key])
+        return None
+    if isinstance(old, (list, tuple)) and isinstance(new, (list, tuple)):
+        if len(old) != len(new):
+            return f"{path}: {len(old)} -> {len(new)} entries"
+        for index, (old_item, new_item) in enumerate(zip(old, new)):
+            if old_item != new_item:
+                return _first_change(f"{path}[{index}]", old_item, new_item)
+        return None
+    return f"{path}: {old!r} -> {new!r}"
+
+
+def _frozen_blocks(topology: LwdTopology) -> dict[str, Any]:
+    """Global blocks an increment must not touch: deployment (minus the
+    instance-count declarations, which follow the added instances),
+    feature_ctrl and control_plane. ``qos`` is exempt by deployment
+    guarantee, not by code (2026-11-18 review decision)."""
+    deployment = asdict(topology.deployment)
+    deployment.pop("edges_num")
+    deployment.pop("clouds_num")
+    return {
+        "deployment": deployment,
+        "feature_ctrl": asdict(topology.feature_ctrl),
+        "control_plane": asdict(topology.control_plane),
+    }
+
+
+def diff_topology(
+    old: LwdTopology, new: LwdTopology
+) -> LwdTopologyIncrement | LwdTopologyUpdateRejected:
+    """Validate a runtime topology update as a pure addition (v1 contract).
+
+    Preconditions: both topologies come from ``from_dict``, so the full
+    layout validation (scene shape, port uniqueness, count consistency,
+    contiguous instance ids, one-to-one links) already ran. The rules, in
+    order:
+
+    * R0 the scene stays ``edge_share`` — the running shared edge engine
+      is the only consumer, and a same-shape ``single_instance`` file
+      parses clean, so the scene must be compared explicitly;
+    * R1 global blocks are frozen (see ``_frozen_blocks``): they size the
+      realized pools (``up_buffer_size``), seed channel scrambling and
+      configure the control plane — none can be applied retroactively;
+    * R2 every realized instance survives byte-identical, dp list and
+      coordination block included — which also pins every realized
+      connection and rules out shrink (scale-in keeps its existing
+      kill + liveness semantics);
+    * R3 links are addition-only: a swap of realized links is a change;
+    * R4 additions are whole instance pairs (edge_share grows by pairs).
+
+    Instance ids are append-only by construction: layout validation
+    requires ids unique and contiguous from 0, so a valid addition can
+    only append the next id."""
+    if old.digest == new.digest:
+        return LwdTopologyIncrement((), (), (), new)
+    if (
+        old.deployment.scene != "edge_share"
+        or new.deployment.scene != old.deployment.scene
+    ):
+        return LwdTopologyUpdateRejected(
+            f"scene changed: {old.deployment.scene} -> {new.deployment.scene}"
+        )
+    frozen_old = _frozen_blocks(old)
+    frozen_new = _frozen_blocks(new)
+    for name, old_block in frozen_old.items():
+        change = _first_change(name, old_block, frozen_new[name])
+        if change is not None:
+            return LwdTopologyUpdateRejected(f"global block changed: {change}")
+    old_edges = {instance.id for instance in old.edges}
+    old_clouds = {instance.id for instance in old.clouds}
+    for role, old_instances, new_instances in (
+        ("edge", old.edges, new.edges),
+        ("cloud", old.clouds, new.clouds),
+    ):
+        new_by_id = {instance.id: instance for instance in new_instances}
+        for instance in old_instances:
+            fresh = new_by_id.get(instance.id)
+            if fresh is None:
+                return LwdTopologyUpdateRejected(
+                    f"instance removed: {role} {instance.id} (shrink is not "
+                    "supported; scale-in keeps the kill + liveness semantics)"
+                )
+            change = _first_change(
+                f"{role} {instance.id}", asdict(instance), asdict(fresh)
+            )
+            if change is not None:
+                return LwdTopologyUpdateRejected(
+                    f"existing instance modified: {change}"
+                )
+    old_links = set(old.instance_links)
+    new_links = set(new.instance_links)
+
+    def link_key(link: LwdLink) -> tuple[int, int]:
+        return (link.edge, link.cloud)
+
+    if old_links - new_links:
+        removed = sorted(old_links - new_links, key=link_key)[0]
+        return LwdTopologyUpdateRejected(
+            f"link removed: edge {removed.edge} - cloud {removed.cloud}"
+        )
+    for link in sorted(new_links - old_links, key=link_key):
+        if (link.edge in old_edges) != (link.cloud in old_clouds):
+            return LwdTopologyUpdateRejected(
+                f"new link crosses old and new instances: "
+                f"edge {link.edge} - cloud {link.cloud}"
+            )
+    new_edge_ids = tuple(sorted({instance.id for instance in new.edges} - old_edges))
+    new_cloud_ids = tuple(sorted({instance.id for instance in new.clouds} - old_clouds))
+    if len(new_edge_ids) != len(new_cloud_ids):
+        return LwdTopologyUpdateRejected(
+            f"additions must be instance pairs: {len(new_edge_ids)} edge(s) "
+            f"vs {len(new_cloud_ids)} cloud(s)"
+        )
+    connections: list[LwdDPConnection] = []
+    for link in sorted(new_links - old_links, key=link_key):
+        connections.extend(new.connections("edge", link.edge))
+    return LwdTopologyIncrement(new_edge_ids, new_cloud_ids, tuple(connections), new)
