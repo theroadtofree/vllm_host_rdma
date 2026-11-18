@@ -537,9 +537,16 @@ class LwdTopology:
                         "an enabled coordination block"
                     )
         if scene == "edge_share":
-            if edge_count != cloud_count or cloud_count < 2:
+            # A single pair is the degenerate form of the shared-edge
+            # pipeline: it runs the attach frontend machinery and the
+            # client_index-based request routing exactly like the N-pair
+            # form, so a deployment can verify the whole pipeline with one
+            # instance and grow by extending the plan. The equal-count
+            # clause below is the actual edge_share invariant; the count
+            # itself is not, and every consumer is count-generic.
+            if edge_count != cloud_count:
                 raise ValueError(
-                    "[LWD] edge_share requires equal multiple edge/cloud IDs"
+                    "[LWD] edge_share requires equal edge/cloud instance IDs"
                 )
             if (
                 len(self.instance_links) != edge_count

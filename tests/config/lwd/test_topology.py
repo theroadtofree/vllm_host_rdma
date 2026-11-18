@@ -4,7 +4,7 @@
 from pathlib import Path
 
 import pytest
-from lwd_config_under_test import LwdTopology
+from lwd_config_under_test import LwdConnectionId, LwdTopology
 from sample_topologies import PAYLOADS, topology_payload
 
 
@@ -46,6 +46,57 @@ def test_colocated_edges_keep_distinct_ranks_and_share_cloud(dp_count: int) -> N
         assert [c.cloud_id for c in topology.connections("edge", edge.id)] == [
             0
         ] * dp_count
+
+
+def minimal_edge_share_payload() -> dict:
+    """One-pair edge_share in host comm: the degenerate form of the
+    shared-edge pipeline, so a deployment can verify the whole attach
+    machinery with a single instance and grow by extending the plan."""
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": "edge_share",
+            "edges_num": 1,
+            "clouds_num": 1,
+            "data_plane_comm": "host",
+        },
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
+        "edges": [{"id": 0, "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}]}],
+        "clouds": [
+            {
+                "id": 0,
+                "dp": [
+                    {
+                        "dp_idx": 0,
+                        "addr": "16.32.2.2",
+                        "ctrl_port": 5550,
+                        "data_port": 5560,
+                    }
+                ],
+            }
+        ],
+        "instance_links": [{"edge": 0, "cloud": 0}],
+    }
+
+
+def test_single_pair_edge_share_is_the_degenerate_pipeline_form() -> None:
+    topology = LwdTopology.from_dict(minimal_edge_share_payload())
+    assert topology.deployment.scene == "edge_share"
+    (connection,) = topology.connections("edge", 0)
+    assert connection.connection_id == LwdConnectionId(0, 0, 0)
+    # The cloud sees the same single connection from its own side.
+    assert topology.connections("cloud", 0) == (connection,)
+
+
+def test_edge_share_still_requires_equal_instance_counts() -> None:
+    raw = minimal_edge_share_payload()
+    raw["deployment"]["edges_num"] = 2
+    raw["edges"].append({"id": 1, "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}]})
+    with pytest.raises(ValueError, match="equal edge/cloud instance IDs"):
+        LwdTopology.from_dict(raw)
 
 
 @pytest.mark.parametrize(
