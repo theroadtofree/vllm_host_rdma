@@ -379,7 +379,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 request.request_id,
                 gate_reason,
             )
-            self._send_abort_outputs_to_client(
+            # ERROR finish code (NOT abort), old-branch parity: the client
+            # sees a request FAILURE, not a cancellation — the "service not
+            # ready" semantics of an unstarted edge-cloud pair. An abort
+            # finish would surface as a cancelled/empty completion instead
+            # of an explicit reject.
+            self._send_error_outputs_to_client(
                 [request.request_id], request.client_index
             )
             return

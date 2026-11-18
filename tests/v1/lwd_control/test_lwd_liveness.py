@@ -229,19 +229,20 @@ def test_entry_gate_rejects_before_the_probe_machinery(
 ) -> None:
     """The gate is the FIRST thing a request meets (old-branch invariant):
     with the route silent, add_request finishes the request directly
-    (client-visible abort output, nothing enqueues afterwards) and never
-    touches the probe machinery — a probe sent to the dead cloud would
-    hang for its full timeout instead of rejecting."""
+    (client-visible ERROR finish — a request failure, not a cancellation
+    — nothing enqueues afterwards) and never touches the probe machinery
+    — a probe sent to the dead cloud would hang for its full timeout
+    instead of rejecting."""
     from types import SimpleNamespace
 
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
     engine._lwd_silent_routes = frozenset({CONNECTION})
-    aborted: list = []
+    errored: list = []
     monkeypatch.setattr(
         engine,
-        "_send_abort_outputs_to_client",
-        lambda ids, client_index: aborted.append((ids, client_index)),
+        "_send_error_outputs_to_client",
+        lambda ids, client_index: errored.append((ids, client_index)),
     )
     engine.scheduler = SimpleNamespace(lwd_edge_request_active=lambda request_id: False)
     engine._lwd_probe_manager = SimpleNamespace(
@@ -254,7 +255,7 @@ def test_entry_gate_rejects_before_the_probe_machinery(
         abort_immediately=False,
     )
     engine.add_request(request)
-    assert aborted == [(["plain-req"], 0)]
+    assert errored == [(["plain-req"], 0)]
 
 
 def test_abort_skips_the_cloud_notify_for_silent_connections(
