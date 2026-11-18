@@ -178,10 +178,17 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     assert lwd is not None
     count = len(lwd.topology.edges)
     requested_count = getattr(args, "api_server_count", None)
-    if requested_count is not None and requested_count != count:
+    # The host-comm primary sets the reserved band capacity
+    # programmatically (lwd_dispatch_attach_frontend): that value is
+    # not a user override, and the later re-resolves (the registration
+    # authority, the attach watchdog) must accept it.
+    capacity_value = (
+        lwd.topology.is_host_comm and requested_count == LWD_API_MAX_FRONTENDS
+    )
+    if requested_count is not None and requested_count != count and not capacity_value:
         raise ValueError(
-            f"[LWD] --api-server-count ({requested_count}) must equal the "
-            f"edge_share frontend count ({count})"
+            f"[LWD] --api-server-count ({requested_count}) must equal "
+            f"the edge_share frontend count ({count})"
         )
     mode = "primary" if api.api_server_rpc_port is not None else "attach"
     endpoint = api.api_server_rpc_port or api.api_server_attach

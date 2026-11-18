@@ -29,6 +29,7 @@ from vllm.config.lwd.topology import LWD_API_MAX_FRONTENDS
 from vllm.entrypoints.openai.lwd.frontend_attach import (
     FrontendAttachServer,
     lwd_dispatch_attach_frontend,
+    resolve_attach_plan,
     wait_for_attach_registrations,
 )
 
@@ -373,6 +374,17 @@ def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
     assert lwd_dispatch_attach_frontend(args) is False
     assert args.api_server_count == (LWD_API_MAX_FRONTENDS if host_comm else 1)
     assert args.lwd_attach_primary is expected
+    if host_comm:
+        # The registration authority re-resolves the plan AFTER the
+        # dispatch set the capacity value; that re-resolve must accept
+        # the programmatic count (the regression: "--api-server-count
+        # (8) must equal the edge_share frontend count (1)").
+        replan = resolve_attach_plan(args)
+        assert replan is not None and replan.client_count == 1
+    # A genuinely user-passed wrong count still fails fast.
+    args.api_server_count = 3
+    with pytest.raises(ValueError, match="must equal"):
+        resolve_attach_plan(args)
 
 
 def test_authority_accepts_attach_beyond_the_plan_within_capacity() -> None:
