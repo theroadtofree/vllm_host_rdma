@@ -18,13 +18,16 @@ through the transparent reconnection.
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 import pytest
+import yaml
 
 import vllm.entrypoints.openai.lwd.frontend_attach as frontend_attach
 from vllm.entrypoints.openai.lwd.frontend_attach import (
     FrontendAttachServer,
+    lwd_dispatch_attach_frontend,
     wait_for_attach_registrations,
 )
 
@@ -299,3 +302,71 @@ def test_registration_rejects_a_listen_port_inside_the_band() -> None:
     assert response["type"] == "LWD_FRONTEND_ERROR"
     assert "reserved engine IO band" in response["reason"]
     assert _handle(server, _attach_message(pid=111))["type"] == "LWD_FRONTEND_ACCEPT"
+
+
+def _one_pair_edge_share_yaml(path: Any, *, host_comm: bool) -> None:
+    """A single-pair edge_share topology; device comm adds the rank
+    allocations host comm does not use."""
+    deployment: dict[str, Any] = {
+        "mode": 0,
+        "scene": "edge_share",
+        "edges_num": 1,
+        "clouds_num": 1,
+    }
+    edge_dp: dict[str, Any] = {"dp_idx": 0, "addr": "135.150.2.2"}
+    cloud_dp: dict[str, Any] = {"dp_idx": 0, "addr": "16.32.2.2", "ctrl_port": 5550}
+    if host_comm:
+        deployment["data_plane_comm"] = "host"
+        cloud_dp["data_port"] = 5560
+    else:
+        deployment["hccl_world_size"] = 2
+        edge_dp["ranks"] = [0]
+        cloud_dp["ranks"] = [1]
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "deployment": deployment,
+                "feature_ctrl": {
+                    "enable_early_recv": False,
+                    "scramble": {
+                        "enable": False,
+                        "device_id": None,
+                        "custom_factor": None,
+                    },
+                },
+                "edges": [{"id": 0, "dp": [edge_dp]}],
+                "clouds": [{"id": 0, "dp": [cloud_dp]}],
+                "instance_links": [{"edge": 0, "cloud": 0}],
+            },
+            sort_keys=False,
+        )
+    )
+
+
+@pytest.mark.parametrize("host_comm,expected", [(True, True), (False, False)])
+def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
+    tmp_path: Any, host_comm: bool, expected: bool
+) -> None:
+    """A count==1 attach primary must still set lwd_attach_primary on
+    host comm so the serve dispatch routes it through
+    run_multi_api_server -- the single in-process path never builds the
+    registration server, and --api-server-rpc-port stays silently
+    unbound (attach frontends then hang on it until their reply
+    timeout). Device comm keeps the native single-server path."""
+    yaml_path = tmp_path / "edge_share.yaml"
+    _one_pair_edge_share_yaml(yaml_path, host_comm=host_comm)
+    args = argparse.Namespace(
+        additional_config={
+            "lwd_config": {
+                "path": str(yaml_path),
+                "role": "edge",
+                "instance_id": 0,
+            }
+        },
+        api_server_rpc_port="127.0.0.1:23657",
+        api_server_attach=None,
+        api_server_count=None,
+    )
+    assert lwd_dispatch_attach_frontend(args) is False
+    assert args.api_server_count == 1
+    assert args.lwd_attach_primary is expected

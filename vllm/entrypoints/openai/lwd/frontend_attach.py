@@ -148,6 +148,11 @@ class FrontendAttachPlan:
     api_bind_base_port: int
     topology_digest: str
     additional_config: dict[str, Any]
+    host_comm: bool
+    """Whether the primary must run the attach pipeline: the serve
+    dispatch routes an attach primary through ``run_multi_api_server``
+    for host comm even at ``client_count == 1``; device-comm deployments
+    keep the native single-server path."""
 
 
 def _additional_config_dict(args: Any) -> dict[str, Any]:
@@ -184,6 +189,7 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
         api_bind_base_port=lwd.topology.deployment.api_bind_base_port,
         topology_digest=lwd.topology.digest,
         additional_config=_additional_config_dict(args),
+        host_comm=lwd.topology.is_host_comm,
     )
 
 
@@ -905,6 +911,13 @@ def lwd_dispatch_attach_frontend(args: Any) -> bool:
         run_attach_api_server(args)
         return True
     args.api_server_count = plan.client_count
+    # Route this primary through run_multi_api_server even at
+    # client_count == 1: the single in-process path never builds the
+    # registration server, so --api-server-rpc-port stays silently
+    # unbound and every attach frontend hangs on it until its reply
+    # timeout. Host comm only — device-comm primaries keep the native
+    # single-server path.
+    args.lwd_attach_primary = plan.host_comm
     return False
 
 
