@@ -177,8 +177,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         deadline = time.monotonic() + handshake_timeout_s
         self._lwd_clouds.update(plane.wait_until_ready(handshake_timeout_s))
         # Seed the accounts for the discovered connections (a beat that
-        # already arrived mid-assembly wins over the seeding).
-        for connection in self._lwd_clouds:
+        # already arrived mid-assembly wins over the seeding). tuple()
+        # snapshot: _lwd_clouds also gains entries on the control-plane
+        # IO thread (a cloud's limits adopt mid-assembly), and a
+        # Python-level dict iteration raises on that insert while
+        # tuple(dict) completes in C.
+        for connection in tuple(self._lwd_clouds):
             self._lwd_hello_last.setdefault(connection, time.monotonic())
         expected = len(self._lwd_clouds)
         while len(self._lwd_cloud_params) < expected:
@@ -193,7 +197,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     f"{handshake_timeout_s}s"
                 )
             self._lwd_cloud_params_received.clear()
-        for connection, params in self._lwd_cloud_params.items():
+        # Snapshot: a straggler cloud completes its handshake after the
+        # wait and its limits land on the IO thread while this loop runs.
+        for connection, params in tuple(self._lwd_cloud_params.items()):
             self._lwd_adopt_cloud(connection, self._lwd_clouds[connection], params)
         self._lwd_configure_prefix_cache()
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
@@ -292,7 +298,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
 
     def _lwd_configure_prefix_cache(self) -> None:
         capabilities: set[tuple[int, int, bool, bool]] = set()
-        for dp_idx, params in self._lwd_cloud_params.items():
+        # Snapshot: a straggler cloud's limits can land on the IO thread
+        # while this engine-thread loop runs.
+        for dp_idx, params in tuple(self._lwd_cloud_params.items()):
             if self._lwd_prefix_enabled != params.prefix_caching:
                 raise RuntimeError(
                     f"[LWD] prefix caching mismatch on dp{dp_idx}: "
@@ -328,7 +336,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if watch_stop is not None:
             watch_stop.set()
         self._lwd_probe_manager.close()
-        for client in getattr(self, "_lwd_coord_clients", {}).values():
+        # Snapshot: a late adoption on the IO thread can add a client
+        # while shutdown iterates.
+        for client in tuple(getattr(self, "_lwd_coord_clients", {}).values()):
             client.shutdown()
         super().shutdown()
 
@@ -755,7 +765,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         and retryably. Letting it through would route it to an
         unaddressable connection and kill the shared engine."""
         edge_id, _ = parse_edge_id(request_id)
-        scoped = {c for c in self._lwd_clouds if c.edge_id == edge_id}
+        # Snapshot before iterating: _lwd_clouds is written by the
+        # control-plane IO thread (runtime adoption) while this runs on
+        # the engine thread per request; a Python-level iteration raises
+        # on the concurrent insert, tuple(dict) completes in C.
+        scoped = {c for c in tuple(self._lwd_clouds) if c.edge_id == edge_id}
         if not scoped:
             return (
                 f"cloud unavailable (no adopted connection for edge "

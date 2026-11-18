@@ -9,6 +9,7 @@ a restart verdict on its own.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -456,3 +457,36 @@ def test_beat_survives_the_mid_assembly_window(monkeypatch: pytest.MonkeyPatch) 
     assert engine._lwd_hello_boot[CONNECTION] == "boot-a"
     # The gate admits nothing-relevant with the still-empty view elsewhere.
     assert engine._lwd_gate_reason("plain-req") is None
+
+
+def test_gate_iteration_survives_concurrent_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The control-plane IO thread adopts (inserts into _lwd_clouds)
+    while the engine thread gates: every engine-thread read of the dict
+    snapshots first — tuple(dict) completes in C, a Python-level
+    iteration raises 'dictionary changed size during iteration'
+    (the pre-fix shape that would kill the shared engine per request).
+    Stress-shaped but one-sided: it can only fail while the race
+    exists, never spuriously."""
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    stop = threading.Event()
+
+    def adopter() -> None:
+        while not stop.is_set():
+            engine._lwd_clouds[CONNECTION_E1] = None
+            del engine._lwd_clouds[CONNECTION_E1]
+
+    saved_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # force the interleave the race needs
+    try:
+        thread = threading.Thread(target=adopter, daemon=True)
+        thread.start()
+        for _ in range(2000):
+            engine._lwd_gate_reason("plain-req")
+        stop.set()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+    finally:
+        sys.setswitchinterval(saved_interval)
