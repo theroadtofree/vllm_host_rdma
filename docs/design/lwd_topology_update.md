@@ -111,7 +111,73 @@ cloud's endpoint and DP size, registry and scheduler seeding,
 idempotent replay) and the gate rejection of a control-plane-only
 connection.
 
-## 4. Processing order (caller flow, Phase A)
+## 4. Phase C: runtime data-plane assembly (items 6-7; item 8 needs nothing)
+
+Decided 2026-11-18: a refused data-plane build keeps the connection
+**control-plane only, retried by the next detected increment** — no
+timers, no new channel.
+
+### 4.1 Scope correction
+
+The queue layer is already lazy: `LwdDataPlane._submit` materializes a
+queue on first submit per `(connection, channel, op)` and the host queue
+resolves its UCX IO by connection — so item 8 (transfer queues) needs
+no work. The cloud side needs none either: an edge_share addition's
+cloud is a fresh process reading the updated yaml, so its listener,
+tokens and hint MQs exist from its own init.
+
+### 4.2 Layering
+
+* `vllm/v1/lwd_control/lwd_comm/lwd_data_plane_hooks.py` (new, mirrors
+  `lwd_restart_hooks`): `register_data_plane_add_hook(hook)` /
+  `notify_data_plane_added(connection) -> bool`. A raising hook is
+  logged and counts as a refusal. Device comm never registers — the
+  reload path is host-gated, so the empty registry is unreachable there.
+* `vllm-ascend` `lwd_host_channels.py`:
+  * `_HostLinkPlan` — the link-building inputs (role, block sizes,
+    qos, sidecar) snapshotted at init: `get_current_vllm_config()` is
+    gone by request time, and the values are process-lifetime
+    constants. `_ALLOCATED_MB` is the budget ledger: the startup plan's
+    need plus every runtime-built pair, against the same 12 GiB
+    per-rank limit.
+  * `_build_connection_ios(conn, listener, plan)` — the shared body of
+    the init loop and the runtime addition; rolls its own partial
+    builds back on failure.
+  * `lwd_add_runtime_connection(conn) -> bool` — refuses, never raises:
+    uninitialized plane, non-edge caller, missing `data_port`, budget
+    shortfall, or a build failure (rolled back). Idempotent on replay.
+    Registered as the hook at the end of `lwd_init_host_channels`,
+    so a notify can only reach an initialized plane.
+* Engine (vllm): `_lwd_arm_runtime_connection` — notify; on success
+  the connection joins `_lwd_armed_connections` and the scheduler's
+  routing candidates (`lwd_arm_runtime_connection`, sorted insert so
+  round-robin order stays stable). On refusal: error log only.
+* **Gate**: the phase-B runtime-only rejection narrows to
+  "runtime AND unarmed" — an armed runtime connection falls through to
+  the silence check like any planned link.
+* `_teardown_cloud_dp` snapshots `_UCX_IOS.items()` (tuple(dict.items())
+  completes in C): runtime adds land on the engine thread while a
+  boot-change verdict can fire the teardown on the IO thread.
+
+### 4.3 Legacy boundary
+
+`LwdEdgeScheduler`'s int-indexed send-watermark mapping
+(`_lwd_connections[dp_idx]`) predates runtime additions: it keeps
+meaning link indices of the STARTUP plan. Runtime connections produce
+`LwdConnectionId`-keyed watermarks.
+
+### 4.4 Tests
+
+`tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py`
+(+6): builds both links with the right token and closures, ledger
+accounting, idempotent replay, budget shortfall refusal, uninitialized
+and non-edge refusal, partial-build rollback, missing data_port.
+`test_lwd_topology_watch.py` (+2): refused-then-armed retry semantics
+(no duplicate control-plane add, gate flips to admit) and the hook
+registry contract (empty refuses, a raising hook survives the caller,
+a working hook reports the build).
+
+## 5. Processing order (caller flow, Phase A)
 
 ```text
 trigger (host + edge_share + edge gate)
@@ -128,7 +194,7 @@ Standard validation runs **first**, so count mismatches, id gaps and port
 collisions never reach the diff — they fail at parse with the existing
 messages.
 
-## 5. Rules (all must hold to accept)
+## 6. Rules (all must hold to accept)
 
 | Rule | Content | Why |
 | --- | --- | --- |
@@ -142,7 +208,7 @@ Ids are append-only by construction: layout validation requires instance
 ids unique and contiguous from 0, so a valid addition can only append the
 next id.
 
-## 6. Interface
+## 7. Interface
 
 ```python
 # vllm/config/lwd/topology.py
@@ -165,7 +231,7 @@ def diff_topology(old: LwdTopology, new: LwdTopology
 Empty `new_connections` on an accepted verdict = no-op (the file was
 touched but its semantics did not change; the digest fast path catches it).
 
-## 7. Snapshot semantics
+## 8. Snapshot semantics
 
 * The engine holds a **realized snapshot** — the topology its current
   links were built from (initial: the startup yaml).
@@ -174,7 +240,7 @@ touched but its semantics did not change; the digest fast path catches it).
 * A rejected update never advances it; the verdict is deterministic, so
   re-reading the same file yields the same result.
 
-## 8. Rejection messages
+## 9. Rejection messages
 
 Pattern `[LWD] topology update rejected: <rule>: <detail>`:
 
@@ -189,7 +255,7 @@ link removed: edge 0 - cloud 0
 new link crosses old and new instances: edge 2 - cloud 0
 ```
 
-## 9. Tests
+## 10. Tests
 
 `tests/config/lwd/test_topology_update.py` — 13 cases: no-op (digest fast
 path, deepcopy), +1 pair, +2 pairs, scene change, frozen deployment /

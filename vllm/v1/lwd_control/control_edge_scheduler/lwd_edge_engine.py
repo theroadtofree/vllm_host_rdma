@@ -58,6 +58,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdEdgeControlPlane,
     LwdPeerNotRegisteredError,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
+    notify_data_plane_added,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -132,6 +135,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # (cloud_id, dp_idx): the engine thread puts, the control-plane IO
         # thread only gets — a keyed read cannot observe a half-applied add.
         self._lwd_runtime_connections: dict[tuple[int, int], LwdDPConnection] = {}
+        # The subset of those whose data-plane links were built: service
+        # (gate + routing) opens only on arm. A refused build keeps the
+        # connection control-plane only; the next detected increment
+        # retries that half.
+        self._lwd_armed_connections: set[tuple[int, int]] = set()
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
@@ -304,17 +312,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         return verdict
 
     def _lwd_apply_increment(self, increment: LwdTopologyIncrement) -> None:
-        """Phase B: build the control-plane half of every new connection
-        (DEALER + handshake + bookkeeping). The data-plane half is a later
-        phase — the admission gate keeps rejecting these connections
-        until it exists, so a request never reaches a link that cannot
-        carry it. Idempotent per connection: a re-detected increment
-        replays the already-added ones silently."""
+        """Elastic scale-out: build both halves of every new connection —
+        the control plane (DEALER + handshake + bookkeeping), then the
+        data plane (UCX links), which on success arms the connection for
+        service. Idempotent per connection: armed connections replay
+        silently; a connection whose data-plane build was refused retries
+        only that half on the next detected increment."""
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdEdgeControlPlane)
         for connection in increment.new_connections:
             key = (connection.cloud_id, connection.dp_idx)
             if key in self._lwd_runtime_connections:
+                if key not in self._lwd_armed_connections:
+                    self._lwd_arm_runtime_connection(connection)
                 continue
             if connection.cloud.ctrl_port is None:
                 lwd_logger.error(
@@ -343,6 +353,29 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 connection.cloud.addr,
                 connection.cloud.ctrl_port,
             )
+            self._lwd_arm_runtime_connection(connection)
+
+    def _lwd_arm_runtime_connection(self, connection: LwdDPConnection) -> None:
+        """Build the connection's data-plane links; on success open it for
+        service (admission gate + routing candidates). A refusal — budget,
+        NPU assembly — keeps the connection control-plane only: the gate
+        keeps rejecting it, and the next detected increment retries this
+        half."""
+        if not notify_data_plane_added(connection):
+            lwd_logger.error(
+                "[LWD] data-plane build refused for %s; the connection "
+                "stays control-plane only (retried on the next topology "
+                "change)",
+                connection.connection_id,
+            )
+            return
+        key = (connection.cloud_id, connection.dp_idx)
+        self._lwd_armed_connections.add(key)
+        self.scheduler.lwd_arm_runtime_connection(connection.connection_id)
+        lwd_logger.info(
+            "[LWD] runtime connection %s armed (data plane up)",
+            connection.connection_id,
+        )
 
     def _lwd_configure_prefix_cache(self) -> None:
         capabilities: set[tuple[int, int, bool, bool]] = set()
@@ -831,19 +864,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"{edge_id}; the planned cloud has not started/registered "
                 f"yet)"
             )
-        # Phase B of elastic scale-out: a runtime-added connection carries
-        # no data-plane link yet — reject fast with the real reason instead
-        # of letting routing score a link that cannot carry traffic. Must
-        # sit before the silence check: the silence block returns None
-        # (admit) whenever nothing is silent, and this connection is
-        # never a routing candidate until its data plane exists.
+        # Elastic scale-out: a runtime-added connection whose data-plane
+        # build was refused (or has not run) carries no transport — reject
+        # fast with the real reason instead of letting routing score a
+        # link that cannot carry traffic. Must sit before the silence
+        # check: the silence block returns None (admit) whenever nothing
+        # is silent, and an unarmed connection is never a routing
+        # candidate. An ARMED runtime connection falls through: its
+        # data plane exists and its heartbeats flow.
         if all(
             (c.cloud_id, c.dp_idx) in self._lwd_runtime_connections
+            and (c.cloud_id, c.dp_idx) not in self._lwd_armed_connections
             for c in scoped
         ):
             return (
                 "cloud unavailable (adopted on the control plane only; the "
-                "data-plane link arrives with the next phase)"
+                "data-plane build was refused or has not run)"
             )
         with self._lwd_hello_lock:
             now = time.monotonic()

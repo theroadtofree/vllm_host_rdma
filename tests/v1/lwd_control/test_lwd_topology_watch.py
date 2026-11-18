@@ -47,13 +47,18 @@ class _RecordingPlane:
 
 
 class _RecordingScheduler:
-    """Stands in for the scheduler: records runtime-connection seeds."""
+    """Stands in for the scheduler: records runtime-connection seeds and
+    arming."""
 
     def __init__(self) -> None:
         self.connections: list[LwdConnectionId] = []
+        self.armed: list[LwdConnectionId] = []
 
     def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
         self.connections.append(connection_id)
+
+    def lwd_arm_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        self.armed.append(connection_id)
 
 
 def _payload(instances: int) -> dict[str, Any]:
@@ -108,6 +113,7 @@ def _engine(path: Path) -> LwdEdgeEngineCore:
     engine._lwd_control_plane = _RecordingPlane()
     engine.scheduler = _RecordingScheduler()
     engine._lwd_runtime_connections = {}
+    engine._lwd_armed_connections = set()
     return engine
 
 
@@ -145,6 +151,53 @@ def test_applying_the_same_increment_twice_adds_each_link_once(
     assert first is not None and not isinstance(first, LwdTopologyUpdateRejected)
     engine._lwd_apply_increment(first)
     assert len(engine._lwd_control_plane.links) == 1
+
+
+def test_a_refused_data_plane_arms_on_the_next_increment(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The phase C retry semantics: a refused data-plane build keeps the
+    connection control-plane only; the next detected increment (a replay
+    of the same one) retries ONLY the data-plane half — no duplicate
+    control-plane add — and, on success, arms the connection for
+    service."""
+    build_results: list[bool] = []
+
+    def fake_notify(connection: Any) -> bool:
+        return build_results.pop() if build_results else False
+
+    monkeypatch.setattr(lwd_edge_engine, "notify_data_plane_added", fake_notify)
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _payload(1))
+    engine = _engine(topology_file)
+    _write(topology_file, _payload(2))
+    first = engine._lwd_process_topology_reload()
+    assert first is not None and not isinstance(first, LwdTopologyUpdateRejected)
+    # The refusal kept the connection control-plane only: unarmed, never a
+    # routing candidate, and the gate rejects with the real reason.
+    assert (1, 0) in engine._lwd_runtime_connections
+    assert (1, 0) not in engine._lwd_armed_connections
+    assert engine.scheduler.armed == []
+    assert engine._lwd_gate_reason("e1-wrapped-req") is not None
+    # The next detected increment replays the same verdict: the retry
+    # touches only the data-plane half.
+    build_results.append(True)
+    engine._lwd_apply_increment(first)
+    assert engine._lwd_control_plane.links == [
+        ("tcp://16.32.2.2:5551", LwdConnectionId(1, 1, 0), 1)
+    ]  # no duplicate control-plane add
+    assert engine.scheduler.connections == [LwdConnectionId(1, 1, 0)]
+    assert (1, 0) in engine._lwd_armed_connections
+    assert engine.scheduler.armed == [LwdConnectionId(1, 1, 0)]
+    # An armed runtime connection is servable: the gate admits it.
+    engine._lwd_hello_lock = threading.Lock()
+    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
+    engine._lwd_hello_boot = {}
+    engine._lwd_silent = set()
+    engine._lwd_silent_routes = frozenset()
+    engine._lwd_hello_silent_s = 10.0
+    engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
+    assert engine._lwd_gate_reason("e1-wrapped-req") is None
 
 
 def test_an_illegal_update_is_rejected_without_repeats(tmp_path: Path) -> None:
@@ -244,3 +297,45 @@ def test_the_gate_rejects_a_control_plane_only_connection(
     # The planned connection is not runtime: a fresh heartbeat admits it.
     engine._lwd_clouds = {LwdConnectionId(0, 0, 0): None}
     assert engine._lwd_gate_reason("plain-req") is None
+
+
+def test_the_data_plane_hook_registry_reports_and_survives_raising_hooks(
+    tmp_path: Path,
+) -> None:
+    """The registry contract: an empty registry refuses (a connection
+    with no assembler stays control-plane only), a raising hook is
+    logged and never breaks the caller, and a working hook reports the
+    build."""
+    from vllm.v1.lwd_control.lwd_comm import (
+        lwd_data_plane_hooks as hooks,
+    )
+
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _payload(1))
+    engine = _engine(topology_file)
+    _write(topology_file, _payload(2))
+    verdict = engine._lwd_process_topology_reload()
+    assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
+    # The test process registered no assembler: the notify refuses and the
+    # connection stays control-plane only (the engine logs the refusal).
+    assert (1, 0) not in engine._lwd_armed_connections
+
+    saved = list(hooks._hooks)
+    try:
+
+        def boom(connection: Any) -> bool:
+            raise RuntimeError("assembler boom")
+
+        built: list = []
+
+        def works(connection: Any) -> bool:
+            built.append(connection.connection_id)
+            return True
+
+        hooks.register_data_plane_add_hook(boom)
+        hooks.register_data_plane_add_hook(works)
+        (connection,) = verdict.new_connections
+        assert hooks.notify_data_plane_added(connection) is True
+        assert built == [LwdConnectionId(1, 1, 0)]
+    finally:
+        hooks._hooks[:] = saved

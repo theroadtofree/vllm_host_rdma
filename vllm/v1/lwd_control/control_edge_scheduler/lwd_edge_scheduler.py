@@ -191,6 +191,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_accounts[connection_id] = LwdCloudDpAccount(connection_id)
         self._lwd_aborted_req_ids.setdefault(connection_id, [])
 
+    def lwd_arm_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        """Open a runtime connection for service: it joins the routing
+        candidates (sorted, so the round-robin order stays stable).
+        Idempotent. Legacy int-indexed send watermarks
+        (`_lwd_connections[dp_idx]`) predate runtime additions and keep
+        meaning link indices of the startup plan."""
+        if connection_id in self._lwd_connections:
+            return
+        self._lwd_connections = tuple(
+            sorted((*self._lwd_connections, connection_id))
+        )
+
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed dp_idx of an active request; unrouted ids are a bug."""
         return self._lwd_route[request_id]
