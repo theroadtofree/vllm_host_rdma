@@ -25,6 +25,7 @@ import pytest
 import yaml
 
 import vllm.entrypoints.openai.lwd.frontend_attach as frontend_attach
+from vllm.config.lwd.topology import LWD_API_MAX_FRONTENDS
 from vllm.entrypoints.openai.lwd.frontend_attach import (
     FrontendAttachServer,
     lwd_dispatch_attach_frontend,
@@ -35,6 +36,7 @@ from vllm.entrypoints.openai.lwd.frontend_attach import (
 def _server() -> FrontendAttachServer:
     server = object.__new__(FrontendAttachServer)
     server.client_count = 2
+    server.expected_attaches = 1
     server.config_payload = {"k": "v"}
     server.frontend_args_payload = {}
     server.stats_update_address = None
@@ -347,12 +349,13 @@ def _one_pair_edge_share_yaml(path: Any, *, host_comm: bool) -> None:
 def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
     tmp_path: Any, host_comm: bool, expected: bool
 ) -> None:
-    """A count==1 attach primary must still set lwd_attach_primary on
-    host comm so the serve dispatch routes it through
-    run_multi_api_server -- the single in-process path never builds the
-    registration server, and --api-server-rpc-port stays silently
-    unbound (attach frontends then hang on it until their reply
-    timeout). Device comm keeps the native single-server path."""
+    """A single-pair attach primary provisions the full reserved frontend
+    capacity on host comm -- api_server_count carries the band capacity,
+    so frontends beyond the yaml plan attach without a primary restart
+    and the serve dispatch reaches run_multi_api_server (whose
+    registration server is the only thing that ever binds
+    --api-server-rpc-port). Device comm keeps the plan count and the
+    native single-server path."""
     yaml_path = tmp_path / "edge_share.yaml"
     _one_pair_edge_share_yaml(yaml_path, host_comm=host_comm)
     args = argparse.Namespace(
@@ -368,5 +371,21 @@ def test_one_frontend_primary_flags_the_multi_server_path_by_comm(
         api_server_count=None,
     )
     assert lwd_dispatch_attach_frontend(args) is False
-    assert args.api_server_count == 1
+    assert args.api_server_count == (LWD_API_MAX_FRONTENDS if host_comm else 1)
     assert args.lwd_attach_primary is expected
+
+
+def test_authority_accepts_attach_beyond_the_plan_within_capacity() -> None:
+    """Capacity, not the plan, bounds attach indices: a primary whose yaml
+    plans one frontend still accepts client_index 1 (the previous
+    rejection 'client_index must be in [1, 1)'); the band capacity is the
+    bound, and index 0 or >= capacity stays rejected."""
+    server = _server()
+    server.client_count = LWD_API_MAX_FRONTENDS
+    server.expected_attaches = 0
+    assert _handle(server, _attach_message(pid=111))["type"] == "LWD_FRONTEND_ACCEPT"
+    beyond = _attach_message(pid=112)
+    beyond["client_index"] = LWD_API_MAX_FRONTENDS
+    response = _handle(server, beyond)
+    assert response["type"] == "LWD_FRONTEND_ERROR"
+    assert f"client_index must be in [1, {LWD_API_MAX_FRONTENDS})" in response["reason"]

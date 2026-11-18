@@ -378,6 +378,7 @@ class FrontendAttachServer:
         main_listen: tuple[str, int],
         frontend_args: dict[str, Any] | None = None,
         api_bind_base_port: int = LWD_API_BIND_BASE_PORT_DEFAULT,
+        expected_attaches: int | None = None,
     ):
         host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
         self.endpoint = get_tcp_uri(host, port)
@@ -388,7 +389,14 @@ class FrontendAttachServer:
         # pre-seed and the bidirectional registration-side conflict check
         # derive from the same value the attach frontends bind.
         self.api_bind_base_port = api_bind_base_port
+        # Capacity, not the yaml plan: the number of frontend slots the
+        # primary provisions (registration index bounds, pre-seeded engine
+        # IO addresses). The yaml plan governs which instances the engine
+        # routes; the barrier waits only for the planned remote frontends.
         self.client_count = client_count
+        self.expected_attaches = (
+            client_count - 1 if expected_attaches is None else expected_attaches
+        )
         self.config_payload = config_payload
         self.frontend_args_payload = frontend_args or {}
         self.stats_update_address: str | None = None
@@ -404,10 +412,6 @@ class FrontendAttachServer:
             self._ctx, self.endpoint, zmq.ROUTER, bind=True, linger=0
         )
         self._closed = False
-
-    @property
-    def expected_attaches(self) -> int:
-        return self.client_count - 1
 
     def wait_for_registrations(
         self, engine_manager: Any = None, timeout: float | None = None
@@ -748,8 +752,16 @@ def create_frontend_registration_server(
 ) -> FrontendAttachServer:
     plan = resolve_attach_plan(args)
     assert plan is not None and plan.mode == "primary"
-    if client_count != plan.client_count:
-        raise ValueError("[LWD] API server count does not match edge_share topology")
+    # client_count is the reserved frontend capacity: it must cover the
+    # yaml plan and stay within the engine IO band. Frontends beyond the
+    # plan attach into the spare capacity; only the planned remote
+    # frontends gate the startup barrier.
+    if not plan.client_count <= client_count <= LWD_API_MAX_FRONTENDS:
+        raise ValueError(
+            f"[LWD] API server count ({client_count}) must cover the "
+            f"edge_share frontend plan ({plan.client_count}) and stay "
+            f"within the reserved engine IO band ({LWD_API_MAX_FRONTENDS})"
+        )
     # Bidirectional conflict check, authority side: the primary's own
     # configured ports must stay out of the band its frontends bind into.
     ports = {
@@ -767,6 +779,7 @@ def create_frontend_registration_server(
         main_listen=_resolve_listen(args),
         frontend_args=compute_frontend_args_payload(args),
         api_bind_base_port=plan.api_bind_base_port,
+        expected_attaches=plan.client_count - 1,
     )
 
 
@@ -910,13 +923,18 @@ def lwd_dispatch_attach_frontend(args: Any) -> bool:
     if plan.mode == "attach":
         run_attach_api_server(args)
         return True
-    args.api_server_count = plan.client_count
-    # Route this primary through run_multi_api_server even at
-    # client_count == 1: the single in-process path never builds the
-    # registration server, so --api-server-rpc-port stays silently
-    # unbound and every attach frontend hangs on it until its reply
-    # timeout. Host comm only — device-comm primaries keep the native
-    # single-server path.
+    # Frontend capacity is the reserved engine IO band, not the yaml
+    # plan: a host-comm primary provisions all frontend slots up front,
+    # so a frontend beyond the current yaml plan can attach without a
+    # primary restart (its requests stay gate-rejected until the plan
+    # that launched the engine includes its instance). The capacity
+    # count also routes the primary through run_multi_api_server, home
+    # of the registration server the single in-process path never
+    # builds; device-comm primaries keep the plan count and may take
+    # the native single-server path.
+    args.api_server_count = (
+        LWD_API_MAX_FRONTENDS if plan.host_comm else plan.client_count
+    )
     args.lwd_attach_primary = plan.host_comm
     return False
 
@@ -951,12 +969,12 @@ def wait_for_attach_registrations(
     addresses: Any,
     engine_manager: Any,
 ) -> None:
-    """Elastic partial start: seed every planned attach slot with its
-    deterministic engine IO address, then let the grace-window barrier
-    upgrade the slots that actually registered to their reported
-    endpoints.
+    """Elastic partial start: seed every capacity slot of the reserved
+    engine IO band with its deterministic address, then let the
+    grace-window barrier upgrade the planned slots that actually
+    registered to their reported endpoints.
 
-    The engine therefore starts with the FULL planned frontend list and
+    The engine therefore starts with the FULL capacity frontend list and
     serves with whichever frontends exist; a frontend that starts later
     binds the same deterministic address and the engine's DEALER/PUSH
     reconnect transparently (the READY re-send completes its client
