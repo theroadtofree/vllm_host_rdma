@@ -365,6 +365,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         if self.scheduler.lwd_edge_request_active(request.request_id):
             raise AssertionError(f"duplicate active request id: {request.request_id}")
+        # Availability gate, at the ADMISSION ENTRY (old-branch invariant):
+        # the gate is the first thing a request meets, before the
+        # probe/prefix machinery — a probe sent to a dead cloud would hang
+        # for its full timeout instead of rejecting. The
+        # shutdown-rejection paradigm finishes the request DIRECTLY:
+        # nothing enqueues after this returns, so the abort-channel path
+        # used post-probe would never find it.
+        gate_reason = self._lwd_gate_reason(request.request_id)
+        if gate_reason is not None:
+            lwd_logger.error(
+                "[edge] request rejected req=%s: %s",
+                request.request_id,
+                gate_reason,
+            )
+            self._send_abort_outputs_to_client(
+                [request.request_id], request.client_index
+            )
+            return
         if request.abort_immediately:
             self._lwd_add_request_after_probe(request)
             return
@@ -383,7 +401,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> None:
         gate_reason = self._lwd_gate_reason(request.request_id)
         if gate_reason is not None:
-            # Availability gate (peer-restart line): reject through the abort
+            # Availability gate, defense in depth (the primary check is the
+            # add_request ENTRY): this one covers the probe race — the
+            # probe went out while the cloud was alive, and it completed
+            # after the cloud went silent. Reject through the abort
             # channel — aborts_queue is drained at the NEXT step head, after
             # the caller's single native enqueue has entered the scheduler,
             # so the abort finds the request exactly once and the client

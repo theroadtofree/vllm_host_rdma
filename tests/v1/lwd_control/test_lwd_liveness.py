@@ -224,6 +224,39 @@ def test_gate_rejection_uses_the_abort_channel_only(
     assert engine.input_queue.items == []  # the caller owns the single enqueue
 
 
+def test_entry_gate_rejects_before_the_probe_machinery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate is the FIRST thing a request meets (old-branch invariant):
+    with the route silent, add_request finishes the request directly
+    (client-visible abort output, nothing enqueues afterwards) and never
+    touches the probe machinery — a probe sent to the dead cloud would
+    hang for its full timeout instead of rejecting."""
+    from types import SimpleNamespace
+
+    notified: list = []
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified)
+    engine._lwd_silent_routes = frozenset({CONNECTION})
+    aborted: list = []
+    monkeypatch.setattr(
+        engine,
+        "_send_abort_outputs_to_client",
+        lambda ids, client_index: aborted.append((ids, client_index)),
+    )
+    engine.scheduler = SimpleNamespace(lwd_edge_request_active=lambda request_id: False)
+    engine._lwd_probe_manager = SimpleNamespace(
+        submit=lambda request: pytest.fail("probe machinery must not be touched")
+    )
+    request = SimpleNamespace(
+        request_id="plain-req",
+        client_index=0,
+        num_prompt_tokens=4,
+        abort_immediately=False,
+    )
+    engine.add_request(request)
+    assert aborted == [(["plain-req"], 0)]
+
+
 def test_abort_skips_the_cloud_notify_for_silent_connections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
