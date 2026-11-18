@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from types import MethodType, SimpleNamespace
 
 import pytest
 
@@ -22,6 +23,9 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
 from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
+)
+from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
+    LwdEdgeScheduler,
 )
 from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks as hooks_module
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -53,8 +57,27 @@ class _RecordingQueue:
         self.items.append(item)
 
 
+def _scheduler_stub(
+    *, edge_share: bool = False, instance_id: int = 0
+) -> SimpleNamespace:
+    """Scheduler carrying the routing edge-identity fields the gate reads;
+    ``_lwd_edge_id_of`` is the REAL scheduler method bound to the stub, so
+    the gate and its tests judge edge identity exactly like routing does."""
+    stub = SimpleNamespace(
+        _lwd_edge_share=edge_share,
+        _lwd_instance_id=instance_id,
+    )
+    stub._lwd_edge_id_of = MethodType(LwdEdgeScheduler._lwd_edge_id_of, stub)
+    return stub
+
+
 def _edge_engine(
-    monkeypatch: pytest.MonkeyPatch, connections, notified: list
+    monkeypatch: pytest.MonkeyPatch,
+    connections,
+    notified: list,
+    *,
+    edge_share: bool = False,
+    instance_id: int = 0,
 ) -> LwdEdgeEngineCore:
     engine = object.__new__(LwdEdgeEngineCore)
     engine._lwd_hello_lock = threading.Lock()
@@ -67,6 +90,9 @@ def _edge_engine(
     engine._lwd_hello_silent_s = 10.0
     engine._lwd_last_sweep = 0.0
     engine._lwd_clouds = {connection: None for connection in connections}
+    engine.scheduler = _scheduler_stub(
+        edge_share=edge_share, instance_id=instance_id
+    )
     monkeypatch.setattr(
         lwd_edge_engine,
         "notify_cloud_restarted",
@@ -130,17 +156,23 @@ def test_gate_rejects_only_when_the_routes_are_silent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     notified: list = []
-    engine = _edge_engine(monkeypatch, [CONNECTION, CONNECTION_E1], notified)
-    assert engine._lwd_gate_reason("plain-req") is None
+    engine = _edge_engine(
+        monkeypatch, [CONNECTION, CONNECTION_E1], notified, edge_share=True
+    )
+    # Edge-side ids are BARE: identity comes from client_index (routing's
+    # source), never the id string.
+    edge0_req = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
+    edge1_req = SimpleNamespace(request_id="chatcmpl-y", client_index=1)
+    assert engine._lwd_gate_reason(edge0_req) is None
     engine._lwd_silent_routes = frozenset({CONNECTION_E1})
     # Whole-route silence rejects everything.
     engine._lwd_silent_routes = frozenset({CONNECTION, CONNECTION_E1})
-    assert engine._lwd_gate_reason("plain-req") is not None
-    # Partial silence: an unwrapped id (edge 0) still has a live route.
+    assert engine._lwd_gate_reason(edge0_req) is not None
+    # Partial silence: edge 0 still has a live route.
     engine._lwd_silent_routes = frozenset({CONNECTION_E1})
-    assert engine._lwd_gate_reason("plain-req") is None
-    # A wrapped id whose source edge is fully silent is rejected.
-    assert engine._lwd_gate_reason("e1-wrapped-req") is not None
+    assert engine._lwd_gate_reason(edge0_req) is None
+    # A request whose source edge is fully silent is rejected.
+    assert engine._lwd_gate_reason(edge1_req) is not None
 
 
 def test_gate_uses_live_staleness_before_the_first_sweep(
@@ -152,7 +184,8 @@ def test_gate_uses_live_staleness_before_the_first_sweep(
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
     engine._lwd_hello_last[CONNECTION] = time.monotonic() - 30.0
     assert engine._lwd_silent_routes == frozenset()  # no sweep has run
-    assert engine._lwd_gate_reason("plain-req") is not None
+    request = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
+    assert engine._lwd_gate_reason(request) is not None
 
 
 def test_gate_rejects_when_the_requests_edge_has_no_adopted_cloud(
@@ -163,12 +196,37 @@ def test_gate_rejects_when_the_requests_edge_has_no_adopted_cloud(
     layer that would address the un-adopted connection (the KeyError on
     the shared engine's first drill)."""
     notified: list = []
-    engine = _edge_engine(monkeypatch, [CONNECTION], notified)  # edge 0 adopted
-    reason = engine._lwd_gate_reason("e1-wrapped-req")
+    # edge_share: edge 0 adopted, edge 1's cloud still loading.
+    engine = _edge_engine(monkeypatch, [CONNECTION], notified, edge_share=True)
+    reason = engine._lwd_gate_reason(
+        SimpleNamespace(request_id="chatcmpl-x", client_index=1)
+    )
     assert reason is not None
     assert "not started" in reason
     # The adopted edge still admits.
-    assert engine._lwd_gate_reason("plain-req") is None
+    assert (
+        engine._lwd_gate_reason(
+            SimpleNamespace(request_id="chatcmpl-y", client_index=0)
+        )
+        is None
+    )
+
+
+def test_gate_admits_a_bare_id_on_a_standalone_nonzero_edge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (cloud_share drill): a standalone edge engine whose
+    instance id is NOT 0 serves bare request ids. The gate used to derive
+    the edge from the id string, and ``parse_edge_id`` defaults an
+    unparsable id to edge 0 — on edge 1 no connection matched and every
+    request 500'd with "the planned cloud has not started/registered
+    yet" although the cloud was fully adopted."""
+    notified: list = []
+    engine = _edge_engine(
+        monkeypatch, [LwdConnectionId(1, 0, 0)], notified, instance_id=1
+    )
+    request = SimpleNamespace(request_id="chatcmpl-814f54ce", client_index=0)
+    assert engine._lwd_gate_reason(request) is None
 
 
 def test_routing_to_an_unadopted_cloud_fails_the_request_not_the_engine(
@@ -178,28 +236,27 @@ def test_routing_to_an_unadopted_cloud_fails_the_request_not_the_engine(
     sibling, the admission is cancelled and the request aborted (fast,
     retryable) — the notify must never address a cloud the engine cannot
     send to."""
-    from types import SimpleNamespace
-
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION_E1], notified)
     engine.aborts_queue = _RecordingQueue()
     cancelled: list = []
     unadopted = LwdConnectionId(1, 2, 0)
     engine.scheduler = SimpleNamespace(
+        _lwd_edge_id_of=lambda request: 1,
         lwd_admit_request=lambda request, preferred: unadopted,
         lwd_edge_cancel_admission=cancelled.append,
     )
-    engine._lwd_admit_and_notify(SimpleNamespace(request_id="e1-wrapped-req"))
-    assert cancelled == ["e1-wrapped-req"]
-    assert engine.aborts_queue.items == [["e1-wrapped-req"]]
+    engine._lwd_admit_and_notify(
+        SimpleNamespace(request_id="chatcmpl-x", client_index=0)
+    )
+    assert cancelled == ["chatcmpl-x"]
+    assert engine.aborts_queue.items == [["chatcmpl-x"]]
 
 
 def test_send_to_an_unadopted_cloud_drops_instead_of_raising() -> None:
     """Last line of defense: a message still landing on an un-adopted
     connection drops with a log — the KeyError killed the shared engine
     (instance 0's requests went down with it)."""
-    from types import SimpleNamespace
-
     engine = object.__new__(LwdEdgeEngineCore)
     engine._lwd_clouds = {}
     engine._lwd_send_to_cloud(CONNECTION_E1, SimpleNamespace())
@@ -212,15 +269,13 @@ def test_gate_rejection_uses_the_abort_channel_only(
     request itself — the caller enqueues unconditionally after admission,
     so the rejection goes through aborts_queue alone (drained at the next
     step head, after the single enqueue entered the scheduler)."""
-    from types import SimpleNamespace
-
     engine = _edge_engine(monkeypatch, [CONNECTION], [])
     engine._lwd_silent_routes = frozenset({CONNECTION})
     engine.aborts_queue = _RecordingQueue()
     engine.input_queue = _RecordingQueue()
-    request = SimpleNamespace(request_id="plain-req", client_index=0)
+    request = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
     engine._lwd_admit_and_notify(request, None)
-    assert engine.aborts_queue.items == [["plain-req"]]
+    assert engine.aborts_queue.items == [["chatcmpl-x"]]
     assert engine.input_queue.items == []  # the caller owns the single enqueue
 
 
@@ -233,8 +288,6 @@ def test_entry_gate_rejects_before_the_probe_machinery(
     — nothing enqueues afterwards) and never touches the probe machinery
     — a probe sent to the dead cloud would hang for its full timeout
     instead of rejecting."""
-    from types import SimpleNamespace
-
     notified: list = []
     engine = _edge_engine(monkeypatch, [CONNECTION], notified)
     engine._lwd_silent_routes = frozenset({CONNECTION})
@@ -244,18 +297,21 @@ def test_entry_gate_rejects_before_the_probe_machinery(
         "_send_error_outputs_to_client",
         lambda ids, client_index: errored.append((ids, client_index)),
     )
-    engine.scheduler = SimpleNamespace(lwd_edge_request_active=lambda request_id: False)
+    engine.scheduler = SimpleNamespace(
+        _lwd_edge_id_of=lambda request: 0,
+        lwd_edge_request_active=lambda request_id: False,
+    )
     engine._lwd_probe_manager = SimpleNamespace(
         submit=lambda request: pytest.fail("probe machinery must not be touched")
     )
     request = SimpleNamespace(
-        request_id="plain-req",
+        request_id="chatcmpl-x",
         client_index=0,
         num_prompt_tokens=4,
         abort_immediately=False,
     )
     engine.add_request(request)
-    assert errored == [(["plain-req"], 0)]
+    assert errored == [(["chatcmpl-x"], 0)]
 
 
 def test_abort_skips_the_cloud_notify_for_silent_connections(
@@ -264,8 +320,6 @@ def test_abort_skips_the_cloud_notify_for_silent_connections(
     """An abort notify to a silent cloud cannot arrive and would stall the
     abort behind send retries: it is skipped, the live cloud still gets
     its notify."""
-    from types import SimpleNamespace
-
     from vllm.v1.engine.core import EngineCoreProc
 
     monkeypatch.setattr(EngineCoreProc, "abort_requests", lambda self, ids: None)
@@ -419,8 +473,6 @@ def test_edge_reregistration_resets_the_connection_seqno_books(
     at 0 while _lwd_latest_seqnos kept the old incarnation's high-water
     mark — the new stream's first RangeNotify was dropped as a duplicate
     and the request hung with its UP frame already sent."""
-    from types import SimpleNamespace
-
     from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 
     engine = object.__new__(LwdCloudEngineCore)
@@ -454,5 +506,6 @@ def test_beat_survives_the_mid_assembly_window(monkeypatch: pytest.MonkeyPatch) 
     engine._lwd_beat(CONNECTION, "boot-a")
     assert engine._lwd_hello_last[CONNECTION] > 0
     assert engine._lwd_hello_boot[CONNECTION] == "boot-a"
-    # The gate admits nothing-relevant with the still-empty view elsewhere.
-    assert engine._lwd_gate_reason("plain-req") is None
+    # The gate admits when no connection is stale enough to gate on.
+    request = SimpleNamespace(request_id="chatcmpl-x", client_index=0)
+    assert engine._lwd_gate_reason(request) is None
