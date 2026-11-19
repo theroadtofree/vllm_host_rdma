@@ -191,7 +191,7 @@ class LwdBaseEngineCore(EngineCoreProc):
             name="lwd-topology-watch",
             daemon=True,
         ).start()
-        lwd_logger.info(
+        lwd_logger.error(
             "[LWD] topology file watch up: %s (every %.1fs)",
             self.lwd_config.path,
             _LWD_TOPOLOGY_POLL_INTERVAL_S,
@@ -238,7 +238,7 @@ class LwdBaseEngineCore(EngineCoreProc):
             # The file moved (mtime ticked) but its canonical content is
             # identical — comments/formatting only. The watcher IS alive;
             # there is simply nothing to apply.
-            lwd_logger.info(
+            lwd_logger.error(
                 "[LWD] topology file changed but the canonical digest is "
                 "identical; nothing to apply"
             )
@@ -251,14 +251,14 @@ class LwdBaseEngineCore(EngineCoreProc):
         if not verdict.new_connections:
             # The file's semantics moved (e.g. a tunable-only change) but
             # nothing this engine can apply arrived.
-            lwd_logger.info(
+            lwd_logger.error(
                 "[LWD] topology update accepted with no new connections: "
                 "new_edge_ids=%s new_cloud_ids=%s",
                 list(verdict.new_edge_ids),
                 list(verdict.new_cloud_ids),
             )
             return None
-        lwd_logger.info(
+        lwd_logger.error(
             "[LWD] topology increment detected: +%d edge(s) %s, +%d cloud(s) "
             "%s, %d connection(s)",
             len(verdict.new_edge_ids),

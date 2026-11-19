@@ -160,6 +160,16 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         plane = self._lwd_start_control_plane()
         assert isinstance(plane, LwdEdgeControlPlane)
         handshake_timeout_s = plane.spec.config.handshake_timeout_s
+        # Assembly-time anchor: while this wait runs the engine serves
+        # NOTHING (no io loop yet), so a request sent during it produces
+        # zero engine logs by design — this line is how you tell that
+        # state apart from a stuck engine thread.
+        lwd_logger.error(
+            "[edge] waiting for cloud handshakes: %d planned connections "
+            "(timeout %.0fs)",
+            len(self.lwd_config.connections),
+            handshake_timeout_s,
+        )
         deadline = time.monotonic() + handshake_timeout_s
         self._lwd_clouds.update(plane.wait_until_ready(handshake_timeout_s))
         # Seed the accounts for the discovered connections (a beat that
@@ -195,7 +205,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
-        lwd_logger.info(
+        lwd_logger.error(
             "[edge] engine assembled: %d cloud DP ranks, native batch-queue "
             "stepping depth=%d",
             len(self._lwd_clouds),
@@ -224,7 +234,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 scene == "lwd_cluster"
                 and connection.edge_id != self.lwd_config.instance_id
             ):
-                lwd_logger.info(
+                lwd_logger.error(
                     "[LWD] topology increment %s skipped: owned by edge %d "
                     "(this engine serves edge %d)",
                     connection.connection_id,
@@ -260,7 +270,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     ).dp
                 ),
             )
-            lwd_logger.info(
+            lwd_logger.error(
                 "[LWD] topology increment applied (control plane): "
                 "connection %s -> %s:%s",
                 connection.connection_id,
@@ -286,7 +296,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             # coordination block (scene validation), so this branch means
             # an edge_share-scale cloud without one: no probe targeting
             # for it, by design.
-            lwd_logger.info(
+            lwd_logger.error(
                 "[LWD] probe cloud %d not registered: no enabled "
                 "coordination block",
                 cloud_id,
@@ -294,7 +304,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             return
         url = f"http://{cloud_dp.addr}:{coordination.listen_port}"
         self._lwd_probe_manager.register_cloud(cloud_id, url)
-        lwd_logger.info(
+        lwd_logger.error(
             "[LWD] probe cloud registered: cloud=%d url=%s rotation=%s "
             "(probes — and the routing preference they produce — now "
             "spread over every adopted cloud)",
@@ -309,20 +319,29 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         NPU assembly — keeps the connection control-plane only: the gate
         keeps rejecting it, and the next detected increment retries this
         half."""
+        started = time.monotonic()
+        lwd_logger.error(
+            "[LWD] data-plane build start for %s (the engine thread waits "
+            "for the build to return; requests are not served until it "
+            "does)",
+            connection.connection_id,
+        )
         if not notify_data_plane_added(connection):
             lwd_logger.error(
-                "[LWD] data-plane build refused for %s; the connection "
+                "[LWD] data-plane build refused for %s (%.1fs); the connection "
                 "stays control-plane only (retried on the next topology "
                 "change)",
                 connection.connection_id,
+                time.monotonic() - started,
             )
             return
         key = (connection.cloud_id, connection.dp_idx)
         self._lwd_armed_connections.add(key)
         self.scheduler.lwd_arm_runtime_connection(connection.connection_id)
-        lwd_logger.info(
-            "[LWD] runtime connection %s armed (data plane up)",
+        lwd_logger.error(
+            "[LWD] runtime connection %s armed (data plane up, %.1fs)",
             connection.connection_id,
+            time.monotonic() - started,
         )
 
     def _lwd_configure_prefix_cache(self) -> None:
@@ -461,7 +480,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
-        lwd_logger.info("[cloud-params] %s limits verified: %s", dp_idx, local)
+        lwd_logger.error("[cloud-params] %s limits verified: %s", dp_idx, local)
 
     def _lwd_send_to_cloud(
         self, dp_idx: LwdConnectionId, message: LwdEdgeToCloudMessage
@@ -579,7 +598,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # The one line that answers "which cloud did this request go to":
         # routed-connection vs preferred-connection contrast exposes a
         # dropped probe preference (None = round-robin/scoring decided).
-        lwd_logger.info(
+        # ERROR for now — the deployment reads error level only; demote
+        # once the scale-out diagnosis closes.
+        lwd_logger.error(
             "[edge] request routed req=%s -> %s (probe preferred=%s)",
             request.request_id,
             dp_idx,

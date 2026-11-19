@@ -306,7 +306,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # reservation, routing and coordinator state therefore have one owner:
         # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
-        lwd_logger.info("[cloud] engine assembled: control plane on %s", plane.endpoint)
+        lwd_logger.error(
+            "[cloud] engine assembled: control plane on %s", plane.endpoint
+        )
         # Liveness epoch (peer-restart line): random per process launch; the
         # edge treats a change of it as "this cloud DP restarted".
         self._lwd_boot_id = uuid.uuid4().hex[:16]
@@ -629,7 +631,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             ):
                 continue
             plane.allow_edge(edge_id)
-            lwd_logger.info(
+            lwd_logger.error(
                 "[cloud] edge %d admitted to the handshake allowlist "
                 "(topology increment)",
                 edge_id,
@@ -653,7 +655,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     connection.connection_id,
                 )
                 continue
-            lwd_logger.info(
+            lwd_logger.error(
                 "[LWD] runtime connection %s built (serve pair on the shared listener)",
                 connection.connection_id,
             )
@@ -701,7 +703,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
         self._lwd_done_mqs[connection] = MessageQueue.create_from_handle(handles[0], 0)
-        lwd_logger.info("[LWD] runtime hint/done MQs wired for %s", connection)
+        lwd_logger.error("[LWD] runtime hint/done MQs wired for %s", connection)
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
@@ -742,6 +744,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "RequestNotify prompt lengths were recorded"
             )
         self._lwd_track_range(connection_id, notify.seqno, request_ids)
+        # First-arrival marker per batch (dup/stale filtered above): the
+        # cloud-side proof that requests from this edge actually landed.
+        # ERROR for now — the deployment reads error level only; demote
+        # once the scale-out diagnosis closes.
+        lwd_logger.error(
+            "[cloud] range notify received on %s seqno=%d reqs=%s",
+            connection_id,
+            notify.seqno,
+            request_ids,
+        )
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             make_recv_hint,
             post_irecv_hint,

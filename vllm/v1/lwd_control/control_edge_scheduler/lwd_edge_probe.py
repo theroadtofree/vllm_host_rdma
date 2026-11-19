@@ -282,7 +282,7 @@ class LwdEdgeProbeManager:
             try:
                 outcome = future.result()
             except Exception:
-                logger.warning(
+                logger.error(
                     "[LWD] probe to cloud=%d failed (url=%s); using full "
                     "prefill",
                     target_cloud,
@@ -319,7 +319,7 @@ class LwdEdgeProbeManager:
                         # "all requests stayed on the other cloud"
                         # signature when the target is a runtime-adopted
                         # cloud whose HTTP endpoint is not answering.
-                        logger.warning(
+                        logger.error(
                             "[LWD] probe target cloud=%d entered cooldown "
                             "after repeated failures (url=%s); it re-enters "
                             "the rotation once a probe succeeds",
