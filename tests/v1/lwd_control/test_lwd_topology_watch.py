@@ -23,6 +23,9 @@ import yaml
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
 from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
+    LwdCloudEngineCore,
+)
 from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
@@ -390,3 +393,74 @@ def test_the_watch_gate_watches_only_the_shared_side_of_the_scene(
     assert not gated("edge", "single_instance", host_comm=True)
     assert not gated("edge", "edge_share", host_comm=False)
     assert not gated("cloud", "cloud_share", host_comm=False)
+
+
+def test_the_cloud_engine_admits_increment_edges_to_the_allowlist(
+    tmp_path: Path,
+) -> None:
+    """C-2: the cloud's apply hook grows the handshake allowlist per new
+    edge. A recording plane stands in — the real handshake accept/replay
+    semantics live in test_lwd_handshake_allow_edge."""
+
+    class _RecordingCloudPlane:
+        def __init__(self) -> None:
+            self.allowed: list[int] = []
+
+        def allow_edge(self, edge_id: int) -> None:
+            self.allowed.append(edge_id)
+
+    topology_file = tmp_path / "cloud_topology.yaml"
+    _cloud_share_write(topology_file, 1)
+    engine = object.__new__(LwdCloudEngineCore)
+    engine._lwd_control_plane = _RecordingCloudPlane()
+    _cloud_share_write(topology_file, 2)
+    verdict = engine._lwd_process_topology_reload()
+    assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
+    assert verdict.new_edge_ids == (1,)
+    assert engine._lwd_control_plane.allowed == [1]
+    # A replay of the same increment: allow_edge fires again (the plane
+    # and the handshake are both idempotent; the log stays clean).
+    engine._lwd_apply_topology_increment(verdict)
+    assert engine._lwd_control_plane.allowed == [1, 1]
+
+
+def _cloud_share_write(path: Path, edges: int) -> None:
+    """A cloud_share topology on the cloud host's copy of the file: N
+    edges, one cloud, full mesh."""
+    payload = {
+        "deployment": {
+            "mode": 0,
+            "scene": "cloud_share",
+            "edges_num": edges,
+            "clouds_num": 1,
+            "data_plane_comm": "host",
+        },
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
+        "edges": [
+            {
+                "id": i,
+                "coordination": {"enabled": True},
+                "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}],
+            }
+            for i in range(edges)
+        ],
+        "clouds": [
+            {
+                "id": 0,
+                "coordination": {"enabled": True},
+                "dp": [
+                    {
+                        "dp_idx": 0,
+                        "addr": "16.32.2.2",
+                        "ctrl_port": 5550,
+                        "data_port": 5560,
+                    }
+                ],
+            }
+        ],
+        "instance_links": [{"edge": i, "cloud": 0} for i in range(edges)],
+    }
+    path.write_text(yaml.safe_dump(payload, sort_keys=False))

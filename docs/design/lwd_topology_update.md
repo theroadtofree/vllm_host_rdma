@@ -249,6 +249,21 @@ cloud_share edges do not attach):
   one-time snapshot (`hint_mqs = self._irecv_hint_mqs`) becomes a
   per-iteration `tuple()` snapshot.
 
+**C-2 detail (2026-11-19)**: `LwdCloudHandshake.allow_edge(edge_id)` —
+an atomic frozenset superset swap (copy-on-write; the IO thread's
+`_mismatch_reason` sees either the old or the new set, never a
+half-built one). `LwdCloudControlPlane.allow_edge` forwards; the cloud
+engine's `_lwd_apply_topology_increment` calls it per new edge and logs
+the admission. Idempotent: a replayed increment re-places the same
+element harmlessly. The rest of the join chain — registration seqno
+reset, scheduling-limits resend, heartbeat fan-out from `_lwd_edges`,
+unreachable-peer pruning — is the existing runtime machinery; the
+cloud's `_lwd_connection_of` is a pure constructor (no registry
+needed). Tests: `test_lwd_handshake_allow_edge.py` (5: reject before /
+accept after / idempotent + live sessions / empty allowlist stays
+open / same-session retry is a refresh) and `test_lwd_topology_watch.py`
+(+1: the cloud's apply hook fires allow_edge per detected edge).
+
 Acceptance: 1-edge cloud_share running → grow the cloud host's yaml to
 2 edges → launch edge 1 → the cloud's watch fires, the edge registers,
 its UCX pair builds on the shared listener → requests through edge 1

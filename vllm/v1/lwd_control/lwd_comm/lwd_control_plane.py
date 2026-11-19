@@ -978,6 +978,13 @@ class LwdCloudControlPlane(LwdControlPlane):
             spec.instance_id, spec.dp_rank, spec.dp_size, spec.expected_edge_ids
         )
 
+    def allow_edge(self, edge_id: int) -> None:
+        """Admit one more edge id to the handshake allowlist (elastic
+        scale-out: a late edge's HELLO must not bounce off the startup
+        plan). The swap is atomic; the IO thread's check sees either the
+        old or the new set."""
+        self._handshake.allow_edge(edge_id)
+
     def _create_transport(self) -> LwdControlTransport:
         return LwdCloudTransport(self.endpoint)
 

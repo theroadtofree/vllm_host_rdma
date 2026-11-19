@@ -28,7 +28,7 @@ from typing import Any
 import msgspec
 import torch
 
-from vllm.config.lwd import LwdConnectionId
+from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.lwd_logger import lwd_logger
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequestType
@@ -47,6 +47,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     lwd_spec_factor,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdCloudControlPlane,
     LwdPeerNotRegisteredError,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
@@ -603,6 +604,24 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         return LwdConnectionId(
             peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
         )
+
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
+        """C-2: admit each new edge to the handshake allowlist. The rest
+        of the join is the existing runtime machinery — registration
+        resets the seqno ledgers and resends the scheduling limits, the
+        heartbeat fan-out picks the peer up from `_lwd_edges` — and the
+        data-plane half (UCX tokens on the shared listener, the hint MQ
+        pair) is the later steps. Idempotent per edge: a replayed
+        increment does not disturb the live allowlist."""
+        plane = self._lwd_control_plane
+        assert isinstance(plane, LwdCloudControlPlane)
+        for edge_id in increment.new_edge_ids:
+            plane.allow_edge(edge_id)
+            lwd_logger.info(
+                "[cloud] edge %d admitted to the handshake allowlist "
+                "(topology increment)",
+                edge_id,
+            )
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
