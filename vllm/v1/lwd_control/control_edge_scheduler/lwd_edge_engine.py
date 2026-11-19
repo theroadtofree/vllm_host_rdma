@@ -18,19 +18,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import threading
 import time
 from collections import deque
 from typing import Any
 
-from vllm.config.lwd import (
-    LwdConnectionId,
-    LwdTopology,
-    LwdTopologyIncrement,
-    LwdTopologyUpdateRejected,
-    diff_topology,
-)
+from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.config.lwd.topology import LwdDPConnection
 from vllm.lwd_logger import lwd_logger
 from vllm.utils.network_utils import make_zmq_path
@@ -102,22 +95,6 @@ LWD_HELLO_SILENT_S = 10.0
 _LWD_SEND_RETRY_STEPS = 5
 _LWD_SEND_RETRY_INTERVAL_S = 0.2
 
-# Topology-file poll cadence (host-comm edge_share elastic scale-out): the
-# shared edge engine re-reads the topology when the file's mtime moves, so
-# instance pairs added to the plan are picked up without an engine restart.
-# The stat is one syscall per interval and rides no other loop (the engine
-# thread blocks in input_queue between steps), so it gets its own thread.
-_LWD_TOPOLOGY_POLL_INTERVAL_S = 1.0
-
-
-class _LwdTopologyReloadTick:
-    """Input-queue sentinel of the topology-file watcher thread: the engine
-    thread (the single writer) re-reads, validates and diffs the file."""
-
-
-_LWD_TOPOLOGY_RELOAD_TICK = _LwdTopologyReloadTick()
-
-
 class LwdEdgeEngineCore(LwdBaseEngineCore):
     """Edge PO engine: control plane to every cloud DP rank, cloud limits
     check and native stepping."""
@@ -126,10 +103,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     scheduler: LwdEdgeScheduler
 
     def _lwd_assemble(self) -> None:
-        # Reached by shutdown after a failed assembly too (base __init__
-        # calls it from the except branch), so the watch stop event must
-        # predate every fallible step below.
-        self._lwd_topology_watch_stop = threading.Event()
         # Runtime-added connections (elastic scale-out), keyed by
         # (cloud_id, dp_idx): the engine thread puts, the control-plane IO
         # thread only gets — a keyed read cannot observe a half-applied add.
@@ -228,89 +201,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             len(self._lwd_clouds),
             self.batch_queue_size,
         )
-        if (
-            self.lwd_config.topology.is_host_comm
-            and self.lwd_config.topology.deployment.scene == "edge_share"
-        ):
-            # Phase A of elastic scale-out: poll the topology file so the
-            # running shared engine discovers instance pairs added to the
-            # plan (detect only; applying is the later phases). Device comm
-            # never enters this branch — the HCCL path stays untouched.
-            self._lwd_start_topology_watch()
 
-    def _lwd_start_topology_watch(self) -> None:
-        """Start the mtime poll thread: it owns nothing but the stat and
-        the input-queue tick; the engine thread (the single writer)
-        re-reads and diffs on receipt."""
-        self._lwd_topology_file_digest = self.lwd_config.topology.digest
-        try:
-            self._lwd_topology_mtime_ns: int | None = os.stat(
-                self.lwd_config.path
-            ).st_mtime_ns
-        except OSError:
-            self._lwd_topology_mtime_ns = None
-        threading.Thread(
-            target=self._lwd_watch_topology_file,
-            name="lwd-topology-watch",
-            daemon=True,
-        ).start()
-        lwd_logger.info(
-            "[LWD] topology file watch up: %s (every %.1fs)",
-            self.lwd_config.path,
-            _LWD_TOPOLOGY_POLL_INTERVAL_S,
-        )
-
-    def _lwd_watch_topology_file(self) -> None:
-        """Poll the topology file's mtime; a change queues one reload tick
-        for the engine thread. Transient stat failures (the atomic-rename
-        window) retry on the next tick."""
-        path = self.lwd_config.path
-        while not self._lwd_topology_watch_stop.wait(_LWD_TOPOLOGY_POLL_INTERVAL_S):
-            try:
-                mtime_ns = os.stat(path).st_mtime_ns
-            except OSError:
-                continue
-            if mtime_ns != self._lwd_topology_mtime_ns:
-                self._lwd_topology_mtime_ns = mtime_ns
-                self.input_queue.put_nowait(
-                    (EngineCoreRequestType.WAKEUP, _LWD_TOPOLOGY_RELOAD_TICK)
-                )
-
-    def _lwd_process_topology_reload(
-        self,
-    ) -> LwdTopologyIncrement | LwdTopologyUpdateRejected | None:
-        """Phase A (detect), engine thread: re-read + validate + diff the
-        topology file. Nothing is applied yet — the increment is logged and
-        returned for the later phases; a rejected or unparsable file never
-        touches the realized snapshot and serving continues on it. The
-        last-seen file digest suppresses repeat verdicts for unchanged
-        content (mtime touches included)."""
-        try:
-            candidate = LwdTopology.from_file(self.lwd_config.path)
-        except ValueError as exc:
-            lwd_logger.error("[LWD] topology update rejected: invalid file: %s", exc)
-            return LwdTopologyUpdateRejected(reason=f"invalid file: {exc}")
-        if candidate.digest == self._lwd_topology_file_digest:
-            return None
-        self._lwd_topology_file_digest = candidate.digest
-        verdict = diff_topology(self.lwd_config.topology, candidate)
-        if isinstance(verdict, LwdTopologyUpdateRejected):
-            lwd_logger.error("[LWD] topology update rejected: %s", verdict.reason)
-            return verdict
-        if not verdict.new_connections:
-            return None
-        lwd_logger.info(
-            "[LWD] topology increment detected: +%d pair(s), edges=%s "
-            "clouds=%s, %d connection(s)",
-            len(verdict.new_edge_ids),
-            list(verdict.new_edge_ids),
-            list(verdict.new_cloud_ids),
-            len(verdict.new_connections),
-        )
-        self._lwd_apply_increment(verdict)
-        return verdict
-
-    def _lwd_apply_increment(self, increment: LwdTopologyIncrement) -> None:
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
         """Elastic scale-out: build both halves of every new connection —
         the control plane (DEALER + handshake + bookkeeping), then the
         data plane (UCX links), which on success arms the connection for
@@ -412,9 +304,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         if control is not None:
             control.shutdown()
         # Reached after a failed assembly too, before the clients exist.
-        watch_stop = getattr(self, "_lwd_topology_watch_stop", None)
-        if watch_stop is not None:
-            watch_stop.set()
         self._lwd_probe_manager.close()
         # Snapshot: a late adoption on the IO thread can add a client
         # while shutdown iterates.
@@ -666,13 +555,6 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             request, LwdRefillNotify
         ):
             self._lwd_handle_refill(request)
-            return
-        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
-            request, _LwdTopologyReloadTick
-        ):
-            # Engine thread (the single writer): detect-only reload of the
-            # topology file (Phase A of elastic scale-out).
-            self._lwd_process_topology_reload()
             return
         super()._handle_client_request(request_type, request)
 

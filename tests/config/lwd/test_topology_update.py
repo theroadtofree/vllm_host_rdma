@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Increment-contract unit tests of the runtime topology update.
 
-Every accepted update must be a pure addition (whole instance pairs);
-everything else is rejected with a reason that names the broken rule and
-the exact field. The engine never sees a partial update: the caller
-parses with the standard validation first, so count consistency, port
-uniqueness and id contiguity failures surface at parse time, not here.
+Every accepted update must be a pure addition in its scene's shape —
+edge_share grows by instance pairs, cloud_share by edges; everything
+else is rejected with a reason that names the broken rule and the exact
+field. The engine never sees a partial update: the caller parses with
+the standard validation first, so count consistency, port uniqueness
+and id contiguity failures surface at parse time, not here.
 """
 
 from copy import deepcopy
@@ -204,13 +205,108 @@ def test_frontend_digest_tracks_the_frozen_blocks() -> None:
     base = LwdTopology.from_dict(_payload(2))
     moved_port = _payload(2)
     moved_port["deployment"]["api_bind_base_port"] = 62000
-    assert (
-        LwdTopology.from_dict(moved_port).frontend_digest
-        != base.frontend_digest
-    )
+    assert LwdTopology.from_dict(moved_port).frontend_digest != base.frontend_digest
     qos_moved = _payload(2)
     qos_moved["qos"] = {"data_plane": {"traffic_class": 100, "sl": 1}}
-    assert (
-        LwdTopology.from_dict(qos_moved).frontend_digest
-        != base.frontend_digest
+    assert LwdTopology.from_dict(qos_moved).frontend_digest != base.frontend_digest
+
+
+# --------------------------------------------------------------------- #
+# cloud_share: additions are edges only, linked to the existing cloud      #
+# --------------------------------------------------------------------- #
+
+
+def _cloud_share_payload(edges: int) -> dict[str, Any]:
+    """An N-edge, one-cloud cloud_share host topology (coordination is a
+    cloud_share requirement on every instance)."""
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": "cloud_share",
+            "edges_num": edges,
+            "clouds_num": 1,
+            "data_plane_comm": "host",
+        },
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
+        "edges": [
+            {
+                "id": i,
+                "coordination": {
+                    "enabled": True,
+                    "control_url": "http://16.32.2.2:9133/v1/chat/completions",
+                    "consumer_id": f"enterprise-a-edge{i}",
+                },
+                "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}],
+            }
+            for i in range(edges)
+        ],
+        "clouds": [
+            {
+                "id": 0,
+                "coordination": {"enabled": True},
+                "dp": [
+                    {
+                        "dp_idx": 0,
+                        "addr": "16.32.2.2",
+                        "ctrl_port": 5550,
+                        "data_port": 5560,
+                    }
+                ],
+            }
+        ],
+        # Full mesh: every edge links to the single cloud.
+        "instance_links": [{"edge": i, "cloud": 0} for i in range(edges)],
+    }
+
+
+def test_cloud_share_adds_edges_to_the_existing_cloud() -> None:
+    """The cloud_share shape: a new edge only, linked to the SAME existing
+    cloud — exactly the crossing edge_share forbids. The increment's
+    connections are the new edge's zipped DP pairs against cloud 0."""
+    new = LwdTopology.from_dict(_cloud_share_payload(2))
+    verdict = diff_topology(LwdTopology.from_dict(_cloud_share_payload(1)), new)
+    assert not isinstance(verdict, LwdTopologyUpdateRejected)
+    assert verdict.new_edge_ids == (1,)
+    assert verdict.new_cloud_ids == ()
+    (connection,) = verdict.new_connections
+    assert connection == new.connections("edge", 1)[0]
+    assert connection.cloud_id == 0
+
+
+def test_cloud_share_rejects_a_new_cloud() -> None:
+    """The shared cloud's own plan never grows at runtime: a second cloud
+    is a scene-shape change (cloud_share demands one cloud), so it fails
+    the standard validation before the diff."""
+    raw = _cloud_share_payload(1)
+    raw["clouds"].append(
+        {
+            "id": 1,
+            "coordination": {"enabled": True},
+            "dp": [
+                {
+                    "dp_idx": 0,
+                    "addr": "16.32.2.3",
+                    "ctrl_port": 5551,
+                    "data_port": 5561,
+                }
+            ],
+        }
     )
+    with pytest.raises(ValueError, match="one cloud"):
+        LwdTopology.from_dict(raw)
+
+
+def test_cloud_share_rejects_a_scene_flip() -> None:
+    assert "scene changed" in _rejected(_cloud_share_payload(1), _payload(1))
+
+
+def test_single_instance_has_no_runtime_update_semantics() -> None:
+    """An edge_share pair flipped to single_instance parses clean in both
+    files (same shape), so R0's scene check is what refuses it —
+    restarting is the only way to change that plan."""
+    single = _payload(1)
+    single["deployment"]["scene"] = "single_instance"
+    assert "no runtime-update semantics" in _rejected(_payload(1), single)

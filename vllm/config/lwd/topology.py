@@ -709,12 +709,14 @@ def diff_topology(
 
     Preconditions: both topologies come from ``from_dict``, so the full
     layout validation (scene shape, port uniqueness, count consistency,
-    contiguous instance ids, one-to-one links) already ran. The rules, in
+    contiguous instance ids, link completeness) already ran. The rules, in
     order:
 
-    * R0 the scene stays ``edge_share`` — the running shared edge engine
-      is the only consumer, and a same-shape ``single_instance`` file
-      parses clean, so the scene must be compared explicitly;
+    * R0 the scene stays the same — and only the shared side of a scene
+      has runtime-update semantics: ``edge_share`` (the shared edge
+      engine grows by cloud pairs) and ``cloud_share`` (the shared cloud
+      grows by edges). A same-shape ``single_instance`` file parses
+      clean, so the scene must be compared explicitly;
     * R1 global blocks are frozen (see ``_frozen_blocks``): they size the
       realized pools (``up_buffer_size``), seed channel scrambling and
       configure the control plane — none can be applied retroactively;
@@ -723,19 +725,24 @@ def diff_topology(
       connection and rules out shrink (scale-in keeps its existing
       kill + liveness semantics);
     * R3 links are addition-only: a swap of realized links is a change;
-    * R4 additions are whole instance pairs (edge_share grows by pairs).
+    * R4 the addition shape is the scene's: edge_share adds whole
+      instance pairs and a new link may not cross old and new instances
+      (one-to-one); cloud_share adds edges only and every new link MUST
+      cross (new edge -> the existing cloud), per the full-mesh scene.
 
     Instance ids are append-only by construction: layout validation
     requires ids unique and contiguous from 0, so a valid addition can
     only append the next id."""
     if old.digest == new.digest:
         return LwdTopologyIncrement((), (), (), new)
-    if (
-        old.deployment.scene != "edge_share"
-        or new.deployment.scene != old.deployment.scene
-    ):
+    if old.deployment.scene != new.deployment.scene:
         return LwdTopologyUpdateRejected(
             f"scene changed: {old.deployment.scene} -> {new.deployment.scene}"
+        )
+    if old.deployment.scene not in ("edge_share", "cloud_share"):
+        return LwdTopologyUpdateRejected(
+            f"scene {old.deployment.scene} has no runtime-update "
+            "semantics; restart the engine to change its plan"
         )
     frozen_old = _frozen_blocks(old)
     frozen_new = _frozen_blocks(new)
@@ -775,20 +782,36 @@ def diff_topology(
         return LwdTopologyUpdateRejected(
             f"link removed: edge {removed.edge} - cloud {removed.cloud}"
         )
-    for link in sorted(new_links - old_links, key=link_key):
-        if (link.edge in old_edges) != (link.cloud in old_clouds):
-            return LwdTopologyUpdateRejected(
-                f"new link crosses old and new instances: "
-                f"edge {link.edge} - cloud {link.cloud}"
-            )
+    added_links = sorted(new_links - old_links, key=link_key)
     new_edge_ids = tuple(sorted({instance.id for instance in new.edges} - old_edges))
     new_cloud_ids = tuple(sorted({instance.id for instance in new.clouds} - old_clouds))
-    if len(new_edge_ids) != len(new_cloud_ids):
-        return LwdTopologyUpdateRejected(
-            f"additions must be instance pairs: {len(new_edge_ids)} edge(s) "
-            f"vs {len(new_cloud_ids)} cloud(s)"
-        )
+    if old.deployment.scene == "edge_share":
+        for link in added_links:
+            if (link.edge in old_edges) != (link.cloud in old_clouds):
+                return LwdTopologyUpdateRejected(
+                    f"new link crosses old and new instances: "
+                    f"edge {link.edge} - cloud {link.cloud}"
+                )
+        if len(new_edge_ids) != len(new_cloud_ids):
+            return LwdTopologyUpdateRejected(
+                f"additions must be instance pairs: {len(new_edge_ids)} "
+                f"edge(s) vs {len(new_cloud_ids)} cloud(s)"
+            )
+    else:  # cloud_share
+        if new_cloud_ids:
+            return LwdTopologyUpdateRejected(
+                f"cloud_share additions are edges only; new cloud(s) "
+                f"{list(new_cloud_ids)} (restart the cloud to change its "
+                "own plan)"
+            )
+        for link in added_links:
+            if link.edge not in new_edge_ids or link.cloud not in old_clouds:
+                return LwdTopologyUpdateRejected(
+                    f"a cloud_share addition links every new edge to the "
+                    f"existing cloud; got edge {link.edge} - cloud "
+                    f"{link.cloud}"
+                )
     connections: list[LwdDPConnection] = []
-    for link in sorted(new_links - old_links, key=link_key):
+    for link in added_links:
         connections.extend(new.connections("edge", link.edge))
     return LwdTopologyIncrement(new_edge_ids, new_cloud_ids, tuple(connections), new)

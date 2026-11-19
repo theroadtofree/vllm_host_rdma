@@ -7,6 +7,7 @@ the engine thread."""
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from contextlib import ExitStack
@@ -16,6 +17,12 @@ from typing import Any
 import msgspec
 import zmq
 
+from vllm.config.lwd import (
+    LwdTopology,
+    LwdTopologyIncrement,
+    LwdTopologyUpdateRejected,
+    diff_topology,
+)
 from vllm.lwd_logger import lwd_logger
 from vllm.multimodal.cache import MultiModalCacheMissError
 from vllm.utils.network_utils import make_zmq_socket
@@ -35,6 +42,23 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_encode_message,
 )
 from vllm.v1.serial_utils import MsgpackDecoder
+
+# Topology-file poll cadence (host-comm elastic scale-out): the shared
+# side of a scene re-reads the topology when the file's mtime moves, so
+# instances added to the plan are picked up without an engine restart.
+# The stat is one syscall per interval and rides no other loop (the
+# engine thread blocks in input_queue between steps), so it gets its
+# own thread.
+_LWD_TOPOLOGY_POLL_INTERVAL_S = 1.0
+
+
+class _LwdTopologyReloadTick:
+    """Input-queue sentinel of the topology-file watcher thread: the
+    engine thread (the single writer) re-reads, validates and diffs the
+    file, then applies its half of the increment."""
+
+
+_LWD_TOPOLOGY_RELOAD_TICK = _LwdTopologyReloadTick()
 
 
 @dataclass(frozen=True)
@@ -96,6 +120,9 @@ class LwdBaseEngineCore(EngineCoreProc):
         self._lwd_sender: LwdControlSender | None = None
         # has_work state at the last transition log; None = not logged yet.
         self._lwd_last_has_work_state: tuple[bool, bool, bool] | None = None
+        # The topology-file watch stop event predates everything fallible:
+        # shutdown reaches it after a failed assembly too.
+        self._lwd_topology_watch_stop = threading.Event()
         vllm_config = kwargs["vllm_config"]
         scheduler_config = vllm_config.scheduler_config
         scheduler_config.scheduler_cls = self.lwd_scheduler_cls
@@ -111,10 +138,107 @@ class LwdBaseEngineCore(EngineCoreProc):
             # the executor and the control plane before failing startup.
             self.shutdown()
             raise
+        # Elastic scale-out, after a successful assembly: the shared side of
+        # the scene watches its plan (see _lwd_topology_watch_enabled).
+        if self._lwd_topology_watch_enabled():
+            self._lwd_start_topology_watch()
 
     def _lwd_assemble(self) -> None:
         """Role setup once the engine is built, including the control plane."""
         raise NotImplementedError
+
+    def _lwd_topology_watch_enabled(self) -> bool:
+        """The shared side of a scene watches its plan: the edge engine in
+        edge_share (clouds are added to the running shared engine), the
+        cloud engine in cloud_share (edges are added to the running shared
+        cloud). The other side always starts fresh with the grown yaml and
+        needs no watch. Device comm never watches — the HCCL path stays
+        untouched."""
+        scene = self.lwd_config.topology.deployment.scene
+        watched = "edge_share" if self.lwd_config.role == "edge" else "cloud_share"
+        return self.lwd_config.topology.is_host_comm and scene == watched
+
+    def _lwd_start_topology_watch(self) -> None:
+        """Start the mtime poll thread: it owns nothing but the stat and
+        the input-queue tick; the engine thread (the single writer)
+        re-reads, validates and diffs on receipt."""
+        self._lwd_topology_file_digest = self.lwd_config.topology.digest
+        try:
+            self._lwd_topology_mtime_ns: int | None = os.stat(
+                self.lwd_config.path
+            ).st_mtime_ns
+        except OSError:
+            self._lwd_topology_mtime_ns = None
+        threading.Thread(
+            target=self._lwd_watch_topology_file,
+            name="lwd-topology-watch",
+            daemon=True,
+        ).start()
+        lwd_logger.info(
+            "[LWD] topology file watch up: %s (every %.1fs)",
+            self.lwd_config.path,
+            _LWD_TOPOLOGY_POLL_INTERVAL_S,
+        )
+
+    def _lwd_watch_topology_file(self) -> None:
+        """Poll the topology file's mtime; a change queues one reload tick
+        for the engine thread. Transient stat failures (the atomic-rename
+        window) retry on the next tick."""
+        path = self.lwd_config.path
+        while not self._lwd_topology_watch_stop.wait(_LWD_TOPOLOGY_POLL_INTERVAL_S):
+            try:
+                mtime_ns = os.stat(path).st_mtime_ns
+            except OSError:
+                continue
+            if mtime_ns != self._lwd_topology_mtime_ns:
+                self._lwd_topology_mtime_ns = mtime_ns
+                self.input_queue.put_nowait(
+                    (EngineCoreRequestType.WAKEUP, _LWD_TOPOLOGY_RELOAD_TICK)
+                )
+
+    def _lwd_process_topology_reload(
+        self,
+    ) -> LwdTopologyIncrement | LwdTopologyUpdateRejected | None:
+        """Detect-only core, engine thread: re-read + validate + diff the
+        topology file, then hand an accepted increment to the role hook.
+        A rejected or unparsable file never touches the realized snapshot
+        and serving continues on it. The last-seen file digest suppresses
+        repeat verdicts for unchanged content (mtime touches included)."""
+        try:
+            candidate = LwdTopology.from_file(self.lwd_config.path)
+        except ValueError as exc:
+            lwd_logger.error("[LWD] topology update rejected: invalid file: %s", exc)
+            return LwdTopologyUpdateRejected(reason=f"invalid file: {exc}")
+        if candidate.digest == self._lwd_topology_file_digest:
+            return None
+        self._lwd_topology_file_digest = candidate.digest
+        verdict = diff_topology(self.lwd_config.topology, candidate)
+        if isinstance(verdict, LwdTopologyUpdateRejected):
+            lwd_logger.error("[LWD] topology update rejected: %s", verdict.reason)
+            return verdict
+        if not verdict.new_connections:
+            return None
+        lwd_logger.info(
+            "[LWD] topology increment detected: +%d edge(s) %s, +%d cloud(s) "
+            "%s, %d connection(s)",
+            len(verdict.new_edge_ids),
+            list(verdict.new_edge_ids),
+            len(verdict.new_cloud_ids),
+            list(verdict.new_cloud_ids),
+            len(verdict.new_connections),
+        )
+        self._lwd_apply_topology_increment(verdict)
+        return verdict
+
+    def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
+        """Role hook: apply the half of the increment this engine owns. The
+        default only records the detection — the shared edge builds the
+        control-plane and data-plane links, and the shared cloud grows its
+        allowlist and listener, each in its override."""
+        lwd_logger.info(
+            "[LWD] topology increment recorded (role=%s has no runtime apply yet)",
+            self.lwd_config.role,
+        )
 
     def _lwd_start_control_plane(self) -> LwdControlPlane:
         """Start this DP rank's control plane; the calling (engine) thread
@@ -409,6 +533,13 @@ class LwdBaseEngineCore(EngineCoreProc):
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         if request_type == EngineCoreRequestType.WAKEUP and isinstance(
+            request, _LwdTopologyReloadTick
+        ):
+            # Engine thread (the single writer): detect-only reload of the
+            # topology file (elastic scale-out), then the role's apply hook.
+            self._lwd_process_topology_reload()
+            return
+        if request_type == EngineCoreRequestType.WAKEUP and isinstance(
             request, _LwdPeerUp
         ):
             self._lwd_handle_peer_registered(request.peer)
@@ -437,6 +568,7 @@ class LwdBaseEngineCore(EngineCoreProc):
 
     def shutdown(self) -> None:
         # Also reached after a failed assembly, before the plane exists.
+        self._lwd_topology_watch_stop.set()
         if self._lwd_control_plane is not None:
             self._lwd_control_plane.shutdown()
         super().shutdown()

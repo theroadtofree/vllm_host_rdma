@@ -28,16 +28,22 @@
 The engine polls the topology file itself; there is no operator signal
 and no separate database:
 
-* **Who polls**: the running **shared edge engine** only
-  (`is_host_comm && scene == edge_share && role == edge`; the HCCL path
-  never enters the branch — v1 is edge_share-first, cloud_share will
-  join as the second consumer with its own addition shape).
+* **Who polls (2026-11-19: lifted to the shared base, role-aware)**: the
+  **shared side of the scene** — `LwdBaseEngineCore` starts the watch
+  after a successful assembly when
+  `_lwd_topology_watch_enabled()`: the edge engine in `edge_share`
+  (clouds join the running shared engine), the cloud engine in
+  `cloud_share` (edges join the running shared cloud). The other side
+  always starts fresh with the grown yaml and needs no watch. Device
+  comm never watches — the HCCL path is untouched.
 * **How**: a daemon thread (`lwd-topology-watch`, cadence
   `_LWD_TOPOLOGY_POLL_INTERVAL_S = 1.0s`) stats the file's mtime. A
   change queues one `(WAKEUP, _LWD_TOPOLOGY_RELOAD_TICK)` into the
   engine's input queue — the same host pattern as the liveness
   heartbeat: the poll thread owns nothing but the stat and the tick, and
-  the engine thread (the single writer) re-reads, validates and diffs.
+  the engine thread (the single writer) re-reads, validates, diffs and
+  calls the role's `_lwd_apply_topology_increment` hook (the edge builds
+  its halves; the cloud's steps arrive as C-2..C-4 below).
 * **Deployment discipline**: edits must go through temp-file + atomic
   rename. A half-written file is caught by parse validation (rejected,
   serving continues); a `touch` with unchanged content no-ops on the
@@ -209,15 +215,55 @@ the `edges_num`/`clouds_num` declarations) — while the full
   `diff_topology`'s no-op check keep the FULL digest — they must notice
   every content change; only the frontend comparison narrows.
 
-## 6. Processing order (caller flow, Phase A)
+## 6. cloud_share scale-out plan (2026-11-19 re-analysis)
+
+The elastic chain above grew the shared EDGE. cloud_share is its mirror:
+the running shared CLOUD grows by edges. Re-analysis against this repo
+(kill corrected item by item — the old session's three: listener token
+registration is already supported by the locked `_routes` on
+`LwdUcxListener` (`register` is callable mid-run; `serve_via` registers
+synchronously); `expected_edge_ids` is real but shrinks to an atomic
+superset swap; the topology digest does not exist in the edge→cloud
+join path at all — the frontend-attach digest is the only one, and
+cloud_share edges do not attach):
+
+* **C-1 (this change)**: scene-parameterized contract + the watch lifted
+  to `LwdBaseEngineCore` with the role-aware gate. The cloud engine now
+  detects cloud_share increments (edges only, links to the existing
+  cloud) and logs them; its apply hook is the base's no-op default
+  until C-2 lands.
+* **C-2**: `LwdCloudControlPlane.allow_edge(edge_id)` — an atomic
+  frozenset superset swap on the handshake's allowlist — wired from the
+  cloud's `_lwd_apply_topology_increment`. Late-edge HELLOs then
+  register through the existing runtime path
+  (`_lwd_handle_peer_registered` already handles re-registration).
+* **C-3**: `lwd_add_runtime_connection` goes role-aware: the cloud
+  builds its serve-side pair on the EXISTING shared listener
+  (`_UCX_LISTENERS[(cloud_id, dp_idx)]`), reusing `_build_connection_ios`
+  — `serve_via` registers the token mid-run (locked), the budget ledger
+  is shared.
+* **C-4 (the genuinely new piece)**: the hint/done MQ pair for a late
+  edge — the running CLOUD creates `create_hint_mq` + registers the
+  hint sender + fetches the done MQ via `collective_rpc`; the worker
+  attaches/creates per-connection MQs and the early-recv loop's
+  one-time snapshot (`hint_mqs = self._irecv_hint_mqs`) becomes a
+  per-iteration `tuple()` snapshot.
+
+Acceptance: 1-edge cloud_share running → grow the cloud host's yaml to
+2 edges → launch edge 1 → the cloud's watch fires, the edge registers,
+its UCX pair builds on the shared listener → requests through edge 1
+serve, edge 0 never drops.
+
+## 7. Processing order (caller flow, Phase A)
 
 ```text
-trigger (host + edge_share + edge gate)
+trigger (host comm; the shared side of the scene — the edge engine in
+         edge_share, the cloud engine in cloud_share)
 → LwdTopology.from_file(path)   # parse + the FULL standard validation
                                   # (scene shape, port uniqueness, count
-                                  # consistency, contiguous ids, one-to-one
-                                  # links). Failure: error log, keep the old
-                                  # snapshot, serving continues.
+                                  # consistency, contiguous ids, link
+                                  # completeness). Failure: error log, keep
+                                  # the old snapshot, serving continues.
 → diff_topology(realized, new) # this contract: pure-addition verdict
 → LwdTopologyIncrement | LwdTopologyUpdateRejected
 ```
@@ -226,21 +272,21 @@ Standard validation runs **first**, so count mismatches, id gaps and port
 collisions never reach the diff — they fail at parse with the existing
 messages.
 
-## 7. Rules (all must hold to accept)
+## 8. Rules (all must hold to accept)
 
 | Rule | Content | Why |
 | --- | --- | --- |
-| R0 | scene stays `edge_share` on both sides | a same-shape `single_instance` file parses clean, so the scene must be compared explicitly |
+| R0 | the scene stays the same, and only the shared side's scenes have runtime-update semantics: `edge_share` and `cloud_share` (2026-11-19: scene-parameterized). `lwd_cluster`/`single_instance` increments are refused with "no runtime-update semantics; restart the engine" | a same-shape `single_instance` file parses clean, so the scene must be compared explicitly; the same-scene `lwd_cluster` growth needs its own consumer first |
 | R1 | global blocks frozen: `deployment` (minus `edges_num`/`clouds_num`, which follow the added instances), `feature_ctrl`, `control_plane`. **`qos` is exempt by deployment guarantee, not by code** (2026-11-18 review decision) | they size the realized pools (`up_buffer_size`), seed channel scrambling (`feature_ctrl.scramble`) and configure the control plane — none can be applied retroactively |
 | R2 | every realized instance survives byte-identical — dp list and coordination block included | pins every realized connection; rules out shrink and mid-flight renumbering |
 | R3 | links are addition-only | a swap of realized links is a change |
-| R4 | additions are **whole instance pairs** (2026-11-18 review decision) | edge_share grows by pairs; one-to-one scene validation already keeps new links off old instances, asserted for a pointed message |
+| R4 | the addition shape is the scene's (2026-11-19): **edge_share** adds whole instance pairs (2026-11-18 review decision) and a new link may not cross old and new instances; **cloud_share** adds edges only, and every new link MUST cross — new edge → the existing cloud, per the full-mesh scene | each scene's "who joins the running process" is opposite; the standard scene validation already enforces the link shape, the diff asserts it for a pointed message |
 
 Ids are append-only by construction: layout validation requires instance
 ids unique and contiguous from 0, so a valid addition can only append the
 next id.
 
-## 8. Interface
+## 9. Interface
 
 ```python
 # vllm/config/lwd/topology.py
@@ -263,7 +309,7 @@ def diff_topology(old: LwdTopology, new: LwdTopology
 Empty `new_connections` on an accepted verdict = no-op (the file was
 touched but its semantics did not change; the digest fast path catches it).
 
-## 9. Snapshot semantics
+## 10. Snapshot semantics
 
 * The engine holds a **realized snapshot** — the topology its current
   links were built from (initial: the startup yaml).
@@ -272,7 +318,7 @@ touched but its semantics did not change; the digest fast path catches it).
 * A rejected update never advances it; the verdict is deterministic, so
   re-reading the same file yields the same result.
 
-## 10. Rejection messages
+## 11. Rejection messages
 
 Pattern `[LWD] topology update rejected: <rule>: <detail>`:
 
@@ -287,7 +333,7 @@ link removed: edge 0 - cloud 0
 new link crosses old and new instances: edge 2 - cloud 0
 ```
 
-## 11. Tests
+## 12. Tests
 
 `tests/config/lwd/test_topology_update.py` — 13 cases: no-op (digest fast
 path, deepcopy), +1 pair, +2 pairs, scene change, frozen deployment /

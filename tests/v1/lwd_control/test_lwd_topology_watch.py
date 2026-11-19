@@ -27,6 +27,8 @@ from vllm.v1.lwd_control.control_edge_scheduler import lwd_edge_engine
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
+from vllm.v1.lwd_control.control_scheduler import lwd_base_engine
+from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
 
 
 class _RecordingPlane:
@@ -159,7 +161,7 @@ def test_applying_the_same_increment_twice_adds_each_link_once(
     _write(topology_file, _payload(2))
     first = engine._lwd_process_topology_reload()
     assert first is not None and not isinstance(first, LwdTopologyUpdateRejected)
-    engine._lwd_apply_increment(first)
+    engine._lwd_apply_topology_increment(first)
     assert len(engine._lwd_control_plane.links) == 1
 
 
@@ -195,7 +197,7 @@ def test_a_refused_data_plane_arms_on_the_next_increment(
     # The next detected increment replays the same verdict: the retry
     # touches only the data-plane half.
     build_results.append(True)
-    engine._lwd_apply_increment(first)
+    engine._lwd_apply_topology_increment(first)
     assert engine._lwd_control_plane.links == [
         ("tcp://16.32.2.2:5551", LwdConnectionId(1, 1, 0), 1)
     ]  # no duplicate control-plane add
@@ -282,7 +284,7 @@ def test_the_watch_thread_queues_one_tick_per_change(
         engine._lwd_topology_watch_stop.set()
     (request_type, tick) = engine.input_queue.items[0]
     assert request_type == EngineCoreRequestType.WAKEUP
-    assert tick is lwd_edge_engine._LWD_TOPOLOGY_RELOAD_TICK
+    assert tick is lwd_base_engine._LWD_TOPOLOGY_RELOAD_TICK
 
 
 def test_the_gate_rejects_a_control_plane_only_connection(
@@ -352,3 +354,39 @@ def test_the_data_plane_hook_registry_reports_and_survives_raising_hooks(
         assert built == [LwdConnectionId(1, 1, 0)]
     finally:
         hooks._hooks[:] = saved
+
+
+def test_the_watch_gate_watches_only_the_shared_side_of_the_scene(
+    tmp_path: Path,
+) -> None:
+    """The shared side watches its plan: the edge engine in edge_share
+    (clouds join the running engine), the cloud engine in cloud_share
+    (edges join the running cloud). The other side always starts fresh
+    with the grown yaml and never watches; device comm never watches."""
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _payload(1))
+
+    def engine(role: str, scene: str, *, host_comm: bool) -> LwdBaseEngineCore:
+        engine = object.__new__(LwdBaseEngineCore)
+        engine.lwd_config = SimpleNamespace(
+            path=str(topology_file),
+            role=role,
+            topology=SimpleNamespace(
+                is_host_comm=host_comm,
+                deployment=SimpleNamespace(scene=scene),
+                digest="d",
+            ),
+        )
+        return engine
+
+    def gated(role: str, scene: str, *, host_comm: bool) -> bool:
+        return engine(role, scene, host_comm=host_comm)._lwd_topology_watch_enabled()
+
+    assert gated("edge", "edge_share", host_comm=True)
+    assert gated("cloud", "cloud_share", host_comm=True)
+    # The fresh side of each scene, the flipped scene, and device comm.
+    assert not gated("cloud", "edge_share", host_comm=True)
+    assert not gated("edge", "cloud_share", host_comm=True)
+    assert not gated("edge", "single_instance", host_comm=True)
+    assert not gated("edge", "edge_share", host_comm=False)
+    assert not gated("cloud", "cloud_share", host_comm=False)
