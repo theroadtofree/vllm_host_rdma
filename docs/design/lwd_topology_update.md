@@ -314,9 +314,9 @@ startup cloud (2e1c → 2e2c: all requests stayed on cloud 0). Root
 cause: the edge probe manager's cloud set was frozen at startup — the
 health rotation came from this edge's own coordination
 (`control_url_map`), and a single-`control_url` deployment hardcoded
-`cloud_id = 0`; the increment contract keeps the edge's block
-byte-identical, so it can never carry the new cloud's URL. Fix, three
-layers:
+`cloud_id = 0`. Fix, three layers (the edge's own block may now carry the
+new cloud's URL — the R2 exemption above lets the map grow; when it does
+not, the URL is derived):
 
 * **`LwdCloudHealthTracker.add_cloud(cloud_id)`** — the rotation is
   replaced by one atomic tuple swap (`tuple(sorted(_failures))`), so a
@@ -333,15 +333,17 @@ layers:
   `control_url_map[target]` lookup raised KeyError the moment a
   runtime-adopted cloud answered with a different hash block size).
   `enabled` also counts runtime registrations.
-* **The edge engine's `_lwd_apply_topology_increment`** derives the
-  adopted cloud's URL from ITS instance block in
-  `increment.new_topology` — `http://{cloud_dp.addr}:{coordination.
-  listen_port}{path}` (the dp address is the same routable host the
-  control-plane DEALER dials; the PATH is borrowed from this edge's own
-  startup control_url, because the probe POSTs to the full URL — the
-  cloud app routes `/v1/chat/completions` — and the topology stores
-  host/port per cloud only) — and registers it before the arm
-  attempt: a refused data-plane build never rolls the registration
+* **The edge engine's `_lwd_apply_topology_increment`** registers the
+  adopted cloud's probe URL before the arm attempt, first registration
+  winning. URL sources, in order: (1) this edge's own grown
+  `control_url_map` entry in the update (the operator's explicit
+  intent); (2) a derivation from the cloud's instance block —
+  `http://{cloud_dp.addr}:{coordination.listen_port}{path}` (the dp
+  address is the same routable host the control-plane DEALER dials; the
+  PATH is borrowed from this edge's own startup control_url, because
+  the probe POSTs to the full URL — the cloud app routes
+  `/v1/chat/completions` — and the topology stores host/port per cloud
+  only): a refused data-plane build never rolls the registration
   back, and a cloud that is still loading simply accrues probe
   failures → cooldown → recovery (the tracker's existing semantics;
   `candidates()` fails open only when EVERY cloud cools down).
@@ -386,7 +388,7 @@ messages.
 | --- | --- | --- |
 | R0 | the scene stays the same, and only the shared side's scenes have runtime-update semantics: `edge_share` and `cloud_share` (2026-11-19: scene-parameterized). `lwd_cluster`/`single_instance` increments are refused with "no runtime-update semantics; restart the engine" | a same-shape `single_instance` file parses clean, so the scene must be compared explicitly; the same-scene `lwd_cluster` growth needs its own consumer first |
 | R1 | global blocks frozen: `deployment` (minus `edges_num`/`clouds_num`, which follow the added instances), `feature_ctrl`, `control_plane`. **`qos` is exempt by deployment guarantee, not by code** (2026-11-18 review decision) | they size the realized pools (`up_buffer_size`), seed channel scrambling (`feature_ctrl.scramble`) and configure the control plane — none can be applied retroactively |
-| R2 | every realized instance survives byte-identical — dp list and coordination block included | pins every realized connection; rules out shrink and mid-flight renumbering |
+| R2 | every realized instance survives byte-identical — dp list and coordination block included. **One exemption (2026-11-19 deployment decision)**: an existing EDGE's `coordination.control_url_map` may grow, addition-only and keyed by the newly added clouds (`_relaxed_edge_snapshot` masks exactly those keys; a rewritten existing URL, a removed entry or a bogus key stays a rejection) | pins every realized connection; rules out shrink and mid-flight renumbering. The map is pure edge-side probe config and the runtime registration merges it (first wins) — the natural hand edit when an operator adds a cloud, accepted as-is |
 | R3 | links are addition-only | a swap of realized links is a change |
 | R4 | the addition shape is the scene's (2026-11-19): **edge_share** adds whole instance pairs (2026-11-18 review decision) and a new link may not cross old and new instances; **cloud_share** adds edges only, and every new link MUST cross — new edge → the existing cloud, per the full-mesh scene | each scene's "who joins the running process" is opposite; the standard scene validation already enforces the link shape, the diff asserts it for a pointed message |
 

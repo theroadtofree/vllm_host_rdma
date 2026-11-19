@@ -286,11 +286,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         """Elastic scale-out: teach the probe manager the adopted cloud's
         coordination URL, so probe targeting — and the routing preference
         probes produce — spreads over every adopted cloud instead of
-        staying pinned to the startup set. The increment contract keeps
-        this edge's own coordination block byte-identical, so it cannot
-        carry the new URL; the cloud's instance block does: its HTTP
+        staying pinned to the startup set. The URL's sources, in order:
+        this edge's own map in the update (the relaxed R2 lets it grow
+        with the new cloud — the operator's explicit entry wins), then a
+        derivation from the cloud's own instance block — its HTTP
         listener port plus this DP's routable address (the same host the
-        control-plane DEALER dials)."""
+        control-plane DEALER dials) with the path borrowed from this
+        edge's startup URL (the probe POSTs to the full URL)."""
         coordination = topology.instance("cloud", cloud_id).coordination
         if coordination is None or not coordination.enabled:
             # Every lwd_cluster/cloud_share cloud carries an enabled
@@ -303,7 +305,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 cloud_id,
             )
             return
-        url = f"http://{cloud_dp.addr}:{coordination.listen_port}{self._lwd_probe_url_path()}"
+        edge_coordination = topology.instance(
+            "edge", self.lwd_config.instance_id
+        ).coordination
+        url = (
+            edge_coordination.control_url_map.get(cloud_id)
+            if edge_coordination is not None
+            else None
+        )
+        if url is None:
+            url = (
+                f"http://{cloud_dp.addr}:{coordination.listen_port}"
+                f"{self._lwd_probe_url_path()}"
+            )
+        # First registration wins: a later replay of the same increment
+        # confirms the rotation membership without rewriting the URL.
         self._lwd_probe_manager.register_cloud(cloud_id, url)
         lwd_logger.error(
             "[LWD] probe cloud registered: cloud=%d url=%s rotation=%s "

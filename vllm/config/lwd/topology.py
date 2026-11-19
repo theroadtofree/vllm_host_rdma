@@ -704,6 +704,29 @@ def _frozen_blocks(topology: LwdTopology) -> dict[str, Any]:
     }
 
 
+def _relaxed_edge_snapshot(
+    snapshot: dict[str, Any], added_clouds: set[int]
+) -> dict[str, Any]:
+    """R2 exemption (2026-11-19 deployment decision): an existing EDGE's
+    ``coordination.control_url_map`` may GROW — addition-only, keyed by
+    the newly added clouds. The map is pure edge-side probe config and the
+    runtime registration merges it (first wins), so appending the new
+    clouds' URLs cannot disturb a realized connection; it is also the
+    natural hand edit when an operator adds a cloud. Masking exactly
+    those keys out of the fresh snapshot keeps every other change — a
+    rewritten existing URL, a removed entry, a key no new cloud owns —
+    a rejection."""
+    coordination = snapshot.get("coordination")
+    if coordination is None or not coordination.get("control_url_map"):
+        return snapshot
+    coordination["control_url_map"] = {
+        key: value
+        for key, value in coordination["control_url_map"].items()
+        if key not in added_clouds
+    }
+    return snapshot
+
+
 def diff_topology(
     old: LwdTopology, new: LwdTopology
 ) -> LwdTopologyIncrement | LwdTopologyUpdateRejected:
@@ -725,7 +748,11 @@ def diff_topology(
     * R2 every realized instance survives byte-identical, dp list and
       coordination block included — which also pins every realized
       connection and rules out shrink (scale-in keeps its existing
-      kill + liveness semantics);
+      kill + liveness semantics). One exemption (2026-11-19 deployment
+      decision): an existing EDGE's coordination.control_url_map may
+      grow, addition-only and keyed by the newly added clouds — pure
+      edge-side probe config, merged into the runtime registration
+      (see ``_relaxed_edge_snapshot``);
     * R3 links are addition-only: a swap of realized links is a change;
     * R4 the addition shape is the scene's: edge_share adds whole
       instance pairs and a new link may not cross old and new instances
@@ -758,6 +785,7 @@ def diff_topology(
             return LwdTopologyUpdateRejected(f"global block changed: {change}")
     old_edges = {instance.id for instance in old.edges}
     old_clouds = {instance.id for instance in old.clouds}
+    added_clouds = {instance.id for instance in new.clouds} - old_clouds
     for role, old_instances, new_instances in (
         ("edge", old.edges, new.edges),
         ("cloud", old.clouds, new.clouds),
@@ -770,8 +798,13 @@ def diff_topology(
                     f"instance removed: {role} {instance.id} (shrink is not "
                     "supported; scale-in keeps the kill + liveness semantics)"
                 )
+            fresh_snapshot = (
+                _relaxed_edge_snapshot(asdict(fresh), added_clouds)
+                if role == "edge"
+                else asdict(fresh)
+            )
             change = _first_change(
-                f"{role} {instance.id}", asdict(instance), asdict(fresh)
+                f"{role} {instance.id}", asdict(instance), fresh_snapshot
             )
             if change is not None:
                 return LwdTopologyUpdateRejected(

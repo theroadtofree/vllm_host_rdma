@@ -17,6 +17,7 @@ import pytest
 from lwd_config_under_test import (
     LwdConnectionId,
     LwdTopology,
+    LwdTopologyIncrement,
     LwdTopologyUpdateRejected,
     diff_topology,
 )
@@ -139,6 +140,94 @@ def test_existing_coordination_change_is_rejected() -> None:
     new = _payload(2)
     new["edges"][0]["coordination"] = {"connect_timeout": 6.0}
     assert "edge 0.coordination.connect_timeout" in _rejected(old, new)
+
+
+def test_an_existing_edge_url_map_may_gain_the_new_clouds() -> None:
+    """R2 exemption (2026-11-19 deployment decision): an existing edge's
+    control_url_map may grow, addition-only and keyed by the newly added
+    clouds — the natural hand edit when a cloud joins, accepted as-is
+    (the map is pure edge-side probe config; the runtime registration
+    merges it)."""
+    old = _payload(1)
+    old["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {"0": "http://16.32.2.2:9133/v1/chat/completions"},
+    }
+    new = _payload(2)
+    new["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {
+            "0": "http://16.32.2.2:9133/v1/chat/completions",
+            "1": "http://16.32.2.2:9134/v1/chat/completions",
+        },
+    }
+    verdict = diff_topology(LwdTopology.from_dict(old), LwdTopology.from_dict(new))
+    assert isinstance(verdict, LwdTopologyIncrement)
+    assert verdict.new_cloud_ids == (1,)
+
+
+def test_map_growth_accumulates_across_increments() -> None:
+    """The realized snapshot never advances, so a later update's file
+    still carries every runtime-added cloud's key — the exemption masks by
+    'clouds not in the OLD topology', so growth accumulated over several
+    increments stays legal in one jump."""
+    old = _payload(1)
+    old["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {"0": "http://16.32.2.2:9133/v1/chat/completions"},
+    }
+    new = _payload(3)
+    new["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {
+            "0": "http://16.32.2.2:9133/v1/chat/completions",
+            "1": "http://16.32.2.2:9134/v1/chat/completions",
+            "2": "http://16.32.2.2:9135/v1/chat/completions",
+        },
+    }
+    verdict = diff_topology(LwdTopology.from_dict(old), LwdTopology.from_dict(new))
+    assert isinstance(verdict, LwdTopologyIncrement)
+    assert verdict.new_cloud_ids == (1, 2)
+
+
+def test_a_map_growth_for_a_key_no_new_cloud_owns_is_rejected() -> None:
+    old = _payload(1)
+    old["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {"0": "http://16.32.2.2:9133/v1/chat/completions"},
+    }
+    new = _payload(2)
+    new["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {
+            "0": "http://16.32.2.2:9133/v1/chat/completions",
+            "7": "http://16.32.2.2:9997/v1/chat/completions",
+        },
+    }
+    assert (
+        "edge 0.coordination.control_url_map.7" in _rejected(old, new)
+    )
+
+
+def test_rewriting_an_existing_map_entry_is_rejected() -> None:
+    old = _payload(1)
+    old["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {"0": "http://16.32.2.2:9133/v1/chat/completions"},
+    }
+    new = _payload(2)
+    new["edges"][0]["coordination"] = {
+        "enabled": True,
+        "control_url_map": {
+            "0": "http://16.32.2.2:9999/v1/chat/completions",
+            "1": "http://16.32.2.2:9134/v1/chat/completions",
+        },
+    }
+    assert (
+        "edge 0.coordination.control_url_map.0: "
+        "'http://16.32.2.2:9133/v1/chat/completions' -> "
+        "'http://16.32.2.2:9999/v1/chat/completions'" in _rejected(old, new)
+    )
 
 
 def test_shrink_is_rejected() -> None:
@@ -295,6 +384,9 @@ def test_cloud_share_rejects_a_new_cloud() -> None:
             ],
         }
     )
+    # Keep the count declarations consistent so the count-consistency
+    # validation stays out of the way and the SCENE rule answers.
+    raw["deployment"]["clouds_num"] = 2
     with pytest.raises(ValueError, match="one cloud"):
         LwdTopology.from_dict(raw)
 
@@ -304,9 +396,16 @@ def test_cloud_share_rejects_a_scene_flip() -> None:
 
 
 def test_single_instance_has_no_runtime_update_semantics() -> None:
-    """An edge_share pair flipped to single_instance parses clean in both
-    files (same shape), so R0's scene check is what refuses it —
-    restarting is the only way to change that plan."""
+    """A single_instance deployment has no runtime-update semantics even
+    when both files carry the scene and the content moved (a qos change,
+    say) — restarting is the only way to change that plan. A scene FLIP
+    is a different rule, already covered by R0's scene-change rejection
+    in test_scene_change_is_rejected."""
     single = _payload(1)
     single["deployment"]["scene"] = "single_instance"
-    assert "no runtime-update semantics" in _rejected(_payload(1), single)
+    changed = deepcopy(single)
+    changed["qos"] = {
+        "data_plane": {"traffic_class": 139, "sl": 3},
+        "ctrl_plane": {"dscp": 46},
+    }
+    assert "no runtime-update semantics" in _rejected(single, changed)

@@ -286,10 +286,11 @@ def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     """lwd_cluster routing fix: the probe manager's cloud set — the
     health rotation and the URL map — was frozen at startup, so after a
     2e1c -> 2e2c scale-out every probe (and the routing preference it
-    produces) stayed pinned to cloud 0. The apply hook now derives the
-    adopted cloud's coordination URL from ITS instance block — the edge's
-    own block stays byte-identical by the increment contract, so it
-    cannot carry the URL — and registers it for probe targeting."""
+    produces) stayed pinned to cloud 0. When the operator does NOT grow
+    this edge's own URL map (kept frozen here), the apply hook derives
+    the adopted cloud's URL from ITS instance block and registers it for
+    probe targeting; the operator-map variant is covered by the test
+    below."""
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _cluster_payload(2, 1))
     engine = _engine(topology_file, _cluster_payload(2, 1))
@@ -319,6 +320,25 @@ def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     # back: the next increment retries only the data-plane half).
     assert (1, 0) in engine._lwd_runtime_connections
     assert (1, 0) not in engine._lwd_armed_connections
+
+
+def test_a_lwd_cluster_scale_out_prefers_the_operators_grown_map(
+    tmp_path: Path,
+) -> None:
+    """The relaxed R2 lets an edge's own control_url_map grow with the
+    new cloud (the natural hand edit) — that explicit entry WINS over the
+    derivation from the cloud's block. The payload's map template pins
+    port 8100 while cloud 1's listener sits on 8101, so the assertion
+    tells the two sources apart."""
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _cluster_payload(2, 1))
+    engine = _engine(topology_file, _cluster_payload(2, 1))
+    _write(topology_file, _cluster_payload(2, 2))  # the maps grew with cloud 1
+    verdict = engine._lwd_process_topology_reload()
+    assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
+    assert engine._lwd_probe_manager.registered == [
+        (1, "http://16.32.10.11:8100/v1/chat/completions")
+    ]
 
 
 def test_applying_the_same_increment_twice_adds_each_link_once(
