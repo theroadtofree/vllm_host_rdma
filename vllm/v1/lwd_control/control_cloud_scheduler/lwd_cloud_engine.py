@@ -645,13 +645,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_wire_runtime_hint_mq(self, connection: LwdConnectionId) -> None:
         """C-4: wire one runtime connection's hint/done MQ pair — the
-        engine creates the hint MQ (exported to the env for the worker),
-        registers the hint sender, RPCs the worker to attach/create the
-        per-connection MQs, and stores the returned done MQ handle for
-        the drain loop. Idempotent: an already-wired connection skips."""
+        engine creates the hint MQ, registers the hint sender, RPCs the
+        worker to attach/create the per-connection MQs (passing the hint
+        MQ's handle explicitly: env vars do NOT cross the process
+        boundary in MultiprocExecutor at runtime — they only work at
+        startup where workers inherit the engine's env), and stores the
+        returned done MQ handle for the drain loop. Idempotent: an
+        already-wired connection skips."""
         if connection in self._lwd_hint_mqs:
             return
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            _encode_handle,
             create_hint_mq,
             register_hint_sender,
         )
@@ -659,10 +663,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         hint_mq = create_hint_mq(connection)
         self._lwd_hint_mqs[connection] = hint_mq
         register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint), connection)
+        hint_handle_str = _encode_handle(hint_mq.export_handle())
         handles = [
             handle
             for handle in self.model_executor.collective_rpc(
-                "lwd_attach_runtime_connection_mqs", args=(connection,)
+                "lwd_attach_runtime_connection_mqs",
+                args=(connection, hint_handle_str),
             )
             if handle is not None
         ]
