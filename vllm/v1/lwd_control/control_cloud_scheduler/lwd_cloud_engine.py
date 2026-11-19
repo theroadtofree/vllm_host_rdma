@@ -231,9 +231,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_rejected_nonces: dict[str, int] = {}
         self._lwd_request_routes: dict[str, LwdPeer] = {}
         self._lwd_retired_routes: dict[str, LwdPeer] = {}
-        self._lwd_pending_seqnos: dict[
-            LwdConnectionId, dict[int, set[str]]
-        ] = {}
+        self._lwd_pending_seqnos: dict[LwdConnectionId, dict[int, set[str]]] = {}
         self._lwd_request_seqnos: dict[str, set[int]] = {}
         self._lwd_latest_seqnos: dict[LwdConnectionId, int] = {}
         self._lwd_failed_connections: set[LwdConnectionId] = set()
@@ -399,9 +397,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             raise RuntimeError(f"[LWD] prefix reply route missing for {request_id}")
         self._lwd_send_until_queued(
             peer,
-            LwdPrefixReadyNotify(
-                unwrap_req_id(request_id), hit_tokens, nonce, error
-            ),
+            LwdPrefixReadyNotify(unwrap_req_id(request_id), hit_tokens, nonce, error),
         )
         lwd_logger.info(
             "[prefix] READY req=%s hit=%d nonce=%d error=%r",
@@ -548,9 +544,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             try:
                 self._lwd_handle_edge_message(peer, msg)
             except Exception as exc:
-                lwd_logger.exception(
-                    "[cloud] ingest of %s failed", type(msg).__name__
-                )
+                lwd_logger.exception("[cloud] ingest of %s failed", type(msg).__name__)
                 self._lwd_fail(f"ingest of {type(msg).__name__}: {exc!r}")
             return
         super()._handle_client_request(request_type, request)
@@ -609,16 +603,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
-        """C-2/C-3: admit each new edge to the handshake allowlist, then
-        build its data-plane pair on the shared listener. The rest of
-        the join is the existing runtime machinery — registration resets
-        the seqno ledgers and resends the scheduling limits, the
-        heartbeat fan-out picks the peer up from `_lwd_edges` — and the
-        hint MQ pair is C-4. A data-plane refusal keeps the edge
-        control-plane only (its UP frames bounce off the listener and
-        retry); the next detected increment retries. Idempotent per
-        edge and per connection: replays do not disturb the live
-        allowlist or the listener's route table."""
+        """C-2/C-3/C-4: admit each new edge to the handshake allowlist,
+        build its data-plane pair on the shared listener, and wire its
+        hint/done MQ pair. The rest of the join is the existing runtime
+        machinery — registration resets the seqno ledgers and resends
+        the scheduling limits, the heartbeat fan-out picks the peer up
+        from `_lwd_edges`. A data-plane or MQ refusal keeps the edge
+        control-plane only; the next detected increment retries.
+        Idempotent per edge and per connection: replays do not disturb
+        the live allowlist, the listener's route table or the MQs."""
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdCloudControlPlane)
         for edge_id in increment.new_edge_ids:
@@ -638,10 +631,48 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 )
                 continue
             lwd_logger.info(
-                "[LWD] runtime connection %s built (serve pair on the "
-                "shared listener)",
+                "[LWD] runtime connection %s built (serve pair on the shared listener)",
                 connection.connection_id,
             )
+            self._lwd_wire_runtime_hint_mq(connection.connection_id)
+
+    def _lwd_wire_runtime_hint_mq(self, connection: LwdConnectionId) -> None:
+        """C-4: wire one runtime connection's hint/done MQ pair — the
+        engine creates the hint MQ (exported to the env for the worker),
+        registers the hint sender, RPCs the worker to attach/create the
+        per-connection MQs, and stores the returned done MQ handle for
+        the drain loop. Idempotent: an already-wired connection skips."""
+        if connection in self._lwd_hint_mqs:
+            return
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            create_hint_mq,
+            register_hint_sender,
+        )
+
+        hint_mq = create_hint_mq(connection)
+        self._lwd_hint_mqs[connection] = hint_mq
+        register_hint_sender(lambda hint, mq=hint_mq: mq.enqueue(hint), connection)
+        handles = [
+            handle
+            for handle in self.model_executor.collective_rpc(
+                "lwd_attach_runtime_connection_mqs", args=(connection,)
+            )
+            if handle is not None
+        ]
+        if len(handles) != 1:
+            lwd_logger.error(
+                "[LWD] runtime MQ wiring failed for %s: expected one "
+                "endpoint worker to report a done MQ handle, got %d",
+                connection,
+                len(handles),
+            )
+            return
+        from vllm.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
+        self._lwd_done_mqs[connection] = MessageQueue.create_from_handle(handles[0], 0)
+        lwd_logger.info("[LWD] runtime hint/done MQs wired for %s", connection)
 
     def _lwd_handle_range_notify(
         self, connection_id: LwdConnectionId, notify: LwdRangeNotify
@@ -658,7 +689,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             and current_nonces[item.request_id] != item.prefix_nonce
             for item in notify.items
         ):
-            lwd_logger.warning("[cloud] ignore stale RangeNotify seqno=%d", notify.seqno)
+            lwd_logger.warning(
+                "[cloud] ignore stale RangeNotify seqno=%d", notify.seqno
+            )
             return
         latest = self._lwd_latest_seqnos.get(connection_id, -1)
         if notify.seqno <= latest:
@@ -717,15 +750,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         request_ids: list[str],
     ) -> None:
         self._lwd_latest_seqnos[connection_id] = seqno
-        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(
-            request_ids
-        )
+        self._lwd_pending_seqnos.setdefault(connection_id, {})[seqno] = set(request_ids)
         for request_id in request_ids:
             self._lwd_request_seqnos.setdefault(request_id, set()).add(seqno)
 
-    def _lwd_complete_seqno(
-        self, connection_id: LwdConnectionId, seqno: int
-    ) -> None:
+    def _lwd_complete_seqno(self, connection_id: LwdConnectionId, seqno: int) -> None:
         pending_by_seqno = self._lwd_pending_seqnos.get(connection_id)
         if pending_by_seqno is None:
             return
@@ -1089,11 +1118,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                         "[pre-recv] done MQ drain failed for %s", connection
                     )
                     break
-                if (
-                    isinstance(item, tuple)
-                    and item
-                    and item[0] == "refill_done"
-                ):
+                if isinstance(item, tuple) and item and item[0] == "refill_done":
                     if len(item) == 2:
                         self.scheduler.lwd_refill_done(str(item[1]))
                     elif len(item) == 3:
@@ -1113,18 +1138,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     )
                     self._lwd_retire_connection_requests(connection)
                     continue
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 4
-                    and item[1] == "error"
-                ):
+                if isinstance(item, tuple) and len(item) == 4 and item[1] == "error":
                     self._lwd_fail_connection(connection, item[2], item[3])
                     continue
-                if (
-                    isinstance(item, tuple)
-                    and len(item) == 3
-                    and item[0] == "error"
-                ):
+                if isinstance(item, tuple) and len(item) == 3 and item[0] == "error":
                     self._lwd_fail_connection(connection, item[1], item[2])
                     continue
                 if (
@@ -1166,9 +1183,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         self._lwd_retire_connection_requests(connection)
 
-    def _lwd_retire_connection_requests(
-        self, connection: LwdConnectionId
-    ) -> None:
+    def _lwd_retire_connection_requests(self, connection: LwdConnectionId) -> None:
         """Abort every request routed to one connection without deciding
         whether the connection may come back: the permanent failed marking
         stays with the caller (a link error retires its in-flight requests
@@ -1261,16 +1276,15 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 assert peer is not None
                 restored = msgspec.structs.replace(
                     notify,
-                    req_ids=[unwrap_req_id(request_id) for request_id in notify.req_ids],
+                    req_ids=[
+                        unwrap_req_id(request_id) for request_id in notify.req_ids
+                    ],
                 )
                 self._lwd_send_until_queued(peer, restored)
                 # Finished routes stay pinned until every pending C2E has
                 # flushed; later zero-accepted/retirement notices are legal.
                 for index, request_id in enumerate(notify.req_ids):
-                    if (
-                        notify.finish_reasons
-                        and notify.finish_reasons[index] != -1
-                    ):
+                    if notify.finish_reasons and notify.finish_reasons[index] != -1:
                         finished_ids.append(request_id)
             self.scheduler.pending_c2e.clear()
             for request_id in finished_ids:

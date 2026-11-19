@@ -281,6 +281,27 @@ calls `notify_data_plane_added(connection)` per new connection —
 a refusal keeps the edge control-plane only (UP frames retry the
 listener; the next topology change retries the build).
 
+**C-4 detail (2026-11-19)**: the hint/done MQ pair for a late edge —
+the ONE genuinely new mechanism of the cloud_share chain (in
+edge_share, a new cloud is a fresh process whose MQs exist from its
+own init):
+
+* **Engine** (`_lwd_wire_runtime_hint_mq`): `create_hint_mq`
+  (exported to the env for the worker), `register_hint_sender`,
+  `collective_rpc("lwd_attach_runtime_connection_mqs")`, and the
+  returned done MQ handle stored for the drain loop. Idempotent per
+  connection.
+* **Worker** (`lwd_attach_runtime_connection_mqs`): attaches the
+  hint MQ from the env, creates the done MQ, adds both to the
+  per-connection dicts, returns the done MQ handle. Idempotent.
+* **Early-recv loop**: the one-time snapshot
+  (`hint_mqs = self._irecv_hint_mqs or ...`) became a per-iteration
+  `tuple()` snapshot — a runtime-added connection joins the loop on
+  the next tick (the engine thread's insert and the early-recv
+  thread's iteration are concurrent; `tuple(dict.items())` completes
+  in C, a Python-level iteration would raise). This also closes the
+  latent P1-family risk for the STARTUP connections' dict.
+
 Acceptance: 1-edge cloud_share running → grow the cloud host's yaml to
 2 edges → launch edge 1 → the cloud's watch fires, the edge registers,
 its UCX pair builds on the shared listener → requests through edge 1

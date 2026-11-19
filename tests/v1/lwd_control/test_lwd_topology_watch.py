@@ -426,19 +426,36 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
     _cloud_share_write(topology_file, 1)
     engine = object.__new__(LwdCloudEngineCore)
     engine._lwd_control_plane = _RecordingCloudPlane()
+    engine._lwd_hint_mqs = {}
+    engine._lwd_done_mqs = {}
+    engine.model_executor = SimpleNamespace(
+        collective_rpc=lambda name, args=None: [b"handle"]
+    )
+    wired: list = []
+
+    def fake_wire(connection: LwdConnectionId) -> None:
+        wired.append(connection)
+        engine._lwd_hint_mqs[connection] = "hint-mq"
+        engine._lwd_done_mqs[connection] = "done-mq"
+
+    monkeypatch.setattr(engine, "_lwd_wire_runtime_hint_mq", fake_wire)
     _cloud_share_write(topology_file, 2)
     verdict = engine._lwd_process_topology_reload()
     assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
     assert verdict.new_edge_ids == (1,)
     assert engine._lwd_control_plane.allowed == [1]
-    # The data-plane hook fired for the new connection.
+    # The data-plane hook fired and the MQ wiring ran.
     assert built == [LwdConnectionId(1, 0, 0)]
+    assert wired == [LwdConnectionId(1, 0, 0)]
+    assert engine._lwd_hint_mqs == {LwdConnectionId(1, 0, 0): "hint-mq"}
+    assert engine._lwd_done_mqs == {LwdConnectionId(1, 0, 0): "done-mq"}
     # A replay of the same increment: allow_edge fires again (idempotent),
-    # and the data-plane hook fires again (the ascend builder is
-    # idempotent on the connection's key).
+    # the data-plane hook fires again, but the MQ wiring skips (already
+    # wired).
     engine._lwd_apply_topology_increment(verdict)
     assert engine._lwd_control_plane.allowed == [1, 1]
     assert built == [LwdConnectionId(1, 0, 0), LwdConnectionId(1, 0, 0)]
+    assert wired == [LwdConnectionId(1, 0, 0)]  # not re-wired
 
 
 def _cloud_share_write(path: Path, edges: int) -> None:
