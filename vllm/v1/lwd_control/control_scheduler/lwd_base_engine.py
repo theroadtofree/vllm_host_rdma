@@ -151,10 +151,14 @@ class LwdBaseEngineCore(EngineCoreProc):
         """The shared side of a scene watches its plan: the edge engine in
         edge_share (clouds are added to the running shared engine), the
         cloud engine in cloud_share (edges are added to the running shared
-        cloud). The other side always starts fresh with the grown yaml and
-        needs no watch. Device comm never watches — the HCCL path stays
-        untouched."""
+        cloud). In lwd_cluster BOTH sides watch — each edge engine detects
+        new clouds to connect to, each cloud engine detects new edges to
+        accept; each applies only the connections of its own instance
+        (see the apply hooks). Device comm never watches — the HCCL path
+        stays untouched."""
         scene = self.lwd_config.topology.deployment.scene
+        if scene == "lwd_cluster":
+            return self.lwd_config.topology.is_host_comm
         watched = "edge_share" if self.lwd_config.role == "edge" else "cloud_share"
         return self.lwd_config.topology.is_host_comm and scene == watched
 

@@ -611,14 +611,30 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         the live allowlist, the listener's route table or the MQs."""
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdCloudControlPlane)
+        # In lwd_cluster each cloud engine serves only its own instance's
+        # connections (other cloud engines watch the same file and apply
+        # their own). In cloud_share this filter is a no-op (every new
+        # connection goes to the single shared cloud).
+        my_connections = [
+            connection
+            for connection in increment.new_connections
+            if connection.cloud_id == self.lwd_config.instance_id
+        ]
         for edge_id in increment.new_edge_ids:
+            # Only admit edges that connect to THIS cloud.
+            if not any(
+                c.edge_id == edge_id
+                and c.cloud_id == self.lwd_config.instance_id
+                for c in my_connections
+            ):
+                continue
             plane.allow_edge(edge_id)
             lwd_logger.info(
                 "[cloud] edge %d admitted to the handshake allowlist "
                 "(topology increment)",
                 edge_id,
             )
-        for connection in increment.new_connections:
+        for connection in my_connections:
             # The UCX listener, token route table and IO registry live in
             # the WORKER processes (MultiprocExecutor); the data-plane
             # hook registry is process-local and empty in the EngineCore.

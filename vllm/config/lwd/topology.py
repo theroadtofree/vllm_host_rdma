@@ -739,7 +739,11 @@ def diff_topology(
         return LwdTopologyUpdateRejected(
             f"scene changed: {old.deployment.scene} -> {new.deployment.scene}"
         )
-    if old.deployment.scene not in ("edge_share", "cloud_share"):
+    if old.deployment.scene not in (
+        "edge_share",
+        "cloud_share",
+        "lwd_cluster",
+    ):
         return LwdTopologyUpdateRejected(
             f"scene {old.deployment.scene} has no runtime-update "
             "semantics; restart the engine to change its plan"
@@ -797,7 +801,7 @@ def diff_topology(
                 f"additions must be instance pairs: {len(new_edge_ids)} "
                 f"edge(s) vs {len(new_cloud_ids)} cloud(s)"
             )
-    else:  # cloud_share
+    elif old.deployment.scene == "cloud_share":
         if new_cloud_ids:
             return LwdTopologyUpdateRejected(
                 f"cloud_share additions are edges only; new cloud(s) "
@@ -811,7 +815,16 @@ def diff_topology(
                     f"existing cloud; got edge {link.edge} - cloud "
                     f"{link.cloud}"
                 )
+    # lwd_cluster needs no shape-specific check: the full-mesh scene
+    # validation already enforces that every new edge links every cloud
+    # and every new cloud is linked from every edge.
     connections: list[LwdDPConnection] = []
     for link in added_links:
-        connections.extend(new.connections("edge", link.edge))
+        # Filter by the link's cloud: in lwd_cluster a new cloud means
+        # existing edges gain a connection to it, and `connections("edge",
+        # edge)` returns ALL of that edge's pairs — only the one to this
+        # link's cloud is new. In edge_share/cloud_share the filter is a
+        # no-op (a new edge's every connection is new).
+        edge_conns = new.connections("edge", link.edge)
+        connections.extend(conn for conn in edge_conns if conn.cloud_id == link.cloud)
     return LwdTopologyIncrement(new_edge_ids, new_cloud_ids, tuple(connections), new)

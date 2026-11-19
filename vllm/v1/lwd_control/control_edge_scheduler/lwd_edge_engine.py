@@ -212,6 +212,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdEdgeControlPlane)
         for connection in increment.new_connections:
+            # In lwd_cluster each edge engine serves only its own
+            # instance's connections (other engines watch the same file
+            # and apply their own). In edge_share the shared engine's
+            # lwd_config.connections spans every logical edge, so this
+            # filter is a no-op there.
+            if connection.edge_id not in {
+                c.edge_id for c in self.lwd_config.connections
+            }:
+                continue
             key = (connection.cloud_id, connection.dp_idx)
             if key in self._lwd_runtime_connections:
                 if key not in self._lwd_armed_connections:
