@@ -47,12 +47,16 @@ import ctypes
 import queue
 from typing import Any
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 # --------------------------------------------------------------------- #
 # Block pool defaults (wire constructor defaults; the assembly layer can #
 # override them via its constructor args and does the env parsing).      #
 # --------------------------------------------------------------------- #
 _DEFAULT_BLOCK_MB = 128
-_DEFAULT_N_BLOCKS = 4
+_DEFAULT_N_BLOCKS = 2
 
 
 class LwdUcxBlock:
@@ -119,9 +123,17 @@ class LwdUcxBlockPool:
         """Take one free buffer; on timeout return None. The waiting policy
         belongs to the caller."""
         try:
-            return self._free.get(timeout=timeout)
+            blk = self._free.get(timeout=timeout)
         except queue.Empty:
             return None
+        n_used = len(self.blocks) - self._free.qsize()
+        if n_used == _DEFAULT_N_BLOCKS:
+            logger.error(
+                "[ucx-pool] N_BLOCKS usage reached %d/%d",
+                n_used,
+                len(self.blocks),
+            )
+        return blk
 
     def release(self, blk: LwdUcxBlock) -> None:
         """Return a block: the shared entry point for send-completion
