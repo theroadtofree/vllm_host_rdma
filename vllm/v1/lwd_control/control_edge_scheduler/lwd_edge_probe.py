@@ -95,6 +95,10 @@ class LwdEdgeProbeManager:
         # added mid-run brings its URL here instead of the startup map.
         self._runtime_urls: dict[int, str] = {}
 
+    def rotation(self) -> tuple[int, ...]:
+        """Cloud ids the health rotation may target (diagnostics)."""
+        return self._health.cloud_ids
+
     def register_cloud(self, cloud_id: int, url: str) -> None:
         """Teach the manager a runtime-adopted cloud's coordination URL and
         open it for probe targeting (elastic scale-out). First
@@ -197,9 +201,21 @@ class LwdEdgeProbeManager:
         # preference they produce — spread over all adopted clouds.
         target_cloud = self._health.next()
         if target_cloud is None:
+            logger.error(
+                "[LWD] probe enabled but the rotation is empty "
+                "(runtime=%s map_keys=%s)",
+                sorted(self._runtime_urls),
+                sorted(coordination.control_url_map),
+            )
             return False
         url = self._url_for(target_cloud)
         if url is None:
+            logger.error(
+                "[LWD] no coordination URL for probe target cloud=%d "
+                "(rotation=%s); request falls back to full prefill",
+                target_cloud,
+                self.rotation(),
+            )
             return False
         cloud_id = target_cloud
         block_size = self._hash_sizes.get(
@@ -266,7 +282,13 @@ class LwdEdgeProbeManager:
             try:
                 outcome = future.result()
             except Exception:
-                logger.warning("[LWD] probe failed; using full prefill", exc_info=True)
+                logger.warning(
+                    "[LWD] probe to cloud=%d failed (url=%s); using full "
+                    "prefill",
+                    target_cloud,
+                    url,
+                    exc_info=True,
+                )
                 outcome = (None, manifest_chain)
             enqueue(outcome)
 
@@ -291,7 +313,19 @@ class LwdEdgeProbeManager:
             del self._inflight[request_id]
             if target is not None:
                 if outcome is None or outcome[0] is None:
-                    self._health.record_failure(target)
+                    if self._health.record_failure(target):
+                        # The rotation skips this cloud until its cooldown
+                        # expires (or a probe succeeds after it) — the
+                        # "all requests stayed on the other cloud"
+                        # signature when the target is a runtime-adopted
+                        # cloud whose HTTP endpoint is not answering.
+                        logger.warning(
+                            "[LWD] probe target cloud=%d entered cooldown "
+                            "after repeated failures (url=%s); it re-enters "
+                            "the rotation once a probe succeeds",
+                            target,
+                            self._url_for(target),
+                        )
                 else:
                     self._health.record_success(target)
             if outcome is None:

@@ -240,6 +240,21 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"[LWD] no cloud connection for edge_id={edge_id} "
                 f"(request {request_id})"
             )
+        if preferred is not None and preferred not in candidates:
+            # The probe produced a preference the router cannot honor: the
+            # connection is not an armed routing candidate (data-plane
+            # build refused, or this edge adopted it but the scheduler
+            # never armed it). The request silently falls back — this log
+            # is the elastic scale-out diagnosis cue.
+            lwd_logger.error(
+                "[LWD] preferred %s is not a routing candidate for "
+                "edge_id=%d (request %s): candidates=%s; falling back to "
+                "score/round-robin",
+                preferred,
+                edge_id,
+                request_id,
+                [cid for cid in candidates],
+            )
         if preferred is not None and preferred in candidates:
             best = candidates[preferred]
         elif len(candidates) == 1:

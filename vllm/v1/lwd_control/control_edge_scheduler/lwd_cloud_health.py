@@ -26,6 +26,11 @@ class LwdCloudHealthTracker:
         self._failures[cloud_id] = 0
         self._cloud_ids = tuple(sorted(self._failures))
 
+    @property
+    def cloud_ids(self) -> tuple[int, ...]:
+        """The full rotation, cooling-down clouds included (diagnostics)."""
+        return self._cloud_ids
+
     def candidates(self, now: float | None = None) -> tuple[int, ...]:
         now = time.monotonic() if now is None else now
         healthy = tuple(
@@ -56,9 +61,13 @@ class LwdCloudHealthTracker:
         now: float | None = None,
         threshold: int = 3,
         cooldown_s: float = 60.0,
-    ) -> None:
+    ) -> bool:
+        """Count one probe failure. Returns True when this failure put
+        the cloud into cooldown (the caller's diagnostics cue)."""
         now = time.monotonic() if now is None else now
         failures = self._failures.get(cloud_id, 0) + 1
         self._failures[cloud_id] = failures
         if failures >= threshold:
             self._cooldown_until[cloud_id] = now + cooldown_s
+            return True
+        return False

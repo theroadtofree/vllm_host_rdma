@@ -224,6 +224,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 scene == "lwd_cluster"
                 and connection.edge_id != self.lwd_config.instance_id
             ):
+                lwd_logger.info(
+                    "[LWD] topology increment %s skipped: owned by edge %d "
+                    "(this engine serves edge %d)",
+                    connection.connection_id,
+                    connection.edge_id,
+                    self.lwd_config.instance_id,
+                )
                 continue
             key = (connection.cloud_id, connection.dp_idx)
             if key in self._lwd_runtime_connections:
@@ -275,9 +282,25 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         control-plane DEALER dials)."""
         coordination = topology.instance("cloud", cloud_id).coordination
         if coordination is None or not coordination.enabled:
+            # Every lwd_cluster/cloud_share cloud carries an enabled
+            # coordination block (scene validation), so this branch means
+            # an edge_share-scale cloud without one: no probe targeting
+            # for it, by design.
+            lwd_logger.info(
+                "[LWD] probe cloud %d not registered: no enabled "
+                "coordination block",
+                cloud_id,
+            )
             return
-        self._lwd_probe_manager.register_cloud(
-            cloud_id, f"http://{cloud_dp.addr}:{coordination.listen_port}"
+        url = f"http://{cloud_dp.addr}:{coordination.listen_port}"
+        self._lwd_probe_manager.register_cloud(cloud_id, url)
+        lwd_logger.info(
+            "[LWD] probe cloud registered: cloud=%d url=%s rotation=%s "
+            "(probes — and the routing preference they produce — now "
+            "spread over every adopted cloud)",
+            cloud_id,
+            url,
+            self._lwd_probe_manager.rotation(),
         )
 
     def _lwd_arm_runtime_connection(self, connection: LwdDPConnection) -> None:
@@ -553,6 +576,15 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.aborts_queue.put_nowait([request.request_id])
             return
         dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+        # The one line that answers "which cloud did this request go to":
+        # routed-connection vs preferred-connection contrast exposes a
+        # dropped probe preference (None = round-robin/scoring decided).
+        lwd_logger.info(
+            "[edge] request routed req=%s -> %s (probe preferred=%s)",
+            request.request_id,
+            dp_idx,
+            preferred,
+        )
         if dp_idx not in self._lwd_clouds:
             # Elastic partial start: routing scored a planned connection
             # whose cloud is not adopted yet (a multi-cloud-per-edge pick
@@ -650,7 +682,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
             if candidate in self._lwd_clouds:
                 return candidate
-        return next(
+        preferred = next(
             (
                 connection_id
                 for connection_id in sorted(self._lwd_clouds)
@@ -658,6 +690,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             ),
             None,
         )
+        if preferred is None:
+            # The probe SUCCEEDED against this cloud but the engine has no
+            # adopted connection for it: the routing preference the probe
+            # produced is dropped and the request falls back to
+            # score/round-robin. On a scaled-out deployment this means the
+            # control-plane join (handshake → params → adopt) of the new
+            # cloud never completed on this edge.
+            lwd_logger.error(
+                "[edge] probe preferred cloud=%d engine=%s but it is not "
+                "adopted (adopted=%s); routing falls back to round-robin",
+                cloud_id,
+                engine,
+                sorted(self._lwd_clouds),
+            )
+        return preferred
 
     def _lwd_drain_probe_completions(self) -> None:
         for completion in self._lwd_probe_manager.drain():

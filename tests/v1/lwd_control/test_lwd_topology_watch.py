@@ -67,6 +67,9 @@ class _RecordingProbeManager:
     def register_cloud(self, cloud_id: int, url: str) -> None:
         self.registered.append((cloud_id, url))
 
+    def rotation(self) -> tuple[int, ...]:
+        return tuple(cloud_id for cloud_id, _ in self.registered)
+
 
 class _RecordingScheduler:
     """Stands in for the scheduler: records runtime-connection seeds and
@@ -411,6 +414,16 @@ def test_the_watch_thread_queues_one_tick_per_change(
     engine._lwd_start_topology_watch()
     try:
         _write(topology_file, _payload(2))
+        # Windows file timestamps share the ~15.6ms system-clock tick, so
+        # a replace milliseconds after the startup write can keep the SAME
+        # mtime and the watcher (correctly) sees no change. Linux (the
+        # deployment target) has nanosecond granularity; nudge the mtime
+        # deterministically so the test never depends on the clock.
+        stat = topology_file.stat()
+        os.utime(
+            topology_file,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000),
+        )
         deadline = time.monotonic() + 2.0
         while not engine.input_queue.items:
             assert time.monotonic() < deadline, "watch thread never ticked"

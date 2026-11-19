@@ -142,6 +142,19 @@ class LwdBaseEngineCore(EngineCoreProc):
         # the scene watches its plan (see _lwd_topology_watch_enabled).
         if self._lwd_topology_watch_enabled():
             self._lwd_start_topology_watch()
+        else:
+            # Diagnosis anchor: a host-comm lwd_cluster deployment must land
+            # in the OTHER branch on both roles. Anything unexpected here
+            # means the gate read a different scene/comm than the
+            # deployment intends, and every later "why didn't the edge see
+            # the new cloud" question starts at this line.
+            lwd_logger.info(
+                "[LWD] topology watch NOT started: role=%s scene=%s "
+                "host_comm=%s",
+                self.lwd_config.role,
+                self.lwd_config.topology.deployment.scene,
+                self.lwd_config.topology.is_host_comm,
+            )
 
     def _lwd_assemble(self) -> None:
         """Role setup once the engine is built, including the control plane."""
@@ -213,7 +226,22 @@ class LwdBaseEngineCore(EngineCoreProc):
         except ValueError as exc:
             lwd_logger.error("[LWD] topology update rejected: invalid file: %s", exc)
             return LwdTopologyUpdateRejected(reason=f"invalid file: {exc}")
+        except OSError as exc:
+            # The atomic-replace window (or a transient FS error): the file
+            # vanished between the watcher's stat and this read. Serving
+            # continues on the realized snapshot; the next tick retries.
+            lwd_logger.error(
+                "[LWD] topology update rejected: unreadable file: %s", exc
+            )
+            return LwdTopologyUpdateRejected(reason=f"unreadable file: {exc}")
         if candidate.digest == self._lwd_topology_file_digest:
+            # The file moved (mtime ticked) but its canonical content is
+            # identical — comments/formatting only. The watcher IS alive;
+            # there is simply nothing to apply.
+            lwd_logger.info(
+                "[LWD] topology file changed but the canonical digest is "
+                "identical; nothing to apply"
+            )
             return None
         self._lwd_topology_file_digest = candidate.digest
         verdict = diff_topology(self.lwd_config.topology, candidate)
@@ -221,6 +249,14 @@ class LwdBaseEngineCore(EngineCoreProc):
             lwd_logger.error("[LWD] topology update rejected: %s", verdict.reason)
             return verdict
         if not verdict.new_connections:
+            # The file's semantics moved (e.g. a tunable-only change) but
+            # nothing this engine can apply arrived.
+            lwd_logger.info(
+                "[LWD] topology update accepted with no new connections: "
+                "new_edge_ids=%s new_cloud_ids=%s",
+                list(verdict.new_edge_ids),
+                list(verdict.new_cloud_ids),
+            )
             return None
         lwd_logger.info(
             "[LWD] topology increment detected: +%d edge(s) %s, +%d cloud(s) "
