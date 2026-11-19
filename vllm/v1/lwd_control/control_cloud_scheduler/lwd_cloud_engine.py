@@ -50,9 +50,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdCloudControlPlane,
     LwdPeerNotRegisteredError,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
-    notify_data_plane_added,
-)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -622,7 +619,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 edge_id,
             )
         for connection in increment.new_connections:
-            if not notify_data_plane_added(connection):
+            # The UCX listener, token route table and IO registry live in
+            # the WORKER processes (MultiprocExecutor); the data-plane
+            # hook registry is process-local and empty in the EngineCore.
+            # Build via collective_rpc: the endpoint Worker (the one
+            # that owns the shared listener) does the work, others return
+            # None (not their job, distinct from False = refused).
+            results = self.model_executor.collective_rpc(
+                "lwd_build_runtime_connection", args=(connection,)
+            )
+            built = any(result is True for result in results)
+            if not built:
                 lwd_logger.error(
                     "[LWD] data-plane build refused for %s; the edge's UP "
                     "frames will keep retrying the listener (retried on "
