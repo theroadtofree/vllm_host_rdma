@@ -336,8 +336,11 @@ layers:
 * **The edge engine's `_lwd_apply_topology_increment`** derives the
   adopted cloud's URL from ITS instance block in
   `increment.new_topology` — `http://{cloud_dp.addr}:{coordination.
-  listen_port}` (the dp address is the same routable host the
-  control-plane DEALER dials) — and registers it before the arm
+  listen_port}{path}` (the dp address is the same routable host the
+  control-plane DEALER dials; the PATH is borrowed from this edge's own
+  startup control_url, because the probe POSTs to the full URL — the
+  cloud app routes `/v1/chat/completions` — and the topology stores
+  host/port per cloud only) — and registers it before the arm
   attempt: a refused data-plane build never rolls the registration
   back, and a cloud that is still loading simply accrues probe
   failures → cooldown → recovery (the tracker's existing semantics;

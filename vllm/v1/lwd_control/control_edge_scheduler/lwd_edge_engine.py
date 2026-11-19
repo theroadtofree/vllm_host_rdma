@@ -22,6 +22,7 @@ import threading
 import time
 from collections import deque
 from typing import Any
+from urllib.parse import urlparse
 
 from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
 from vllm.config.lwd.topology import LwdDP, LwdDPConnection, LwdTopology
@@ -302,7 +303,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 cloud_id,
             )
             return
-        url = f"http://{cloud_dp.addr}:{coordination.listen_port}"
+        url = f"http://{cloud_dp.addr}:{coordination.listen_port}{self._lwd_probe_url_path()}"
         self._lwd_probe_manager.register_cloud(cloud_id, url)
         lwd_logger.error(
             "[LWD] probe cloud registered: cloud=%d url=%s rotation=%s "
@@ -312,6 +313,22 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             url,
             self._lwd_probe_manager.rotation(),
         )
+
+    def _lwd_probe_url_path(self) -> str:
+        """Path component shared by every cloud's coordination endpoint
+        (they all run the same control app). The topology carries only
+        host/port per cloud — the path lives in this edge's own startup
+        URL, so the runtime-derived URL borrows it: the probe POSTs to
+        the FULL url, and a bare host:port would 404."""
+        template = self.lwd_config.coordination.control_url
+        if not template:
+            values = self.lwd_config.coordination.control_url_map.values()
+            for value in sorted(values):
+                template = value
+                break
+        if not template:
+            return ""
+        return urlparse(template).path
 
     def _lwd_arm_runtime_connection(self, connection: LwdDPConnection) -> None:
         """Build the connection's data-plane links; on success open it for

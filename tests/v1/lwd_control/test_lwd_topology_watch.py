@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
-from vllm.config.lwd.topology import LwdConnectionId
+from vllm.config.lwd.topology import LwdConnectionId, LwdCoordination
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCore,
@@ -169,8 +169,12 @@ def _cluster_payload(
                     "enabled": True,
                     # yaml mapping keys are strings (the loader's
                     # invariant); the config layer coerces them to ints.
+                    # The URLs carry the coordination endpoint's PATH —
+                    # the runtime derivation borrows it for an adopted
+                    # cloud (the probe POSTs to the full URL; a bare
+                    # host:port would 404).
                     "control_url_map": {
-                        str(c): f"http://16.32.10.1{c}:8100"
+                        str(c): f"http://16.32.10.1{c}:8100/v1/chat/completions"
                         for c in range(known)
                     },
                 },
@@ -211,8 +215,12 @@ def _engine(
         topology=LwdTopology.from_dict(payload),
         instance_id=instance_id,
         # The watch gate reads the role against the scene before the
-        # watcher thread ever starts.
+        # watcher thread ever starts; the probe-path derivation reads
+        # this edge's own coordination template.
         role="edge",
+        coordination=LwdTopology.from_dict(payload)
+        .instance("edge", instance_id)
+        .coordination,
     )
     engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
     engine._lwd_control_plane = _RecordingPlane()
@@ -244,6 +252,34 @@ def test_an_added_pair_is_detected(tmp_path: Path) -> None:
     assert engine.scheduler.connections == [LwdConnectionId(1, 1, 0)]
 
 
+def test_the_probe_url_path_borrows_the_edge_template() -> None:
+    """The runtime-derived probe URL carries the coordination endpoint's
+    path, borrowed from THIS edge's own startup control_url: the probe
+    POSTs to the full URL (the cloud's app routes /v1/chat/completions),
+    so a bare host:port would 404. Both config shapes (the legacy single
+    URL and the map) serve as the template; no template at all means no
+    path can be inferred."""
+    engine = object.__new__(LwdEdgeEngineCore)
+    engine.lwd_config = SimpleNamespace(
+        coordination=LwdCoordination(
+            enabled=True,
+            control_url="http://16.32.2.2:9133/v1/chat/completions",
+        )
+    )
+    assert engine._lwd_probe_url_path() == "/v1/chat/completions"
+    engine.lwd_config = SimpleNamespace(
+        coordination=LwdCoordination(
+            enabled=True,
+            control_url_map={0: "http://c0:9133/v1/chat/completions"},
+        )
+    )
+    assert engine._lwd_probe_url_path() == "/v1/chat/completions"
+    engine.lwd_config = SimpleNamespace(
+        coordination=LwdCoordination(enabled=True)
+    )
+    assert engine._lwd_probe_url_path() == ""
+
+
 def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     tmp_path: Path,
 ) -> None:
@@ -271,8 +307,11 @@ def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     assert engine._lwd_control_plane.links == [
         ("tcp://16.32.10.11:5551", LwdConnectionId(0, 1, 0), 1)
     ]
+    # The registered URL carries the endpoint's path — borrowed from this
+    # edge's own startup control_url (the topology stores host/port per
+    # cloud only), appended to the adopted cloud's host:port.
     assert engine._lwd_probe_manager.registered == [
-        (1, "http://16.32.10.11:8101")
+        (1, "http://16.32.10.11:8101/v1/chat/completions")
     ]
     # The data-plane hook registry is empty in this process, so the
     # connection stays control-plane only — but the probe registration
