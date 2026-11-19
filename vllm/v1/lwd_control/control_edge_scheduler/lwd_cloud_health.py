@@ -16,6 +16,16 @@ class LwdCloudHealthTracker:
         self._cooldown_until: dict[int, float] = {}
         self._cursor = 0
 
+    def add_cloud(self, cloud_id: int) -> None:
+        """Elastic scale-out: extend the rotation with a runtime-adopted
+        cloud. Idempotent. The rotation is replaced by one atomic tuple
+        swap, so a concurrent candidates() snapshot sees either the old or
+        the new rotation, never a torn one."""
+        if cloud_id in self._failures:
+            return
+        self._failures[cloud_id] = 0
+        self._cloud_ids = tuple(sorted(self._failures))
+
     def candidates(self, now: float | None = None) -> tuple[int, ...]:
         now = time.monotonic() if now is None else now
         healthy = tuple(

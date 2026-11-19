@@ -85,7 +85,38 @@ class LwdEdgeProbeManager:
         lwd_config = vllm_config.lwd_config
         coordination = lwd_config.coordination
         cloud_ids = tuple(coordination.control_url_map) if coordination else ()
+        if not cloud_ids and coordination is not None and coordination.control_url:
+            # Legacy single-URL deployment: the fixed target IS cloud 0
+            # (the old submit() hardcoded cloud_id = 0 for it).
+            cloud_ids = (0,)
         self._health = LwdCloudHealthTracker(cloud_ids)
+        # Runtime-adopted clouds (elastic scale-out): the increment contract
+        # keeps this edge's own coordination block byte-identical, so a cloud
+        # added mid-run brings its URL here instead of the startup map.
+        self._runtime_urls: dict[int, str] = {}
+
+    def register_cloud(self, cloud_id: int, url: str) -> None:
+        """Teach the manager a runtime-adopted cloud's coordination URL and
+        open it for probe targeting (elastic scale-out). First
+        registration wins; replays only confirm the health-rotation
+        membership (idempotent)."""
+        self._runtime_urls.setdefault(cloud_id, url)
+        self._health.add_cloud(cloud_id)
+
+    def _url_for(self, cloud_id: int) -> str | None:
+        """One cloud's coordination URL: runtime-adopted first, then the
+        startup map; the legacy single URL belongs to cloud 0 by
+        convention."""
+        url = self._runtime_urls.get(cloud_id)
+        if url is not None:
+            return url
+        coordination = self._vllm_config.lwd_config.coordination
+        url = coordination.control_url_map.get(cloud_id)
+        if url is not None:
+            return url
+        if cloud_id == 0:
+            return coordination.control_url
+        return None
 
     @property
     def enabled(self) -> bool:
@@ -93,7 +124,11 @@ class LwdEdgeProbeManager:
         return bool(
             coordination
             and coordination.enabled
-            and (coordination.control_url or coordination.control_url_map)
+            and (
+                coordination.control_url
+                or coordination.control_url_map
+                or self._runtime_urls
+            )
         )
 
     @property
@@ -156,15 +191,17 @@ class LwdEdgeProbeManager:
         if not self.enabled or request.request_id in self._inflight:
             return False
         coordination = self._vllm_config.lwd_config.coordination
-        target_cloud = self._health.next() if coordination.control_url_map else None
+        # Health rotation = startup map (+ the legacy single URL as cloud 0)
+        # plus every runtime-adopted cloud: elastic scale-out widens the
+        # rotation without restarting, so probes — and the routing
+        # preference they produce — spread over all adopted clouds.
+        target_cloud = self._health.next()
         if target_cloud is None:
-            url = coordination.control_url
-            cloud_id = 0
-        else:
-            url = coordination.control_url_map[target_cloud]
-            cloud_id = target_cloud
+            return False
+        url = self._url_for(target_cloud)
         if url is None:
             return False
+        cloud_id = target_cloud
         block_size = self._hash_sizes.get(
             cloud_id, self._vllm_config.cache_config.block_size
         )
@@ -271,11 +308,10 @@ class LwdEdgeProbeManager:
             learned = int(result.block_size)
             self._hash_sizes[self._cloud_for_result(target, result)] = learned
             if chain is not None and learned != build_size:
-                coordination = self._vllm_config.lwd_config.coordination
                 url = (
-                    coordination.control_url_map[target]
+                    self._url_for(target)
                     if target is not None
-                    else coordination.control_url
+                    else self._vllm_config.lwd_config.coordination.control_url
                 )
                 rebuilt = self._client(
                     self._cloud_for_result(target, result), learned, url

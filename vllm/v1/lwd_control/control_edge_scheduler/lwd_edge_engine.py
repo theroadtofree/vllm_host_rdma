@@ -24,7 +24,7 @@ from collections import deque
 from typing import Any
 
 from vllm.config.lwd import LwdConnectionId, LwdTopologyIncrement
-from vllm.config.lwd.topology import LwdDPConnection
+from vllm.config.lwd.topology import LwdDP, LwdDPConnection, LwdTopology
 from vllm.lwd_logger import lwd_logger
 from vllm.utils.network_utils import make_zmq_path
 from vllm.v1.engine import EngineCoreRequestType
@@ -211,15 +211,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         only that half on the next detected increment."""
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdEdgeControlPlane)
+        scene = self.lwd_config.topology.deployment.scene
         for connection in increment.new_connections:
             # In lwd_cluster each edge engine serves only its own
             # instance's connections (other engines watch the same file
-            # and apply their own). In edge_share the shared engine's
-            # lwd_config.connections spans every logical edge, so this
-            # filter is a no-op there.
-            if connection.edge_id not in {
-                c.edge_id for c in self.lwd_config.connections
-            }:
+            # and apply their own). In edge_share the shared engine owns
+            # EVERY logical edge — including ones the increment adds
+            # beyond its own startup snapshot — so only lwd_cluster
+            # filters, and by instance identity, never by the startup
+            # connection set.
+            if (
+                scene == "lwd_cluster"
+                and connection.edge_id != self.lwd_config.instance_id
+            ):
                 continue
             key = (connection.cloud_id, connection.dp_idx)
             if key in self._lwd_runtime_connections:
@@ -233,6 +237,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                     connection.connection_id,
                 )
                 continue
+            self._lwd_register_probe_cloud(
+                connection.cloud_id, connection.cloud, increment.new_topology
+            )
             self._lwd_runtime_connections[key] = connection
             self.scheduler.lwd_add_runtime_connection(connection.connection_id)
             plane.add_link(
@@ -254,6 +261,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 connection.cloud.ctrl_port,
             )
             self._lwd_arm_runtime_connection(connection)
+
+    def _lwd_register_probe_cloud(
+        self, cloud_id: int, cloud_dp: LwdDP, topology: LwdTopology
+    ) -> None:
+        """Elastic scale-out: teach the probe manager the adopted cloud's
+        coordination URL, so probe targeting — and the routing preference
+        probes produce — spreads over every adopted cloud instead of
+        staying pinned to the startup set. The increment contract keeps
+        this edge's own coordination block byte-identical, so it cannot
+        carry the new URL; the cloud's instance block does: its HTTP
+        listener port plus this DP's routable address (the same host the
+        control-plane DEALER dials)."""
+        coordination = topology.instance("cloud", cloud_id).coordination
+        if coordination is None or not coordination.enabled:
+            return
+        self._lwd_probe_manager.register_cloud(
+            cloud_id, f"http://{cloud_dp.addr}:{coordination.listen_port}"
+        )
 
     def _lwd_arm_runtime_connection(self, connection: LwdDPConnection) -> None:
         """Build the connection's data-plane links; on success open it for

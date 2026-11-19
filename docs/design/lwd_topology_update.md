@@ -307,6 +307,58 @@ Acceptance: 1-edge cloud_share running → grow the cloud host's yaml to
 its UCX pair builds on the shared listener → requests through edge 1
 serve, edge 0 never drops.
 
+**lwd_cluster routing detail (2026-11-19)**: the above chains grow the
+LINK; this piece grows the probe TARGETING, without which a grown
+lwd_cluster serves on both clouds but routes every request to the
+startup cloud (2e1c → 2e2c: all requests stayed on cloud 0). Root
+cause: the edge probe manager's cloud set was frozen at startup — the
+health rotation came from this edge's own coordination
+(`control_url_map`), and a single-`control_url` deployment hardcoded
+`cloud_id = 0`; the increment contract keeps the edge's block
+byte-identical, so it can never carry the new cloud's URL. Fix, three
+layers:
+
+* **`LwdCloudHealthTracker.add_cloud(cloud_id)`** — the rotation is
+  replaced by one atomic tuple swap (`tuple(sorted(_failures))`), so a
+  concurrent `candidates()` reader sees either the old or the new
+  rotation, never a torn one (the P1-family pattern). Idempotent.
+* **`LwdEdgeProbeManager`**: `register_cloud(cloud_id, url)` (first
+  registration wins; replays only confirm rotation membership) and the
+  unified `_url_for` resolution — runtime registration first, then the
+  startup map, with the legacy single URL belonging to cloud 0 by
+  convention (the tracker now seeds `(0,)` for it, unifying the code
+  path instead of the old hardcoded target). `submit()` takes its
+  target from the health rotation alone and resolves the URL through
+  `_url_for`; `drain()`'s block-size rebuild does the same (the old
+  `control_url_map[target]` lookup raised KeyError the moment a
+  runtime-adopted cloud answered with a different hash block size).
+  `enabled` also counts runtime registrations.
+* **The edge engine's `_lwd_apply_topology_increment`** derives the
+  adopted cloud's URL from ITS instance block in
+  `increment.new_topology` — `http://{cloud_dp.addr}:{coordination.
+  listen_port}` (the dp address is the same routable host the
+  control-plane DEALER dials) — and registers it before the arm
+  attempt: a refused data-plane build never rolls the registration
+  back, and a cloud that is still loading simply accrues probe
+  failures → cooldown → recovery (the tracker's existing semantics;
+  `candidates()` fails open only when EVERY cloud cools down).
+
+The same increment-apply filter was made scene-aware: only
+lwd_cluster filters per instance (`connection.edge_id !=
+instance_id`); edge_share's shared engine must NOT filter — its
+startup `lwd_config.connections` cannot contain the logical edges the
+increment adds (the realized topology never advances), so a
+snapshot-based filter dropped exactly the connections the scale-out
+was supposed to add. cloud_share/cloud edges never watch; the cloud
+side's instance filter (`cloud_id == instance_id`) was already
+correct.
+
+Acceptance: 2-edge 1-cloud lwd_cluster running → grow to 2 clouds →
+launch cloud 1 → each edge's watch fires, the control plane and data
+plane build, and the probe rotation widens to cloud 1 → requests
+spread over both clouds (round-robin preference via probe completions;
+an unarmed or cooling cloud falls back to the armed candidates).
+
 ## 7. Processing order (caller flow, Phase A)
 
 ```text
@@ -393,3 +445,18 @@ path, deepcopy), +1 pair, +2 pairs, scene change, frozen deployment /
 feature_ctrl, qos exemption (locks the review decision), existing instance
 and coordination modification, shrink, link swap, id gap at parse, and the
 parse-before-diff ordering.
+
+`tests/v1/lwd_control/test_lwd_topology_watch.py` — the shared-edge watch
+chain (detect/apply/replay/refusal/gate/watcher-thread/role-gate), the
+cloud's allowlist+collective_rpc apply, and the lwd_cluster scale-out
+probe registration (string-keyed yaml payloads; the recording planes
+subclass the real control-plane classes because both apply hooks assert
+the plane type). `test_lwd_cloud_health.py` — the rotation's runtime
+extension: sorted spread, idempotence, cooldown interplay, the atomic
+swap under a concurrent reader. `test_lwd_edge_probe.py` — the probe
+manager's runtime registration: rotation widening, legacy single-URL
+seeding, `_url_for` precedence, enabled-by-registration, and the
+drain-time rebuild's KeyError regression (a runtime cloud answering with
+a different hash block size). The probe/health files skip under the
+torch-less lightweight conftest (the full chain needs torch/aiohttp);
+the watch file runs everywhere.

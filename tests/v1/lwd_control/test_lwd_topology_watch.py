@@ -23,9 +23,6 @@ import yaml
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
 from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.engine import EngineCoreRequestType
-from vllm.v1.lwd_control.control_cloud_scheduler import (
-    lwd_cloud_engine as lwd_cloud_engine_module,
-)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCore,
 )
@@ -35,10 +32,16 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
 )
 from vllm.v1.lwd_control.control_scheduler import lwd_base_engine
 from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import LwdBaseEngineCore
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
+    LwdCloudControlPlane,
+    LwdEdgeControlPlane,
+)
 
 
-class _RecordingPlane:
-    """Stands in for the edge control plane: records add_link calls."""
+class _RecordingPlane(LwdEdgeControlPlane):
+    """Stands in for the edge control plane: records add_link calls. A
+    subclass (with no plane construction) because the engine's apply hook
+    asserts the control-plane type before touching it."""
 
     def __init__(self) -> None:
         self.links: list[tuple[str, LwdConnectionId, int]] = []
@@ -52,6 +55,17 @@ class _RecordingPlane:
         done: threading.Event | None = None,
     ) -> None:
         self.links.append((endpoint, connection_id, cloud_dp_size))
+
+
+class _RecordingProbeManager:
+    """Stands in for the probe manager: records runtime cloud
+    registrations (the probe-targeting half of elastic scale-out)."""
+
+    def __init__(self) -> None:
+        self.registered: list[tuple[int, str]] = []
+
+    def register_cloud(self, cloud_id: int, url: str) -> None:
+        self.registered.append((cloud_id, url))
 
 
 class _RecordingScheduler:
@@ -122,16 +136,87 @@ def _write(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _engine(path: Path) -> LwdEdgeEngineCore:
+def _cluster_payload(
+    edges: int, clouds: int, *, known_clouds: int = 0
+) -> dict[str, Any]:
+    """An E×C lwd_cluster host-comm topology: the scene requires an
+    enabled coordination block on every instance. The edges' URL maps
+    cover ``known_clouds`` clouds (default: all of them) — the increment
+    contract keeps edge instances byte-identical, so a grown deployment
+    still carries only the startup map and the new cloud's URL must be
+    derived from ITS instance block at runtime."""
+    known = clouds if known_clouds == 0 else known_clouds
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": "lwd_cluster",
+            "edges_num": edges,
+            "clouds_num": clouds,
+            "data_plane_comm": "host",
+        },
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
+        "edges": [
+            {
+                "id": e,
+                "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}],
+                "coordination": {
+                    "enabled": True,
+                    # yaml mapping keys are strings (the loader's
+                    # invariant); the config layer coerces them to ints.
+                    "control_url_map": {
+                        str(c): f"http://16.32.10.1{c}:8100"
+                        for c in range(known)
+                    },
+                },
+            }
+            for e in range(edges)
+        ],
+        "clouds": [
+            {
+                "id": c,
+                "dp": [
+                    {
+                        "dp_idx": 0,
+                        "addr": f"16.32.10.1{c}",
+                        "ctrl_port": 5550 + c,
+                        "data_port": 5560 + c,
+                    }
+                ],
+                "coordination": {"enabled": True, "listen_port": 8100 + c},
+            }
+            for c in range(clouds)
+        ],
+        "instance_links": [
+            {"edge": e, "cloud": c} for e in range(edges) for c in range(clouds)
+        ],
+    }
+
+
+def _engine(
+    path: Path,
+    payload: dict[str, Any] | None = None,
+    *,
+    instance_id: int = 0,
+) -> LwdEdgeEngineCore:
+    payload = _payload(1) if payload is None else payload
     engine = object.__new__(LwdEdgeEngineCore)
     engine.lwd_config = SimpleNamespace(
-        path=str(path), topology=LwdTopology.from_dict(_payload(1))
+        path=str(path),
+        topology=LwdTopology.from_dict(payload),
+        instance_id=instance_id,
+        # The watch gate reads the role against the scene before the
+        # watcher thread ever starts.
+        role="edge",
     )
     engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
     engine._lwd_control_plane = _RecordingPlane()
     engine.scheduler = _RecordingScheduler()
     engine._lwd_runtime_connections = {}
     engine._lwd_armed_connections = set()
+    engine._lwd_probe_manager = _RecordingProbeManager()
     return engine
 
 
@@ -154,6 +239,44 @@ def test_an_added_pair_is_detected(tmp_path: Path) -> None:
     ]
     assert (1, 0) in engine._lwd_runtime_connections
     assert engine.scheduler.connections == [LwdConnectionId(1, 1, 0)]
+
+
+def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
+    tmp_path: Path,
+) -> None:
+    """lwd_cluster routing fix: the probe manager's cloud set — the
+    health rotation and the URL map — was frozen at startup, so after a
+    2e1c -> 2e2c scale-out every probe (and the routing preference it
+    produces) stayed pinned to cloud 0. The apply hook now derives the
+    adopted cloud's coordination URL from ITS instance block — the edge's
+    own block stays byte-identical by the increment contract, so it
+    cannot carry the URL — and registers it for probe targeting."""
+    topology_file = tmp_path / "topology.yaml"
+    _write(topology_file, _cluster_payload(2, 1))
+    engine = _engine(topology_file, _cluster_payload(2, 1))
+    # The grown deployment: both edges byte-identical (their URL maps
+    # still cover only cloud 0), cloud 1 appended with its own
+    # coordination block.
+    _write(topology_file, _cluster_payload(2, 2, known_clouds=1))
+    verdict = engine._lwd_process_topology_reload()
+    assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
+    assert verdict.new_cloud_ids == (1,)
+    # Edge 0's engine applied only its own connection (edge 1's engine
+    # watches the same file and applies its own) and taught the probe
+    # manager cloud 1's URL: the cloud DP's routable address plus its
+    # coordination listener port.
+    assert engine._lwd_control_plane.links == [
+        ("tcp://16.32.10.11:5551", LwdConnectionId(0, 1, 0), 1)
+    ]
+    assert engine._lwd_probe_manager.registered == [
+        (1, "http://16.32.10.11:8101")
+    ]
+    # The data-plane hook registry is empty in this process, so the
+    # connection stays control-plane only — but the probe registration
+    # has already happened (it precedes the arm attempt and never rolls
+    # back: the next increment retries only the data-plane half).
+    assert (1, 0) in engine._lwd_runtime_connections
+    assert (1, 0) not in engine._lwd_armed_connections
 
 
 def test_applying_the_same_increment_twice_adds_each_link_once(
@@ -188,6 +311,16 @@ def test_a_refused_data_plane_arms_on_the_next_increment(
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _payload(1))
     engine = _engine(topology_file)
+    # Liveness state the gate reads (a runtime adoption is recorded in
+    # _lwd_clouds by the control-plane IO thread in production): set up
+    # front, both gate checks below run against it.
+    engine._lwd_hello_lock = threading.Lock()
+    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
+    engine._lwd_hello_boot = {}
+    engine._lwd_silent = set()
+    engine._lwd_silent_routes = frozenset()
+    engine._lwd_hello_silent_s = 10.0
+    engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
     _write(topology_file, _payload(2))
     first = engine._lwd_process_topology_reload()
     assert first is not None and not isinstance(first, LwdTopologyUpdateRejected)
@@ -211,13 +344,6 @@ def test_a_refused_data_plane_arms_on_the_next_increment(
     assert (1, 0) in engine._lwd_armed_connections
     assert engine.scheduler.armed == [LwdConnectionId(1, 1, 0)]
     # An armed runtime connection is servable: the gate admits it.
-    engine._lwd_hello_lock = threading.Lock()
-    engine._lwd_hello_last = {LwdConnectionId(1, 1, 0): time.monotonic()}
-    engine._lwd_hello_boot = {}
-    engine._lwd_silent = set()
-    engine._lwd_silent_routes = frozenset()
-    engine._lwd_hello_silent_s = 10.0
-    engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
     assert engine._lwd_gate_reason(SimpleNamespace(request_id="e1-wrapped-req")) is None
 
 
@@ -273,7 +399,10 @@ def test_the_watch_thread_queues_one_tick_per_change(
         def put_nowait(self, item: Any) -> None:
             self.items.append(item)
 
-    monkeypatch.setattr(lwd_edge_engine, "_LWD_TOPOLOGY_POLL_INTERVAL_S", 0.02)
+    # The poll pace lives in the base engine since the watch moved there
+    # (36230ecdfa): patch it there — the watch thread re-reads the module
+    # global every iteration.
+    monkeypatch.setattr(lwd_base_engine, "_LWD_TOPOLOGY_POLL_INTERVAL_S", 0.02)
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _payload(1))
     engine = _engine(topology_file)
@@ -402,13 +531,18 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     """C-2/C-3: the cloud's apply hook grows the handshake allowlist per
-    new edge AND calls the data-plane build for each new connection.
-    A recording plane and a monkeypatched data-plane hook stand in — the
+    new edge AND drives the data-plane build for each new connection —
+    through collective_rpc since the UCX listener moved into the Worker
+    processes (the endpoint Worker answers True, the others None). The
     real handshake accept/replay semantics live in
     test_lwd_handshake_allow_edge, the real link build in the ascend
     suite."""
 
-    class _RecordingCloudPlane:
+    class _RecordingCloudPlane(LwdCloudControlPlane):
+        """Stands in for the cloud control plane (see _RecordingPlane):
+        the cloud's apply hook asserts the control-plane type before
+        touching it."""
+
         def __init__(self) -> None:
             self.allowed: list[int] = []
 
@@ -417,23 +551,37 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
 
     built: list = []
 
-    def fake_notify(connection: Any) -> bool:
-        built.append(connection.connection_id)
-        return True
+    def fake_collective_rpc(name: str, args: Any = None) -> list[Any]:
+        # The data-plane build moved behind collective_rpc (the shared
+        # listener lives in the Worker processes): the endpoint Worker
+        # answers True, the others None (not their job).
+        if name == "lwd_build_runtime_connection":
+            built.append(args[0].connection_id)
+            return [True, None]
+        raise AssertionError(f"unexpected rpc under test: {name}")
 
-    monkeypatch.setattr(lwd_cloud_engine_module, "notify_data_plane_added", fake_notify)
     topology_file = tmp_path / "cloud_topology.yaml"
     _cloud_share_write(topology_file, 1)
     engine = object.__new__(LwdCloudEngineCore)
+    engine.lwd_config = SimpleNamespace(
+        path=str(topology_file),
+        topology=LwdTopology.from_dict(
+            yaml.safe_load(topology_file.read_text())
+        ),
+        instance_id=0,
+    )
+    engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
     engine._lwd_control_plane = _RecordingCloudPlane()
     engine._lwd_hint_mqs = {}
     engine._lwd_done_mqs = {}
-    engine.model_executor = SimpleNamespace(
-        collective_rpc=lambda name, args=None: [b"handle"]
-    )
+    engine.model_executor = SimpleNamespace(collective_rpc=fake_collective_rpc)
     wired: list = []
 
     def fake_wire(connection: LwdConnectionId) -> None:
+        # Mirrors the real method's first-line guard: a replayed wire call
+        # returns early on an already-wired connection.
+        if connection in engine._lwd_hint_mqs:
+            return
         wired.append(connection)
         engine._lwd_hint_mqs[connection] = "hint-mq"
         engine._lwd_done_mqs[connection] = "done-mq"
@@ -444,13 +592,14 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
     assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
     assert verdict.new_edge_ids == (1,)
     assert engine._lwd_control_plane.allowed == [1]
-    # The data-plane hook fired and the MQ wiring ran.
+    # The data-plane build was driven through collective_rpc and the MQ
+    # wiring ran.
     assert built == [LwdConnectionId(1, 0, 0)]
     assert wired == [LwdConnectionId(1, 0, 0)]
     assert engine._lwd_hint_mqs == {LwdConnectionId(1, 0, 0): "hint-mq"}
     assert engine._lwd_done_mqs == {LwdConnectionId(1, 0, 0): "done-mq"}
     # A replay of the same increment: allow_edge fires again (idempotent),
-    # the data-plane hook fires again, but the MQ wiring skips (already
+    # the data-plane build fires again, but the MQ wiring skips (already
     # wired).
     engine._lwd_apply_topology_increment(verdict)
     assert engine._lwd_control_plane.allowed == [1, 1]
