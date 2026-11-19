@@ -557,8 +557,10 @@ class LwdTopology:
             raise ValueError(
                 "[LWD] cloud_share requires at least one edge and one cloud"
             )
-        if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
-            raise ValueError("[LWD] lwd_cluster requires at least two clouds")
+        # lwd_cluster has no minimum-count check beyond the type-level
+        # edges_num/clouds_num >= 1: a 1-edge + 1-cloud deployment is the
+        # degenerate form of the full-mesh pipeline, usable for verification
+        # and gradual scale-out.
         # Coordination may be enabled explicitly in every scene. Shared and
         # multi-cloud scenes require it for every instance.
         if scene in ("cloud_share", "lwd_cluster"):
