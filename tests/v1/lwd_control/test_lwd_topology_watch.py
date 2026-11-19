@@ -23,6 +23,9 @@ import yaml
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
 from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.engine import EngineCoreRequestType
+from vllm.v1.lwd_control.control_cloud_scheduler import (
+    lwd_cloud_engine as lwd_cloud_engine_module,
+)
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCore,
 )
@@ -395,12 +398,15 @@ def test_the_watch_gate_watches_only_the_shared_side_of_the_scene(
     assert not gated("cloud", "cloud_share", host_comm=False)
 
 
-def test_the_cloud_engine_admits_increment_edges_to_the_allowlist(
-    tmp_path: Path,
+def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
+    tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """C-2: the cloud's apply hook grows the handshake allowlist per new
-    edge. A recording plane stands in — the real handshake accept/replay
-    semantics live in test_lwd_handshake_allow_edge."""
+    """C-2/C-3: the cloud's apply hook grows the handshake allowlist per
+    new edge AND calls the data-plane build for each new connection.
+    A recording plane and a monkeypatched data-plane hook stand in — the
+    real handshake accept/replay semantics live in
+    test_lwd_handshake_allow_edge, the real link build in the ascend
+    suite."""
 
     class _RecordingCloudPlane:
         def __init__(self) -> None:
@@ -409,6 +415,13 @@ def test_the_cloud_engine_admits_increment_edges_to_the_allowlist(
         def allow_edge(self, edge_id: int) -> None:
             self.allowed.append(edge_id)
 
+    built: list = []
+
+    def fake_notify(connection: Any) -> bool:
+        built.append(connection.connection_id)
+        return True
+
+    monkeypatch.setattr(lwd_cloud_engine_module, "notify_data_plane_added", fake_notify)
     topology_file = tmp_path / "cloud_topology.yaml"
     _cloud_share_write(topology_file, 1)
     engine = object.__new__(LwdCloudEngineCore)
@@ -418,10 +431,14 @@ def test_the_cloud_engine_admits_increment_edges_to_the_allowlist(
     assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
     assert verdict.new_edge_ids == (1,)
     assert engine._lwd_control_plane.allowed == [1]
-    # A replay of the same increment: allow_edge fires again (the plane
-    # and the handshake are both idempotent; the log stays clean).
+    # The data-plane hook fired for the new connection.
+    assert built == [LwdConnectionId(1, 0, 0)]
+    # A replay of the same increment: allow_edge fires again (idempotent),
+    # and the data-plane hook fires again (the ascend builder is
+    # idempotent on the connection's key).
     engine._lwd_apply_topology_increment(verdict)
     assert engine._lwd_control_plane.allowed == [1, 1]
+    assert built == [LwdConnectionId(1, 0, 0), LwdConnectionId(1, 0, 0)]
 
 
 def _cloud_share_write(path: Path, edges: int) -> None:

@@ -50,6 +50,9 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdCloudControlPlane,
     LwdPeerNotRegisteredError,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
+    notify_data_plane_added,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
@@ -606,13 +609,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def _lwd_apply_topology_increment(self, increment: LwdTopologyIncrement) -> None:
-        """C-2: admit each new edge to the handshake allowlist. The rest
-        of the join is the existing runtime machinery — registration
-        resets the seqno ledgers and resends the scheduling limits, the
+        """C-2/C-3: admit each new edge to the handshake allowlist, then
+        build its data-plane pair on the shared listener. The rest of
+        the join is the existing runtime machinery — registration resets
+        the seqno ledgers and resends the scheduling limits, the
         heartbeat fan-out picks the peer up from `_lwd_edges` — and the
-        data-plane half (UCX tokens on the shared listener, the hint MQ
-        pair) is the later steps. Idempotent per edge: a replayed
-        increment does not disturb the live allowlist."""
+        hint MQ pair is C-4. A data-plane refusal keeps the edge
+        control-plane only (its UP frames bounce off the listener and
+        retry); the next detected increment retries. Idempotent per
+        edge and per connection: replays do not disturb the live
+        allowlist or the listener's route table."""
         plane = self._lwd_control_plane
         assert isinstance(plane, LwdCloudControlPlane)
         for edge_id in increment.new_edge_ids:
@@ -621,6 +627,20 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "[cloud] edge %d admitted to the handshake allowlist "
                 "(topology increment)",
                 edge_id,
+            )
+        for connection in increment.new_connections:
+            if not notify_data_plane_added(connection):
+                lwd_logger.error(
+                    "[LWD] data-plane build refused for %s; the edge's UP "
+                    "frames will keep retrying the listener (retried on "
+                    "the next topology change)",
+                    connection.connection_id,
+                )
+                continue
+            lwd_logger.info(
+                "[LWD] runtime connection %s built (serve pair on the "
+                "shared listener)",
+                connection.connection_id,
             )
 
     def _lwd_handle_range_notify(

@@ -264,6 +264,23 @@ accept after / idempotent + live sessions / empty allowlist stays
 open / same-session retry is a refresh) and `test_lwd_topology_watch.py`
 (+1: the cloud's apply hook fires allow_edge per detected edge).
 
+**C-3 detail (2026-11-19)**: `lwd_add_runtime_connection` is now
+role-aware (the edge-only guard is gone). The EDGE path is unchanged
+(`listener=None`, connect out). The CLOUD path looks up the shared
+listener from `_UCX_LISTENERS[(cloud_id, dp_idx)]` (bound at init,
+still alive — no re-bind), passes it to `_build_connection_ios` which
+sets `serve=True` — `LwdUcxChannel.serve_via` registers the connection's
+two tokens on the listener's **locked route table** mid-run (the
+accept loop reads it under the same lock, so a retrying edge's next
+UHC1 handshake completes). The idempotent key is role-aware
+(edge: UP-send, cloud: UP-recv). The budget ledger is shared. A
+cloud without a listener (sidecar daemon) refuses — the edge's UP
+frames keep bouncing and the next increment retries. The cloud
+engine's `_lwd_apply_topology_increment` grew: after allow_edge, it
+calls `notify_data_plane_added(connection)` per new connection —
+a refusal keeps the edge control-plane only (UP frames retry the
+listener; the next topology change retries the build).
+
 Acceptance: 1-edge cloud_share running → grow the cloud host's yaml to
 2 edges → launch edge 1 → the cloud's watch fires, the edge registers,
 its UCX pair builds on the shared listener → requests through edge 1
