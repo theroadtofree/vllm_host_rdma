@@ -99,6 +99,32 @@ def test_edge_share_still_requires_equal_instance_counts() -> None:
         LwdTopology.from_dict(raw)
 
 
+def test_single_edge_cloud_share_is_the_degenerate_pipeline_form() -> None:
+    """Regression (1-edge cloud_share drill): a one-edge, one-cloud
+    cloud_share deployment is the degenerate form of the shared-cloud
+    pipeline and must load — the validator used to demand >= 2 edges and
+    the whole deployment was rejected at config parse time."""
+    raw = minimal_edge_share_payload()
+    raw["deployment"]["scene"] = "cloud_share"
+    # cloud_share still requires an enabled coordination block per instance.
+    for instance in ("edges", "clouds"):
+        for entry in raw[instance]:
+            entry["coordination"] = {"enabled": True}
+    raw["edges"][0]["coordination"].update(
+        control_url="http://16.32.2.2:9133/v1/chat/completions",
+        tenant_key_file="/home/w00505434/edge-cloud-tenant-key",
+        consumer_id="enterprise-a-edge0",
+        connect_timeout=5.0,
+    )
+    raw["clouds"][0]["coordination"].update(listen_host="16.32.2.2", listen_port=9133)
+    topology = LwdTopology.from_dict(raw)
+    assert topology.deployment.scene == "cloud_share"
+    (connection,) = topology.connections("edge", 0)
+    assert connection.connection_id == LwdConnectionId(0, 0, 0)
+    # The cloud sees the same single connection from its own side.
+    assert topology.connections("cloud", 0) == (connection,)
+
+
 @pytest.mark.parametrize(
     "fault,match",
     [

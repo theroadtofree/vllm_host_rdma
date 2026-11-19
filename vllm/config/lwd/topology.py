@@ -547,8 +547,16 @@ class LwdTopology:
         edge_count, cloud_count = len(self.edges), len(self.clouds)
         if scene == "single_instance" and (edge_count, cloud_count) != (1, 1):
             raise ValueError("[LWD] single_instance requires one edge and one cloud")
-        if scene == "cloud_share" and (edge_count < 2 or cloud_count != 1):
-            raise ValueError("[LWD] cloud_share requires multiple edges and one cloud")
+        # A single-edge cloud_share is the degenerate form of the shared
+        # cloud pipeline: it runs the same coordination machinery (the
+        # scene below still requires enabled coordination blocks) and the
+        # same multi-edge request routing, so a deployment can verify the
+        # whole cloud_share pipeline with one instance and grow by adding
+        # edges — mirroring the degenerate single-pair edge_share form.
+        if scene == "cloud_share" and (edge_count < 1 or cloud_count != 1):
+            raise ValueError(
+                "[LWD] cloud_share requires at least one edge and one cloud"
+            )
         if scene == "lwd_cluster" and (edge_count < 1 or cloud_count < 2):
             raise ValueError("[LWD] lwd_cluster requires at least two clouds")
         # Coordination may be enabled explicitly in every scene. Shared and
