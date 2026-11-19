@@ -54,6 +54,16 @@ class _RecordingScheduler:
         self.connections: list[LwdConnectionId] = []
         self.armed: list[LwdConnectionId] = []
 
+    def _lwd_edge_id_of(self, request: Any) -> int:
+        """The tests' identity convention: the ``e<id>-`` prefix names the
+        source edge, a bare id means edge 0 (the REAL scheduler derives
+        this from the deployment shape; here it just mirrors the ids the
+        tests craft)."""
+        prefix = request.request_id.partition("-")[0]
+        if prefix.startswith("e") and prefix[1:].isdigit():
+            return int(prefix[1:])
+        return 0
+
     def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
         self.connections.append(connection_id)
 
@@ -178,7 +188,10 @@ def test_a_refused_data_plane_arms_on_the_next_increment(
     assert (1, 0) in engine._lwd_runtime_connections
     assert (1, 0) not in engine._lwd_armed_connections
     assert engine.scheduler.armed == []
-    assert engine._lwd_gate_reason("e1-wrapped-req") is not None
+    assert (
+        engine._lwd_gate_reason(SimpleNamespace(request_id="e1-wrapped-req"))
+        is not None
+    )
     # The next detected increment replays the same verdict: the retry
     # touches only the data-plane half.
     build_results.append(True)
@@ -197,7 +210,7 @@ def test_a_refused_data_plane_arms_on_the_next_increment(
     engine._lwd_silent_routes = frozenset()
     engine._lwd_hello_silent_s = 10.0
     engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
-    assert engine._lwd_gate_reason("e1-wrapped-req") is None
+    assert engine._lwd_gate_reason(SimpleNamespace(request_id="e1-wrapped-req")) is None
 
 
 def test_an_illegal_update_is_rejected_without_repeats(tmp_path: Path) -> None:
@@ -291,12 +304,12 @@ def test_the_gate_rejects_a_control_plane_only_connection(
     engine._lwd_hello_silent_s = 10.0
     engine._lwd_clouds = {LwdConnectionId(1, 1, 0): None}
     engine._lwd_runtime_connections = {(1, 0): None}
-    reason = engine._lwd_gate_reason("e1-wrapped-req")
+    reason = engine._lwd_gate_reason(SimpleNamespace(request_id="e1-wrapped-req"))
     assert reason is not None
     assert "control plane only" in reason
     # The planned connection is not runtime: a fresh heartbeat admits it.
     engine._lwd_clouds = {LwdConnectionId(0, 0, 0): None}
-    assert engine._lwd_gate_reason("plain-req") is None
+    assert engine._lwd_gate_reason(SimpleNamespace(request_id="plain-req")) is None
 
 
 def test_the_data_plane_hook_registry_reports_and_survives_raising_hooks(

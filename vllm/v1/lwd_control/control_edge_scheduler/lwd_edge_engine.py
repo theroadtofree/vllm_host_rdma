@@ -61,7 +61,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
 from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
     notify_data_plane_added,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
@@ -579,7 +578,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # shutdown-rejection paradigm finishes the request DIRECTLY:
         # nothing enqueues after this returns, so the abort-channel path
         # used post-probe would never find it.
-        gate_reason = self._lwd_gate_reason(request.request_id)
+        gate_reason = self._lwd_gate_reason(request)
         if gate_reason is not None:
             lwd_logger.error(
                 "[edge] request rejected req=%s: %s",
@@ -611,7 +610,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         request: Request,
         preferred: LwdConnectionId | None = None,
     ) -> None:
-        gate_reason = self._lwd_gate_reason(request.request_id)
+        gate_reason = self._lwd_gate_reason(request)
         if gate_reason is not None:
             # Availability gate, defense in depth (the primary check is the
             # add_request ENTRY): this one covers the probe race — the
@@ -840,19 +839,26 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"heartbeat silent {silent_for:.0f}s",
             )
 
-    def _lwd_gate_reason(self, request_id: str) -> str | None:
-        """Admission gate: None admits, a reason rejects. The frozen sweep
-        snapshot is unioned with a LIVE staleness view: the sweep runs at
-        step head, so a cloud that went silent while the engine idled must
-        not admit the very request that wakes it. All routes silent rejects
-        everything; a wrapped id (the edge_share per-frontend prefix)
-        rejects when every connection of its source edge is silent.
-        Elastic partial start adds the not-yet-adopted case: a request
-        whose source edge has NO adopted cloud (the planned cloud starts
-        later, or is still loading) is rejected the same way — fail fast
-        and retryably. Letting it through would route it to an
-        unaddressable connection and kill the shared engine."""
-        edge_id, _ = parse_edge_id(request_id)
+    def _lwd_gate_reason(self, request: Request) -> str | None:
+        """Admission gate: None admits, a reason rejects. The request's
+        source edge comes from the SCHEDULER's routing identity
+        (``_lwd_edge_id_of``: edge_share -> the attach client_index,
+        standalone -> the engine's instance_id) — the same source the
+        router uses, never the request id string (the ``e<id>-`` prefix
+        exists only on the CLOUD side, after ``wrap_req_id``; edge-side
+        ids are bare and an unparsable one defaulted to edge 0, which
+        rejected every request on any edge whose instance id is not 0).
+        The frozen sweep snapshot is unioned with a LIVE staleness view:
+        the sweep runs at step head, so a cloud that went silent while
+        the engine idled must not admit the very request that wakes it.
+        All routes silent rejects everything; a request whose source
+        edge is fully silent is rejected. Elastic partial start adds
+        the not-yet-adopted case: a request whose source edge has NO
+        adopted cloud (the planned cloud starts later, or is still
+        loading) is rejected the same way — fail fast and retryably.
+        Letting it through would route it to an unaddressable
+        connection and kill the shared engine."""
+        edge_id = self.scheduler._lwd_edge_id_of(request)
         # Snapshot before iterating: _lwd_clouds is written by the
         # control-plane IO thread (runtime adoption) while this runs on
         # the engine thread per request; a Python-level iteration raises
