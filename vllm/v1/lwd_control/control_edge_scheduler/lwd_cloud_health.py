@@ -18,6 +18,21 @@ class LwdCloudHealthTracker:
         self._cooldown_until: dict[LwdCloudDpId, float] = {}
         self._cursor = 0
 
+    def add_target(self, target: LwdCloudDpId) -> None:
+        """Elastic scale-out: extend the rotation with a runtime-adopted
+        cloud DP. Idempotent. The rotation is replaced by one atomic tuple
+        swap, so a concurrent candidates() snapshot sees either the old or
+        the new rotation, never a torn one."""
+        if target in self._failures:
+            return
+        self._failures[target] = 0
+        self._targets = tuple(sorted(self._failures))
+
+    @property
+    def targets(self) -> tuple[LwdCloudDpId, ...]:
+        """The full rotation, cooling-down cloud DPs included (diagnostics)."""
+        return self._targets
+
     def candidates(self, now: float | None = None) -> tuple[LwdCloudDpId, ...]:
         now = time.monotonic() if now is None else now
         healthy = tuple(
@@ -28,9 +43,14 @@ class LwdCloudHealthTracker:
         return healthy or self._targets
 
     def next(self, allowed: set[LwdCloudDpId] | None = None) -> LwdCloudDpId | None:
+        """Pick the next rotation member. ``allowed`` scopes the choice
+        (probe targeting excludes what liveness declared silent). An empty
+        filter fails open: the admission gate owns the fully-silent steady
+        state, this covers only the sweep-gap race."""
         candidates = self.candidates()
         if allowed is not None:
-            candidates = tuple(target for target in candidates if target in allowed)
+            live = tuple(target for target in candidates if target in allowed)
+            candidates = live or candidates
         if not candidates:
             return None
         target = candidates[self._cursor % len(candidates)]
@@ -48,9 +68,13 @@ class LwdCloudHealthTracker:
         now: float | None = None,
         threshold: int = 3,
         cooldown_s: float = 60.0,
-    ) -> None:
+    ) -> bool:
+        """Count one probe failure. Returns True when this failure put
+        the cloud DP into cooldown (the caller's diagnostics cue)."""
         now = time.monotonic() if now is None else now
         failures = self._failures.get(target, 0) + 1
         self._failures[target] = failures
         if failures >= threshold:
             self._cooldown_until[target] = now + cooldown_s
+            return True
+        return False

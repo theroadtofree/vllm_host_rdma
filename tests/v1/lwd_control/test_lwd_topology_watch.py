@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 from vllm.config.lwd import LwdTopology, LwdTopologyUpdateRejected
-from vllm.config.lwd.topology import LwdConnectionId, LwdCoordination
+from vllm.config.lwd.topology import LwdConnectionId
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
     LwdCloudEngineCore,
@@ -58,17 +58,24 @@ class _RecordingPlane(LwdEdgeControlPlane):
 
 
 class _RecordingProbeManager:
-    """Stands in for the probe manager: records runtime cloud
-    registrations (the probe-targeting half of elastic scale-out)."""
+    """Stands in for the probe manager: records runtime connection
+    registrations (the probe-targeting half of elastic scale-out). The
+    scale API is connection-grained: register_connection takes the
+    LwdConnectionId (cloud_id, dp_idx included) and the coordination
+    URL, and the health rotation widens with (cloud_id, dp_idx) targets."""
 
     def __init__(self) -> None:
-        self.registered: list[tuple[int, str]] = []
+        self.registered: list[tuple[LwdConnectionId, str]] = []
 
-    def register_cloud(self, cloud_id: int, url: str) -> None:
-        self.registered.append((cloud_id, url))
+    def register_connection(self, connection_id: LwdConnectionId, url: str) -> None:
+        self.registered.append((connection_id, url))
 
-    def rotation(self) -> tuple[int, ...]:
-        return tuple(cloud_id for cloud_id, _ in self.registered)
+    def rotation(self) -> tuple[tuple[int, int], ...]:
+        # Mirrors LwdCloudHealthTracker.targets: (cloud_id, dp_idx) pairs.
+        return tuple(
+            (connection_id.cloud_id, connection_id.dp_idx)
+            for connection_id, _ in self.registered
+        )
 
 
 class _RecordingScheduler:
@@ -139,16 +146,14 @@ def _write(path: Path, payload: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
-def _cluster_payload(
-    edges: int, clouds: int, *, known_clouds: int = 0
-) -> dict[str, Any]:
-    """An E×C lwd_cluster host-comm topology: the scene requires an
-    enabled coordination block on every instance. The edges' URL maps
-    cover ``known_clouds`` clouds (default: all of them) — the increment
-    contract keeps edge instances byte-identical, so a grown deployment
-    still carries only the startup map and the new cloud's URL must be
-    derived from ITS instance block at runtime."""
-    known = clouds if known_clouds == 0 else known_clouds
+def _cluster_payload(edges: int, clouds: int) -> dict[str, Any]:
+    """An E×C lwd_cluster host-comm topology. The scene requires an
+    enabled coordination block on every instance, and every cloud DP
+    carries its coordination endpoint itself (coord_port, with coord_url
+    derived from it at parse time) — so the increment contract keeps
+    existing instances byte-identical and a new cloud's endpoint arrives
+    attached to the new cloud's own DP block, never as an edit to an
+    edge."""
     return {
         "deployment": {
             "mode": 0,
@@ -167,16 +172,8 @@ def _cluster_payload(
                 "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}],
                 "coordination": {
                     "enabled": True,
-                    # yaml mapping keys are strings (the loader's
-                    # invariant); the config layer coerces them to ints.
-                    # The URLs carry the coordination endpoint's PATH —
-                    # the runtime derivation borrows it for an adopted
-                    # cloud (the probe POSTs to the full URL; a bare
-                    # host:port would 404).
-                    "control_url_map": {
-                        str(c): f"http://16.32.10.1{c}:8100/v1/chat/completions"
-                        for c in range(known)
-                    },
+                    "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+                    "connect_timeout": 5.0,
                 },
             }
             for e in range(edges)
@@ -190,9 +187,10 @@ def _cluster_payload(
                         "addr": f"16.32.10.1{c}",
                         "ctrl_port": 5550 + c,
                         "data_port": 5560 + c,
+                        "coord_port": 8100 + c,
                     }
                 ],
-                "coordination": {"enabled": True, "listen_port": 8100 + c},
+                "coordination": {"enabled": True, "listen_host": "0.0.0.0"},
             }
             for c in range(clouds)
         ],
@@ -209,18 +207,19 @@ def _engine(
     instance_id: int = 0,
 ) -> LwdEdgeEngineCore:
     payload = _payload(1) if payload is None else payload
+    topology = LwdTopology.from_dict(payload)
     engine = object.__new__(LwdEdgeEngineCore)
     engine.lwd_config = SimpleNamespace(
         path=str(path),
-        topology=LwdTopology.from_dict(payload),
+        topology=topology,
         instance_id=instance_id,
         # The watch gate reads the role against the scene before the
-        # watcher thread ever starts; the probe-path derivation reads
-        # this edge's own coordination template.
+        # watcher thread ever starts; the coordination block mirrors the
+        # config layer's per-instance LwdCoordination (scale fields:
+        # enabled/placement_only/tenant_key_file/... — the probe/prefix
+        # paths read it; there is no edge-side URL template anymore).
         role="edge",
-        coordination=LwdTopology.from_dict(payload)
-        .instance("edge", instance_id)
-        .coordination,
+        coordination=topology.instance("edge", instance_id).coordination,
     )
     engine._lwd_topology_file_digest = engine.lwd_config.topology.digest
     engine._lwd_control_plane = _RecordingPlane()
@@ -252,68 +251,89 @@ def test_an_added_pair_is_detected(tmp_path: Path) -> None:
     assert engine.scheduler.connections == [LwdConnectionId(1, 1, 0)]
 
 
-def test_the_probe_url_path_borrows_the_edge_template() -> None:
-    """The runtime-derived probe URL carries the coordination endpoint's
-    path, borrowed from THIS edge's own startup control_url: the probe
-    POSTs to the full URL (the cloud's app routes /v1/chat/completions),
-    so a bare host:port would 404. Both config shapes (the legacy single
-    URL and the map) serve as the template; no template at all means no
-    path can be inferred."""
+def test_the_runtime_probe_url_comes_from_the_cloud_dp_block() -> None:
+    """The runtime-registered probe URL comes from the adopted cloud's
+    OWN DP block: an explicit coord_url (DNS/NAT/gateway deployments —
+    the complete URL the probe POSTs to) wins, otherwise it is derived
+    from the DP's routable address and coord_port. There is no edge-side
+    URL template to borrow a path from on this schema; a DP with no
+    coordination endpoint registers nothing (an edge_share scale cloud,
+    by design)."""
     engine = object.__new__(LwdEdgeEngineCore)
-    engine.lwd_config = SimpleNamespace(
-        coordination=LwdCoordination(
-            enabled=True,
-            control_url="http://16.32.2.2:9133/v1/chat/completions",
+    engine._lwd_probe_manager = _RecordingProbeManager()
+    # Explicit coord_url wins over the addr:coord_port derivation (a
+    # gateway whose external port differs from anything derivable).
+    engine._lwd_register_probe_cloud(
+        SimpleNamespace(
+            connection_id=LwdConnectionId(0, 1, 0),
+            cloud=SimpleNamespace(
+                addr="16.32.10.11",
+                coord_port=8101,
+                coord_url="https://gateway.example.com:443",
+            ),
         )
     )
-    assert engine._lwd_probe_url_path() == "/v1/chat/completions"
-    engine.lwd_config = SimpleNamespace(
-        coordination=LwdCoordination(
-            enabled=True,
-            control_url_map={0: "http://c0:9133/v1/chat/completions"},
+    # No explicit URL: derived from this DP's own address + coord_port.
+    engine._lwd_register_probe_cloud(
+        SimpleNamespace(
+            connection_id=LwdConnectionId(0, 2, 0),
+            cloud=SimpleNamespace(
+                addr="16.32.10.12", coord_port=8102, coord_url=None
+            ),
         )
     )
-    assert engine._lwd_probe_url_path() == "/v1/chat/completions"
-    engine.lwd_config = SimpleNamespace(
-        coordination=LwdCoordination(enabled=True)
+    # No coordination endpoint at all: nothing is registered.
+    engine._lwd_register_probe_cloud(
+        SimpleNamespace(
+            connection_id=LwdConnectionId(0, 3, 0),
+            cloud=SimpleNamespace(
+                addr="16.32.10.13", coord_port=None, coord_url=None
+            ),
+        )
     )
-    assert engine._lwd_probe_url_path() == ""
+    assert engine._lwd_probe_manager.registered == [
+        (LwdConnectionId(0, 1, 0), "https://gateway.example.com:443"),
+        (LwdConnectionId(0, 2, 0), "http://16.32.10.12:8102"),
+    ]
+    # The registrations widen the health rotation to the adopted cloud DPs.
+    assert engine._lwd_probe_manager.rotation() == ((1, 0), (2, 0))
 
 
 def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     tmp_path: Path,
 ) -> None:
-    """lwd_cluster routing fix: the probe manager's cloud set — the
+    """lwd_cluster routing fix: the probe manager's target set — the
     health rotation and the URL map — was frozen at startup, so after a
     2e1c -> 2e2c scale-out every probe (and the routing preference it
-    produces) stayed pinned to cloud 0. When the operator does NOT grow
-    this edge's own URL map (kept frozen here), the apply hook derives
-    the adopted cloud's URL from ITS instance block and registers it for
-    probe targeting; the operator-map variant is covered by the test
-    below."""
+    produces) stayed pinned to cloud 0. The apply hook registers the
+    adopted connection with the scale API — register_connection takes
+    the LwdConnectionId and the URL straight from the new cloud's own DP
+    block (coord_url, derived at parse time from its addr:coord_port);
+    no edge-side template is involved."""
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _cluster_payload(2, 1))
     engine = _engine(topology_file, _cluster_payload(2, 1))
-    # The grown deployment: both edges byte-identical (their URL maps
-    # still cover only cloud 0), cloud 1 appended with its own
-    # coordination block.
-    _write(topology_file, _cluster_payload(2, 2, known_clouds=1))
+    # The grown deployment: both edges byte-identical, cloud 1 appended
+    # with its own coordination endpoint in its own DP block.
+    _write(topology_file, _cluster_payload(2, 2))
     verdict = engine._lwd_process_topology_reload()
     assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
     assert verdict.new_cloud_ids == (1,)
     # Edge 0's engine applied only its own connection (edge 1's engine
-    # watches the same file and applies its own) and taught the probe
-    # manager cloud 1's URL: the cloud DP's routable address plus its
-    # coordination listener port.
+    # watches the same file and applies its own): the control-plane link
+    # to the adopted cloud's DP endpoint.
     assert engine._lwd_control_plane.links == [
         ("tcp://16.32.10.11:5551", LwdConnectionId(0, 1, 0), 1)
     ]
-    # The registered URL carries the endpoint's path — borrowed from this
-    # edge's own startup control_url (the topology stores host/port per
-    # cloud only), appended to the adopted cloud's host:port.
+    # The probe manager learned the new cloud through its CONNECTION
+    # (cloud_id and dp_idx travel in the LwdConnectionId): the registered
+    # URL is the cloud DP's own coord_url — derived from its routable
+    # address and coordination port, the complete URL the probe POSTs
+    # to (no path suffix, nothing borrowed from the edge).
     assert engine._lwd_probe_manager.registered == [
-        (1, "http://16.32.10.11:8101/v1/chat/completions")
+        (LwdConnectionId(0, 1, 0), "http://16.32.10.11:8101")
     ]
+    assert engine._lwd_probe_manager.rotation() == ((1, 0),)
     # The data-plane hook registry is empty in this process, so the
     # connection stays control-plane only — but the probe registration
     # has already happened (it precedes the arm attempt and never rolls
@@ -322,23 +342,37 @@ def test_a_lwd_cluster_scale_out_teaches_the_probe_manager_the_new_cloud(
     assert (1, 0) not in engine._lwd_armed_connections
 
 
-def test_a_lwd_cluster_scale_out_prefers_the_operators_grown_map(
+def test_a_lwd_cluster_scale_out_needs_no_existing_edge_edit(
     tmp_path: Path,
 ) -> None:
-    """The relaxed R2 lets an edge's own control_url_map grow with the
-    new cloud (the natural hand edit) — that explicit entry WINS over the
-    derivation from the cloud's block. The payload's map template pins
-    port 8100 while cloud 1's listener sits on 8101, so the assertion
-    tells the two sources apart."""
+    """R2 on this schema: adding a cloud requires NO edit to any existing
+    instance — the new cloud's coordination URL lives in its own DP block
+    (coord_port/coord_url), not in an edge-side map, so the natural hand
+    edit (append the cloud instance, touch nothing else) passes the
+    strict byte-identical comparison. The retired old-branch exemption
+    (growing an edge's control_url_map) targeted a field this schema
+    rejects at parse time, so nothing is relaxed — and a hand edit that
+    DOES touch a realized instance (here an edge's coordination tunable)
+    is rejected outright."""
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _cluster_payload(2, 1))
     engine = _engine(topology_file, _cluster_payload(2, 1))
-    _write(topology_file, _cluster_payload(2, 2))  # the maps grew with cloud 1
+    # The natural hand edit: cloud 1 appended, every existing edge and
+    # cloud byte-identical — accepted, no exemption needed.
+    _write(topology_file, _cluster_payload(2, 2))
     verdict = engine._lwd_process_topology_reload()
     assert verdict is not None and not isinstance(verdict, LwdTopologyUpdateRejected)
-    assert engine._lwd_probe_manager.registered == [
-        (1, "http://16.32.10.11:8100/v1/chat/completions")
-    ]
+    assert verdict.new_cloud_ids == (1,)
+    # The same addition with one extra tweak to an EXISTING instance is
+    # rejected by the strict comparison: no field of a realized instance
+    # may move, coordination tunables included.
+    touched = _cluster_payload(2, 2)
+    touched["edges"][0]["coordination"]["connect_timeout"] = 6.0
+    _write(topology_file, touched)
+    rejected = engine._lwd_process_topology_reload()
+    assert isinstance(rejected, LwdTopologyUpdateRejected)
+    assert "existing instance modified" in rejected.reason
+    assert "edge 0.coordination.connect_timeout" in rejected.reason
 
 
 def test_applying_the_same_increment_twice_adds_each_link_once(
@@ -568,7 +602,9 @@ def test_the_watch_gate_watches_only_the_shared_side_of_the_scene(
 ) -> None:
     """The shared side watches its plan: the edge engine in edge_share
     (clouds join the running engine), the cloud engine in cloud_share
-    (edges join the running cloud). The other side always starts fresh
+    (edges join the running cloud) — and BOTH sides in lwd_cluster,
+    where every engine watches the file and applies only its own
+    instance's connections. The other side always starts fresh
     with the grown yaml and never watches; device comm never watches."""
     topology_file = tmp_path / "topology.yaml"
     _write(topology_file, _payload(1))
@@ -591,6 +627,9 @@ def test_the_watch_gate_watches_only_the_shared_side_of_the_scene(
 
     assert gated("edge", "edge_share", host_comm=True)
     assert gated("cloud", "cloud_share", host_comm=True)
+    # lwd_cluster: every engine watches (each applies its own instance).
+    assert gated("edge", "lwd_cluster", host_comm=True)
+    assert gated("cloud", "lwd_cluster", host_comm=True)
     # The fresh side of each scene, the flipped scene, and device comm.
     assert not gated("cloud", "edge_share", host_comm=True)
     assert not gated("edge", "cloud_share", host_comm=True)
@@ -681,7 +720,9 @@ def test_the_cloud_engine_admits_edges_and_builds_the_data_plane(
 
 def _cloud_share_write(path: Path, edges: int) -> None:
     """A cloud_share topology on the cloud host's copy of the file: N
-    edges, one cloud, full mesh."""
+    edges, one cloud, full mesh. The scene's enabled coordination blocks
+    make the cloud DP's coordination endpoint (coord_port, coord_url
+    derived from it) mandatory."""
     payload = {
         "deployment": {
             "mode": 0,
@@ -712,6 +753,7 @@ def _cloud_share_write(path: Path, edges: int) -> None:
                         "addr": "16.32.2.2",
                         "ctrl_port": 5550,
                         "data_port": 5560,
+                        "coord_port": 8100,
                     }
                 ],
             }

@@ -338,3 +338,99 @@ def test_admit_failure_cancels_unadmitted_usage_drain() -> None:
     engine._lwd_probe_manager.abort.assert_called_once_with("r")
     engine._lwd_probe_manager.mark_admitted.assert_not_called()
     engine.scheduler.lwd_edge_cancel_admission.assert_called_once_with("r")
+
+
+def _config_for(
+    connections: list, prefix_enabled: bool = True
+) -> SimpleNamespace:
+    config = _config(prefix_enabled)
+    config.lwd_config.connections = connections
+    return config
+
+
+def _request_with(request_id: str) -> SimpleNamespace:
+    request = _request()
+    request.request_id = request_id
+    return request
+
+
+def test_register_connection_widens_probe_targeting() -> None:
+    """Elastic scale-out: a runtime-adopted connection joins probe
+    targeting through register_connection() — the fanout covers it
+    exactly like a startup target, so probes (and the routing preference
+    they produce) spread over every adopted cloud."""
+    manager = LwdEdgeProbeManager(
+        _config_for([_connection(0, 0, 0)]), lambda: None
+    )
+    calls: list[tuple[int, int]] = []
+    activity = {"active": 0, "max_active": 0}
+    manager._client = lambda target, _block_size: _Client(target, calls, activity)
+    try:
+        manager.register_connection(LwdConnectionId(0, 1, 0), "http://cloud1:8100")
+        assert manager._targets[LwdConnectionId(0, 1, 0)] == "http://cloud1:8100"
+        assert (1, 0) in manager.rotation()
+        assert manager.submit(_request_with("r0")) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert sorted(calls) == [(0, 0), (1, 0)]
+        assert len(completion.candidates) == 2
+    finally:
+        manager.close()
+
+
+def test_runtime_registration_alone_enables_probing() -> None:
+    """A manager with no startup targets is disabled; one runtime
+    registration enables it (first registration wins, a replay never
+    rewrites the URL)."""
+    manager = LwdEdgeProbeManager(_config_for([]), lambda: None)
+    try:
+        assert not manager.enabled
+        target = LwdConnectionId(0, 5, 0)
+        manager.register_connection(target, "http://runtime:8100")
+        assert manager.enabled
+        manager.register_connection(target, "http://later:8100")
+        assert manager._targets[target] == "http://runtime:8100"
+    finally:
+        manager.close()
+
+
+def test_silent_clouds_leave_probe_targeting_until_recovered() -> None:
+    """Cloud-grained liveness verdict: a fully silent cloud leaves probe
+    targeting; the empty verdict (the resumed beat) restores the fanout;
+    an everything-silent verdict fails open — the admission gate owns the
+    fully-silent steady state, this covers only the sweep-gap race."""
+    manager = LwdEdgeProbeManager(
+        _config_for([_connection(0, 0, 0), _connection(0, 1, 0)]), lambda: None
+    )
+    calls: list[tuple[int, int]] = []
+    activity = {"active": 0, "max_active": 0}
+    clients = {
+        target: _Client(target, calls, activity) for target in manager._targets
+    }
+    manager._client = lambda target, _block_size: clients[target]
+    try:
+        assert manager.submit(_request_with("r0")) is LwdProbeSubmission.SUBMITTED
+        _drain(manager)
+        assert sorted(calls) == [(0, 0), (1, 0)]
+        calls.clear()
+
+        manager.set_silent_clouds(frozenset({1}))
+        assert manager.submit(_request_with("r1")) is LwdProbeSubmission.SUBMITTED
+        completion = _drain(manager)
+        assert calls == [(0, 0)]
+        assert [candidate.connection_id for candidate in completion.candidates] == [
+            LwdConnectionId(0, 0, 0)
+        ]
+        calls.clear()
+
+        manager.set_silent_clouds(frozenset())
+        assert manager.submit(_request_with("r2")) is LwdProbeSubmission.SUBMITTED
+        _drain(manager)
+        assert sorted(calls) == [(0, 0), (1, 0)]
+        calls.clear()
+
+        manager.set_silent_clouds(frozenset({0, 1}))
+        assert manager.submit(_request_with("r3")) is LwdProbeSubmission.SUBMITTED
+        _drain(manager)
+        assert sorted(calls) == [(0, 0), (1, 0)]
+    finally:
+        manager.close()
