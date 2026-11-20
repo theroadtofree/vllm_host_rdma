@@ -165,7 +165,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # NOTHING (no io loop yet), so a request sent during it produces
         # zero engine logs by design — this line is how you tell that
         # state apart from a stuck engine thread.
-        lwd_logger.error(
+        lwd_logger.info(
             "[edge] waiting for cloud handshakes: %d planned connections "
             "(timeout %.0fs)",
             len(self.lwd_config.connections),
@@ -206,7 +206,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
-        lwd_logger.error(
+        lwd_logger.info(
             "[edge] engine assembled: %d cloud DP ranks, native batch-queue "
             "stepping depth=%d",
             len(self._lwd_clouds),
@@ -513,7 +513,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 f"cloud={remote}; a mismatch makes the cloud hold prefills "
                 "behind decodes forever, so start both sides with the same values"
             )
-        lwd_logger.error("[cloud-params] %s limits verified: %s", dp_idx, local)
+        lwd_logger.info("[cloud-params] %s limits verified: %s", dp_idx, local)
 
     def _lwd_send_to_cloud(
         self, dp_idx: LwdConnectionId, message: LwdEdgeToCloudMessage
@@ -631,9 +631,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         # The one line that answers "which cloud did this request go to":
         # routed-connection vs preferred-connection contrast exposes a
         # dropped probe preference (None = round-robin/scoring decided).
-        # ERROR for now — the deployment reads error level only; demote
-        # once the scale-out diagnosis closes.
-        lwd_logger.error(
+        lwd_logger.info(
             "[edge] request routed req=%s -> %s (probe preferred=%s)",
             request.request_id,
             dp_idx,

@@ -191,7 +191,7 @@ class LwdBaseEngineCore(EngineCoreProc):
             name="lwd-topology-watch",
             daemon=True,
         ).start()
-        lwd_logger.error(
+        lwd_logger.info(
             "[LWD] topology file watch up: %s (every %.1fs)",
             self.lwd_config.path,
             _LWD_TOPOLOGY_POLL_INTERVAL_S,

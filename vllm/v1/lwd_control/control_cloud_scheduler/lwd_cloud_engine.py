@@ -306,7 +306,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         # reservation, routing and coordinator state therefore have one owner:
         # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
-        lwd_logger.error(
+        lwd_logger.info(
             "[cloud] engine assembled: control plane on %s", plane.endpoint
         )
         # Liveness epoch (peer-restart line): random per process launch; the
@@ -746,9 +746,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_track_range(connection_id, notify.seqno, request_ids)
         # First-arrival marker per batch (dup/stale filtered above): the
         # cloud-side proof that requests from this edge actually landed.
-        # ERROR for now — the deployment reads error level only; demote
-        # once the scale-out diagnosis closes.
-        lwd_logger.error(
+        lwd_logger.info(
             "[cloud] range notify received on %s seqno=%d reqs=%s",
             connection_id,
             notify.seqno,
