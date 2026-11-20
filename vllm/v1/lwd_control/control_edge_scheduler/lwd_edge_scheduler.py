@@ -127,6 +127,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             sorted(c.connection_id for c in lwd_config.connections)
         )
         self._lwd_connections = connections
+        # Liveness verdict of the engine's sweep (frozen snapshot,
+        # atomically swapped in via lwd_update_silent_routes): a route the
+        # sweep declared dead stays out of the routing candidates while
+        # its siblings are alive.
+        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
             connection_id: LwdCloudDpAccount(connection_id)
             for connection_id in connections
@@ -191,6 +196,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self._lwd_accounts[connection_id] = LwdCloudDpAccount(connection_id)
         self._lwd_aborted_req_ids.setdefault(connection_id, [])
 
+    def lwd_update_silent_routes(self, silent: frozenset[LwdConnectionId]) -> None:
+        """Engine thread: the liveness sweep's frozen verdict (a cloud DP
+        went silent, or its heartbeat resumed). One atomic frozenset swap;
+        routing reads it on the same thread."""
+        self._lwd_silent_routes = silent
+
     def lwd_arm_runtime_connection(self, connection_id: LwdConnectionId) -> None:
         """Open a runtime connection for service: it joins the routing
         candidates (sorted, so the round-robin order stays stable).
@@ -240,20 +251,36 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"[LWD] no cloud connection for edge_id={edge_id} "
                 f"(request {request_id})"
             )
+        # Liveness: a route the sweep declared silent is not a candidate —
+        # round-robin must not keep sending requests to a dead cloud while
+        # a sibling route is alive (partial silence: the gate admits, so
+        # the dead cloud would otherwise eat every other request). Fail
+        # open when every candidate is silent: the gate already rejects
+        # the fully-silent case at admission, so this covers only the
+        # admit/route race, and the transfer containment owns whatever
+        # still slips through.
+        healthy = {
+            connection_id: account
+            for connection_id, account in candidates.items()
+            if connection_id not in self._lwd_silent_routes
+        }
+        if healthy:
+            candidates = healthy
         if preferred is not None and preferred not in candidates:
             # The probe produced a preference the router cannot honor: the
-            # connection is not an armed routing candidate (data-plane
-            # build refused, or this edge adopted it but the scheduler
-            # never armed it). The request silently falls back — this log
-            # is the elastic scale-out diagnosis cue.
+            # connection is not an armable routing candidate (data-plane
+            # build refused) or the liveness sweep declared it silent. The
+            # request silently falls back — this log is the elastic
+            # scale-out diagnosis cue.
             lwd_logger.error(
                 "[LWD] preferred %s is not a routing candidate for "
-                "edge_id=%d (request %s): candidates=%s; falling back to "
-                "score/round-robin",
+                "edge_id=%d (request %s): candidates=%s silent=%s; "
+                "falling back to score/round-robin",
                 preferred,
                 edge_id,
                 request_id,
                 [cid for cid in candidates],
+                sorted(self._lwd_silent_routes),
             )
         if preferred is not None and preferred in candidates:
             best = candidates[preferred]

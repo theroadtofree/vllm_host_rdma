@@ -26,6 +26,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_engine import (
     LwdEdgeEngineCore,
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_scheduler import (
+    LwdCloudDpAccount,
     LwdEdgeScheduler,
 )
 from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks as hooks_module
@@ -63,12 +64,18 @@ def _scheduler_stub(
 ) -> SimpleNamespace:
     """Scheduler carrying the routing edge-identity fields the gate reads;
     ``_lwd_edge_id_of`` is the REAL scheduler method bound to the stub, so
-    the gate and its tests judge edge identity exactly like routing does."""
+    the gate and its tests judge edge identity exactly like routing does.
+    ``lwd_update_silent_routes`` records the liveness pushes the sweep
+    and the beat-recovery mirror into the real scheduler."""
     stub = SimpleNamespace(
         _lwd_edge_share=edge_share,
         _lwd_instance_id=instance_id,
+        silent_pushes=[],
     )
     stub._lwd_edge_id_of = MethodType(LwdEdgeScheduler._lwd_edge_id_of, stub)
+    stub.lwd_update_silent_routes = (
+        lambda silent: stub.silent_pushes.append(silent)
+    )
     return stub
 
 
@@ -127,6 +134,8 @@ def test_beat_releases_the_gate_after_silence(monkeypatch: pytest.MonkeyPatch) -
     engine._lwd_beat(CONNECTION, "boot-a")
     assert engine._lwd_silent_routes == frozenset()
     assert notified == []
+    # Recovery releases the ROUTING exclusion together with the gate.
+    assert engine.scheduler.silent_pushes[-1] == frozenset()
 
 
 def test_sweep_marks_silent_and_fires_the_teardown(
@@ -140,6 +149,9 @@ def test_sweep_marks_silent_and_fires_the_teardown(
     assert len(notified) == 1
     assert notified[0][0] == 0 and notified[0][1] == 0
     assert "heartbeat silent" in notified[0][2]
+    # The frozen verdict is mirrored into the scheduler: routing keeps
+    # the dead route out of its candidates until recovery.
+    assert engine.scheduler.silent_pushes[-1] == frozenset({CONNECTION})
     # The silent transition fires once: a second sweep does not re-notify.
     engine._lwd_last_sweep = 0.0
     engine._lwd_sweep_liveness()
@@ -153,6 +165,40 @@ def test_sweep_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
     engine._lwd_sweep_liveness()
     engine._lwd_sweep_liveness()  # within the sweep interval: no-op
     assert len(notified) == 1
+
+
+def test_routing_excludes_silent_routes_but_fails_open() -> None:
+    """A dead cloud must not eat round-robin traffic while its sibling
+    serves: the sweep's frozen verdict keeps the silent route out of the
+    routing candidates (a preferred pointing at it falls back too). When
+    EVERY candidate is silent the filter fails open — the gate owns the
+    fully-silent rejection at admission, the transfer containment owns
+    the residual admit/route race."""
+    alive = LwdConnectionId(1, 0, 0)
+    dead = LwdConnectionId(1, 1, 0)
+    stub = SimpleNamespace(
+        _lwd_connections=(alive, dead),
+        _lwd_accounts={cid: LwdCloudDpAccount(cid) for cid in (alive, dead)},
+        _lwd_route={},
+        _lwd_last_engine=-1,
+        _lwd_silent_routes=frozenset({dead}),
+    )
+    stub._lwd_route_request = MethodType(
+        LwdEdgeScheduler._lwd_route_request, stub
+    )
+    # A preferred that points at the silent cloud falls back; plain
+    # round-robin never picks it either.
+    assert stub._lwd_route_request("r1", 1, dead) == alive
+    assert stub._lwd_route_request("r2", 1) == alive
+    assert stub._lwd_route_request("r3", 1, None) == alive
+    # Fail open: every candidate silent -> still routable (the race arm;
+    # the gate has already rejected the steady-state fully-silent case).
+    stub._lwd_silent_routes = frozenset({alive, dead})
+    assert stub._lwd_route_request("r4", 1) in (alive, dead)
+    # And with no silence at all, both routes are candidates again.
+    stub._lwd_silent_routes = frozenset()
+    routed = {stub._lwd_route_request(f"r{5 + i}", 1) for i in range(8)}
+    assert routed == {alive, dead}
 
 
 def test_gate_rejects_only_when_the_routes_are_silent(

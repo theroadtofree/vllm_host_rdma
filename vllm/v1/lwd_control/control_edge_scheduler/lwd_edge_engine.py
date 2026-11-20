@@ -810,6 +810,10 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 self._lwd_silent.discard(connection)
                 self._lwd_silent_routes = frozenset(self._lwd_silent)
         if was_silent:
+            # Release the routing exclusion together with the gate: the
+            # route is alive again. The scheduler swap happens off-lock —
+            # the frozenset was already built under it.
+            self.scheduler.lwd_update_silent_routes(self._lwd_silent_routes)
             lwd_logger.error(
                 "[edge] %s back after silence (heartbeat resumed)", connection
             )
@@ -842,6 +846,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             for connection, _ in gone:
                 self._lwd_silent.add(connection)
                 self._lwd_silent_routes = frozenset(self._lwd_silent)
+            # Mirror the frozen verdict into the scheduler: routing keeps
+            # the dead route out of its candidates until recovery.
+            self.scheduler.lwd_update_silent_routes(self._lwd_silent_routes)
         for connection, silent_for in gone:
             lwd_logger.error(
                 "[edge] %s silent %.0fs (no cloud heartbeat)",

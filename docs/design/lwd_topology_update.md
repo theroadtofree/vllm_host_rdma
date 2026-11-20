@@ -364,6 +364,19 @@ plane build, and the probe rotation widens to cloud 1 → requests
 spread over both clouds (round-robin preference via probe completions;
 an unarmed or cooling cloud falls back to the armed candidates).
 
+**Partial-death routing (2026-11-20)**: a stopped cloud must not keep
+eating traffic while its sibling serves. The liveness sweep's frozen
+verdict (`_lwd_silent_routes`) is mirrored into the scheduler at BOTH
+transitions — death (sweep) and recovery (beat) — via
+`lwd_update_silent_routes`; `_lwd_route_request` filters the silent
+routes out of the round-robin candidates, failing open when every
+candidate is silent (the gate owns the fully-silent rejection at
+admission; the transfer containment owns the residual admit/route
+race). A probe preferred pointing at a silent cloud falls back the
+same way. Probe cooldown already keeps the dead cloud out of probe
+targeting; this closes the preferred=None path that round-robined
+into it.
+
 ## 7. Processing order (caller flow, Phase A)
 
 ```text
