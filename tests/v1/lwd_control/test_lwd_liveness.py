@@ -103,6 +103,11 @@ def _edge_engine(
     engine._lwd_runtime_connections = set()
     engine._lwd_armed_connections = set()
     engine.scheduler = _scheduler_stub(edge_share=edge_share, instance_id=instance_id)
+    # Probe-manager stand-in: records the cloud-grained liveness pushes
+    # (a fully silent cloud leaves probe targeting until recovery).
+    probe = SimpleNamespace(silent_pushes=[])
+    probe.set_silent_clouds = lambda ids: probe.silent_pushes.append(ids)
+    engine._lwd_probe_manager = probe
     monkeypatch.setattr(
         lwd_edge_engine,
         "notify_cloud_restarted",
@@ -136,6 +141,8 @@ def test_beat_releases_the_gate_after_silence(monkeypatch: pytest.MonkeyPatch) -
     assert notified == []
     # Recovery releases the ROUTING exclusion together with the gate.
     assert engine.scheduler.silent_pushes[-1] == frozenset()
+    # ...and the cloud re-enters the probe rotation.
+    assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset()
 
 
 def test_sweep_marks_silent_and_fires_the_teardown(
@@ -152,10 +159,36 @@ def test_sweep_marks_silent_and_fires_the_teardown(
     # The frozen verdict is mirrored into the scheduler: routing keeps
     # the dead route out of its candidates until recovery.
     assert engine.scheduler.silent_pushes[-1] == frozenset({CONNECTION})
+    # ...and into the probe manager: the fully silent cloud (every
+    # adopted route of it is silent) leaves probe targeting.
+    assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset({0})
     # The silent transition fires once: a second sweep does not re-notify.
     engine._lwd_last_sweep = 0.0
     engine._lwd_sweep_liveness()
     assert len(notified) == 1
+
+
+def test_probe_targeting_leaves_only_fully_silent_clouds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloud-grained probe exclusion: a cloud stays probeable while ANY of
+    its adopted DP routes is alive (the coordination HTTP listener lives
+    with the instance process); only a cloud whose every adopted route is
+    silent leaves probe targeting."""
+    notified: list = []
+    dp0 = LwdConnectionId(0, 0, 0)
+    dp1 = LwdConnectionId(0, 0, 1)
+    engine = _edge_engine(monkeypatch, [dp0, dp1], notified)
+    engine._lwd_hello_last[dp0] = time.monotonic() - 30.0
+    engine._lwd_sweep_liveness()
+    # dp0 silent, dp1 alive: cloud 0 still answers probes.
+    assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset()
+    engine._lwd_hello_last[dp1] = time.monotonic() - 30.0
+    engine._lwd_last_sweep = 0.0
+    engine._lwd_sweep_liveness()
+    # Every adopted route of cloud 0 is silent: probe targeting skips it
+    # until a heartbeat returns.
+    assert engine._lwd_probe_manager.silent_pushes[-1] == frozenset({0})
 
 
 def test_sweep_is_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:

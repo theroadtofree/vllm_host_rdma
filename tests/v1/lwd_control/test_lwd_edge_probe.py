@@ -85,16 +85,19 @@ def probe_targets(monkeypatch: pytest.MonkeyPatch) -> Any:
         lwd_edge_probe, "compute_processor_fingerprint", lambda _cfg: b"f"
     )
 
+    state = {"submitted": 0}
+
     def targets(manager: LwdEdgeProbeManager, count: int) -> list[int]:
         """One submit + drain per round: the target the probe LEFT for
-        the routing preference."""
+        the routing preference. Callable repeatedly per manager."""
         out: list[int] = []
         for i in range(count):
-            assert manager.submit(_request(f"r{i}"))
+            assert manager.submit(_request(f"r{state['submitted'] + i}"))
             (completion,) = manager.drain()
             assert completion.result is not None
             out.append(completion.target_cloud)
-        assert runtimes and runtimes[0].submitted == count
+        state["submitted"] += count
+        assert runtimes and runtimes[0].submitted == state["submitted"]
         return out
 
     return targets
@@ -158,6 +161,35 @@ def test_a_runtime_registration_alone_enables_probing() -> None:
     assert manager.enabled
     assert manager._url_for(5) == "http://c5:8100"
     assert manager._url_for(0) is None
+
+
+def test_silent_clouds_leave_probe_targeting_until_recovered(
+    probe_targets: Any,
+) -> None:
+    """The liveness verdict (cloud-grained) stops probe targeting a fully
+    silent cloud — without it, a killed member keeps eating 3 fast-fail
+    probes per cooldown cycle and the affected requests lose their probe
+    preference. Fails open when the exclusion covers everything: the
+    admission gate owns the fully-silent steady state."""
+    manager = _manager(
+        LwdCoordination(
+            enabled=True,
+            control_url_map={0: "http://c0:8100", 1: "http://c1:8100"},
+            probe_timeout=6.0,
+        )
+    )
+    assert probe_targets(manager, 2) == [0, 1]
+    manager.set_silent_clouds(frozenset({1}))
+    assert probe_targets(manager, 4) == [0, 0, 0, 0]
+    # Recovery (the engine pushes the empty set on the resumed beat):
+    # the cursor carried through the excluded period, the rotation just
+    # continues over the full tuple.
+    manager.set_silent_clouds(frozenset())
+    assert probe_targets(manager, 2) == [0, 1]
+    # Fail open: every rotation member silent — probing still beats not
+    # probing in the gate's race window.
+    manager.set_silent_clouds(frozenset({0, 1}))
+    assert probe_targets(manager, 2) == [0, 1]
 
 
 def test_drain_rebuilds_a_runtime_cloud_manifest_without_a_keyerror(

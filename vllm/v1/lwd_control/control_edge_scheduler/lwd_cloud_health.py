@@ -42,8 +42,18 @@ class LwdCloudHealthTracker:
         # request routes are owned by the scheduler and are never rewritten.
         return healthy or self._cloud_ids
 
-    def next(self) -> int | None:
+    def next(self, excluded: frozenset[int] = frozenset()) -> int | None:
+        """Pick the next rotation member, skipping the excluded (liveness
+        declared them silent). Fails open when the exclusion empties the
+        pool: the admission gate owns the fully-silent steady state, this
+        covers only the sweep-gap race."""
         candidates = self.candidates()
+        if excluded:
+            live = tuple(
+                cloud_id for cloud_id in candidates
+                if cloud_id not in excluded
+            )
+            candidates = live or candidates
         if not candidates:
             return None
         cloud_id = candidates[self._cursor % len(candidates)]

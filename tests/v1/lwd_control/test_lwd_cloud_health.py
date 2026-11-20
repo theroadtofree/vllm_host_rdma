@@ -50,6 +50,20 @@ def test_added_cloud_can_cool_down_like_a_startup_cloud() -> None:
     assert tracker.candidates(now=now) == (0, 1)
 
 
+def test_next_skips_excluded_clouds_with_fail_open() -> None:
+    """The liveness exclusion: a fully silent cloud leaves probe targeting.
+    Fails open when the exclusion covers everything (the admission gate
+    owns the fully-silent steady state)."""
+    tracker = LwdCloudHealthTracker([0, 1])
+    assert [tracker.next(frozenset({1})) for _ in range(3)] == [0, 0, 0]
+    assert [tracker.next(frozenset({0})) for _ in range(2)] == [1, 1]
+    # Fail open: the exclusion covers everything (the admission gate owns
+    # the fully-silent steady state). The cursor carries through the
+    # excluded period — the rotation just continues over the full tuple.
+    assert [tracker.next(frozenset({0, 1})) for _ in range(2)] == [1, 0]
+    assert tracker.next(frozenset()) in (0, 1)
+
+
 def test_concurrent_candidates_reads_never_see_a_torn_rotation() -> None:
     tracker = LwdCloudHealthTracker([0])
     stop = threading.Event()

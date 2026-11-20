@@ -814,6 +814,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             # route is alive again. The scheduler swap happens off-lock —
             # the frozenset was already built under it.
             self.scheduler.lwd_update_silent_routes(self._lwd_silent_routes)
+            self._lwd_probe_manager.set_silent_clouds(
+                self._lwd_silent_probe_clouds()
+            )
             lwd_logger.error(
                 "[edge] %s back after silence (heartbeat resumed)", connection
             )
@@ -827,6 +830,28 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             notify_cloud_restarted(
                 connection.cloud_id, connection.dp_idx, "boot id changed"
             )
+
+    def _lwd_silent_probe_clouds(self) -> frozenset[int]:
+        """Cloud-grained view of the connection-grained liveness verdict:
+        a cloud leaves probe targeting only when EVERY adopted DP route
+        of it is silent — the coordination HTTP listener lives with the
+        instance process, so any live DP heartbeat means it still answers.
+        A cloud with no adopted route yet is never excluded (its listener
+        may already be up while the handshake is pending)."""
+        silent = self._lwd_silent_routes
+        per_cloud: dict[int, list[bool]] = {}
+        # tuple() snapshot: _lwd_clouds also gains entries on the
+        # control-plane IO thread (runtime adoption) while this runs on
+        # the engine thread; the C-level copy never tears.
+        for connection in tuple(self._lwd_clouds):
+            per_cloud.setdefault(connection.cloud_id, []).append(
+                connection in silent
+            )
+        return frozenset(
+            cloud_id
+            for cloud_id, silent_flags in per_cloud.items()
+            if all(silent_flags)
+        )
 
     def _lwd_sweep_liveness(self) -> None:
         """Engine thread, rate-limited to the sweep interval: a silent
@@ -846,9 +871,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             for connection, _ in gone:
                 self._lwd_silent.add(connection)
                 self._lwd_silent_routes = frozenset(self._lwd_silent)
-            # Mirror the frozen verdict into the scheduler: routing keeps
-            # the dead route out of its candidates until recovery.
+            # Mirror the frozen verdict into the scheduler (routing keeps
+            # the dead route out of its candidates) and into the probe
+            # manager (targeting skips the fully silent cloud).
             self.scheduler.lwd_update_silent_routes(self._lwd_silent_routes)
+            self._lwd_probe_manager.set_silent_clouds(
+                self._lwd_silent_probe_clouds()
+            )
         for connection, silent_for in gone:
             lwd_logger.error(
                 "[edge] %s silent %.0fs (no cloud heartbeat)",

@@ -94,6 +94,16 @@ class LwdEdgeProbeManager:
         # keeps this edge's own coordination block byte-identical, so a cloud
         # added mid-run brings its URL here instead of the startup map.
         self._runtime_urls: dict[int, str] = {}
+        # Liveness verdict, cloud-grained (pushed by the engine's sweep):
+        # a killed cloud keeps eating 3 fast-fail probes per cooldown cycle
+        # otherwise, and the affected requests lose their probe preference.
+        self._silent_clouds: frozenset[int] = frozenset()
+
+    def set_silent_clouds(self, cloud_ids: frozenset[int]) -> None:
+        """Engine thread: stop probing fully silent clouds until their
+        heartbeat returns (the engine re-pushes the empty set on
+        recovery)."""
+        self._silent_clouds = frozenset(cloud_ids)
 
     def rotation(self) -> tuple[int, ...]:
         """Cloud ids the health rotation may target (diagnostics)."""
@@ -198,8 +208,10 @@ class LwdEdgeProbeManager:
         # Health rotation = startup map (+ the legacy single URL as cloud 0)
         # plus every runtime-adopted cloud: elastic scale-out widens the
         # rotation without restarting, so probes — and the routing
-        # preference they produce — spread over all adopted clouds.
-        target_cloud = self._health.next()
+        # preference they produce — spread over all adopted clouds. A
+        # cloud the liveness sweep declared fully silent is skipped until
+        # its heartbeat returns.
+        target_cloud = self._health.next(self._silent_clouds)
         if target_cloud is None:
             logger.error(
                 "[LWD] probe enabled but the rotation is empty "
@@ -282,12 +294,11 @@ class LwdEdgeProbeManager:
             try:
                 outcome = future.result()
             except Exception:
-                logger.error(
+                logger.exception(
                     "[LWD] probe to cloud=%d failed (url=%s); using full "
                     "prefill",
                     target_cloud,
                     url,
-                    exc_info=True,
                 )
                 outcome = (None, manifest_chain)
             enqueue(outcome)
