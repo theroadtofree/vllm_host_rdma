@@ -118,6 +118,17 @@ class LwdCloudHandshake:
         self._sessions_by_identity: dict[bytes, _LwdEdgeSession] = {}
         self._sessions_by_peer: dict[LwdPeer, _LwdEdgeSession] = {}
 
+    def allow_edge(self, edge_id: int) -> None:
+        """Grow the allowlist by one edge id (elastic scale-out, C-2).
+
+        The check runs on the control-plane IO thread; this may be called
+        from the engine thread, so the frozenset is replaced atomically
+        (copy-on-write) — a reader sees either the old or the new set,
+        never a half-built one. Idempotent."""
+        if edge_id in self._expected_edge_ids:
+            return
+        self._expected_edge_ids = self._expected_edge_ids | frozenset((edge_id,))
+
     def peer_of(self, identity: bytes) -> LwdPeer | None:
         session = self._sessions_by_identity.get(identity)
         return session.peer if session is not None else None

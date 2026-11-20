@@ -1189,8 +1189,14 @@ class LwdUcxChannel:
                 "" if not restart else " (on_peer_restart fired)",
             )
             if restart and self._restart_cb is not None:
-                with contextlib.suppress(Exception):
+                try:
                     self._restart_cb()
+                except Exception as exc:  # noqa: BLE001 - a swallowed reset is a silent hang
+                    logger.error(
+                        "[ucx-chan] %s on_peer_restart callback failed: %r",
+                        self._name,
+                        exc,
+                    )
             if self._gen > 1:
                 logger.error(
                     "[ucx-chan] %s link REPLACED gen=%d peer_session=%016x"

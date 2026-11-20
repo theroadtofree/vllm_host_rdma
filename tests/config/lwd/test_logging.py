@@ -62,6 +62,7 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     )
     topology = actual["topology"]
     assert topology.pop("digest") == config.topology.digest
+    assert topology.pop("frontend_digest") == config.topology.frontend_digest
     assert [(link["edge"], link["cloud"]) for link in topology["instance_links"]] == [
         (0, 0),
         (1, 0),
