@@ -429,6 +429,14 @@ class LwdBaseEngineCore(EngineCoreProc):
             frame_trace_last = 0.0
             retry_log_interval_s = 60.0
             retry_log_last: dict[zmq.Socket, float] = {}
+            # Logging discipline: a socket that NEVER connected is an
+            # unclaimed capacity slot of the reserved frontend band — its
+            # steady-state retrying is not news (the startup
+            # "input thread up" line already self-certifies the address
+            # list), so it stays at debug. A socket that connected once
+            # and now retries means a REAL frontend vanished — a rare
+            # event, error-worthy and part of the restart drill chain.
+            ever_connected: set[zmq.Socket] = set()
             while True:
                 # The input thread is a daemon: an uncaught exception would
                 # kill it silently and every frontend request would hang
@@ -452,6 +460,7 @@ class LwdBaseEngineCore(EngineCoreProc):
                             event = int.from_bytes(bytes(frames[0])[:2], "little")
                             input_socket, input_address = target
                             if event == zmq.EVENT_CONNECTED:
+                                ever_connected.add(input_socket)
                                 input_socket.send(ready_payload)
                                 lwd_logger.error(
                                     "[Core] input DEALER connected to %s; "
@@ -469,13 +478,20 @@ class LwdBaseEngineCore(EngineCoreProc):
                                 >= retry_log_interval_s
                             ):
                                 retry_log_last[polled] = now
-                                lwd_logger.error(
-                                    "[Core] input DEALER connection to %s "
-                                    "still retrying; frontend not bound or "
-                                    "unreachable, its ROUTER drops the "
-                                    "messages",
-                                    input_address,
-                                )
+                                if input_socket in ever_connected:
+                                    lwd_logger.error(
+                                        "[Core] input DEALER connection to "
+                                        "%s still retrying; frontend not "
+                                        "bound or unreachable, its ROUTER "
+                                        "drops the messages",
+                                        input_address,
+                                    )
+                                else:
+                                    lwd_logger.debug(
+                                        "[Core] input DEALER to %s still "
+                                        "waiting (unclaimed capacity slot)",
+                                        input_address,
+                                    )
                             continue
                         # (RequestType, RequestData)
                         type_frame, *data_frames = polled.recv_multipart(copy=False)
