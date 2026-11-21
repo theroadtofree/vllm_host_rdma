@@ -16,6 +16,21 @@ class LwdCloudHealthTracker:
         self._cooldown_until: dict[int, float] = {}
         self._cursor = 0
 
+    def add_cloud(self, cloud_id: int) -> None:
+        """Elastic scale-out: extend the rotation with a runtime-adopted
+        cloud. Idempotent. The rotation is replaced by one atomic tuple
+        swap, so a concurrent candidates() snapshot sees either the old or
+        the new rotation, never a torn one."""
+        if cloud_id in self._failures:
+            return
+        self._failures[cloud_id] = 0
+        self._cloud_ids = tuple(sorted(self._failures))
+
+    @property
+    def cloud_ids(self) -> tuple[int, ...]:
+        """The full rotation, cooling-down clouds included (diagnostics)."""
+        return self._cloud_ids
+
     def candidates(self, now: float | None = None) -> tuple[int, ...]:
         now = time.monotonic() if now is None else now
         healthy = tuple(
@@ -27,8 +42,18 @@ class LwdCloudHealthTracker:
         # request routes are owned by the scheduler and are never rewritten.
         return healthy or self._cloud_ids
 
-    def next(self) -> int | None:
+    def next(self, excluded: frozenset[int] = frozenset()) -> int | None:
+        """Pick the next rotation member, skipping the excluded (liveness
+        declared them silent). Fails open when the exclusion empties the
+        pool: the admission gate owns the fully-silent steady state, this
+        covers only the sweep-gap race."""
         candidates = self.candidates()
+        if excluded:
+            live = tuple(
+                cloud_id for cloud_id in candidates
+                if cloud_id not in excluded
+            )
+            candidates = live or candidates
         if not candidates:
             return None
         cloud_id = candidates[self._cursor % len(candidates)]
@@ -46,9 +71,13 @@ class LwdCloudHealthTracker:
         now: float | None = None,
         threshold: int = 3,
         cooldown_s: float = 60.0,
-    ) -> None:
+    ) -> bool:
+        """Count one probe failure. Returns True when this failure put
+        the cloud into cooldown (the caller's diagnostics cue)."""
         now = time.monotonic() if now is None else now
         failures = self._failures.get(cloud_id, 0) + 1
         self._failures[cloud_id] = failures
         if failures >= threshold:
             self._cooldown_until[cloud_id] = now + cooldown_s
+            return True
+        return False
