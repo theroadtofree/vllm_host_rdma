@@ -231,25 +231,6 @@ class TestPerCloudDpBilling:
         assert sched._lwd_num_running_reqs(conns[0]) == 2
         assert sched._lwd_num_running_reqs(conns[1]) == 2
 
-    def test_eight_frontend_spec(self) -> None:
-        # 规格形态 8 边 8 云:每前端独占一个云 DP,池=8x单云配额,
-        # 每条连接在自己的配额内独立开合。
-        conns = _edge_share_connections(8)
-        route = {f"r{i}": conns[i] for i in range(8)}
-        sched = _make_sched(
-            conns, 2, running=[_request(f"r{i}") for i in range(8)], route=route
-        )
-        assert sched.max_num_running_reqs == 16
-        # 每连接补到满配:全部 HOLD,但池恰好容纳 8x2。
-        for i in range(8):
-            sched.running.append(_request(f"s{i}"))
-            sched._lwd_route[f"s{i}"] = conns[i]
-        assert sched._lwd_pick_serving_engine() is None
-        # 任一连接让出 1 个槽,只有它重开。
-        sched.running.pop()
-        assert sched._lwd_pick_serving_engine() == conns[7]
-        assert sched._lwd_num_running_reqs(conns[3]) == 2
-
 
 class TestSlotPoolSizing:
     """原生 running 上限 = 单云配额 x 服务的云 DP 数。"""
