@@ -87,8 +87,10 @@ LWD_EDGE_BATCH_QUEUE_DEPTH = 2
 # per-connection
 # end-to-end window (the cloud's early-recv pump caps in-flight UP chunks
 # per connection at 2); deeper per-connection queuing only accumulates
-# behind its backpressure.
-LWD_EDGE_HOST_MAX_INSTANCES = 4
+# behind its backpressure. 8 matches the deployment spec's frontend
+# maximum (8边8云 edge_share) and the attach band LWD_API_MAX_FRONTENDS;
+# raising the frontend count beyond 8 needs both revisited.
+LWD_EDGE_HOST_MAX_INSTANCES = 8
 LWD_EDGE_HOST_SLOTS_PER_INSTANCE = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 # Liveness sweep rate limit: the verdict's latency granularity.
