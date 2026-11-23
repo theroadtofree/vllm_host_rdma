@@ -56,8 +56,9 @@ class LwdCloudDpAccount:
         self.decode_load = 0
         """Requests routed here that finished embedding and await cloud
         results."""
-        self.gate_held = False
-        """Gate state of the last transition, for HOLD/OPEN logging only."""
+        self.gate_held: str | None = None
+        """Hold reason of the last gate state (None = open), for HOLD/OPEN
+        logging only."""
 
     @property
     def dp_idx(self) -> int:
@@ -132,22 +133,29 @@ class LwdCloudDpAccount:
 
     def is_gated(
         self,
-        max_num_running_reqs: int,
+        slot_cap: int,
         has_resume_inflight: bool,
         *,
         num_running_reqs: int,
-    ) -> bool:
-        """Whether new prefill admission to this engine must wait.
+    ) -> str | None:
+        """Whether new prefill admission to this engine must wait: None
+        admits, otherwise the hold reason ("slots"/"chunks").
 
         A resume in flight is exempt (finish in-flight chunks before new
-        ones; also prevents a max_num_seqs=1 config from deadlocking on
+        ones; also prevents a slot_cap=1 config from deadlocking on
         itself). Otherwise the engine is gated when its request slots are
-        full or its pending chunks reached the cap. Slot occupancy comes
-        from the native edge running queue; routing load also counts
-        waiting requests, which must not block their own admission.
+        full or its pending chunks reached the cap. Slot occupancy counts
+        only requests billed to this connection's cloud DP: the contract
+        grant (max_num_seqs, force-equal across clouds) belongs to the
+        cloud, so connections sharing one cloud split a single grant and
+        edge_share connections each carry their own. Routing load also
+        counts waiting requests, which must not block their own
+        admission.
         """
         if has_resume_inflight:
-            return False
-        if num_running_reqs >= max_num_running_reqs:
-            return True
-        return self.pending_chunks() >= self.max_pending_chunks
+            return None
+        if num_running_reqs >= slot_cap:
+            return "slots"
+        if self.pending_chunks() >= self.max_pending_chunks:
+            return "chunks"
+        return None
