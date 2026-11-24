@@ -61,9 +61,22 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
     """
     scene, edges, clouds = shape
     shared_edge = scene == "edge_share"
+    # Shared/multi-cloud scenes require an enabled coordination block on
+    # every edge (topology validation); edge_share/single_instance don't.
+    coordinated = scene in ("cloud_share", "lwd_cluster")
     edge_entries = [
         {
             "id": edge_id,
+            **(
+                {
+                    "coordination": {
+                        "enabled": True,
+                        "consumer_id": f"enterprise-a-edge{edge_id}",
+                    }
+                }
+                if coordinated
+                else {}
+            ),
             "dp": [
                 {
                     "dp_idx": 0,
@@ -78,12 +91,17 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
     cloud_entries = [
         {
             "id": cloud_id,
+            **({"coordination": {"enabled": True}} if coordinated else {}),
             "dp": [
                 {
                     "dp_idx": 0,
                     "addr": "127.0.0.1",
                     "ranks": [cloud_base + cloud_id],
                     "ctrl_port": 5550 + cloud_id,
+                    # Enabled cloud coordination requires an advertised
+                    # coordination endpoint on every DP (coord_url derives
+                    # from addr + coord_port).
+                    **({"coord_port": 9130 + cloud_id} if coordinated else {}),
                 }
             ],
         }
@@ -158,7 +176,9 @@ class TestAttachSceneValidation:
             _lwd(LWD_CLUSTER, "edge", 1, api_server_rpc_port=self.RPC)
 
     def test_single_instance_scene_rejects_attach(self) -> None:
-        with pytest.raises(ValueError, match="scene=edge_share"):
+        # single_instance has exactly one edge (instance 0), so attach
+        # trips the non-primary rule first; either rule rejects it.
+        with pytest.raises(ValueError, match="non-primary edge|scene=edge_share"):
             _lwd(SINGLE_INSTANCE, "edge", 0, api_server_attach=self.ATTACH)
 
     def test_cloud_role_rejects_attach(self) -> None:
@@ -411,6 +431,10 @@ class _SchedBase:
         self._lwd_pending_refills = deque()
         self._lwd_aborted_req_ids = {_CONNECTION: []}
         self._lwd_announced_refills = set()
+        # 引擎注入的回调钩子(真实调度器在 __init__ 尾部置 None,由引擎
+        # 接线;这里给可空实现,投递路径的调用即 no-op)。
+        self.lwd_on_tokens = lambda *a, **k: None
+        self.lwd_on_finish = lambda *a, **k: None
 
     def _lwd_validate_request(self, request: NS) -> None:
         pass
@@ -418,7 +442,14 @@ class _SchedBase:
     def _lwd_compute_mrope_positions(self, request: NS) -> None:
         pass
 
-    def _lwd_route_request(self, request_id: str) -> tuple[str, int, int]:
+    def _lwd_edge_id_of(self, request: NS) -> int:
+        # 镜像真实调度器的 edge_share 语义:client_index 缺省的旧式调用
+        # 方默认 0(与 _request() 不设置该属性的构造一致)。
+        return getattr(request, "client_index", 0)
+
+    def _lwd_route_request(
+        self, request_id: str, edge_id: int = 0, preferred: object = None
+    ) -> tuple[str, int, int]:
         self._lwd_route[request_id] = _CONNECTION
         return _CONNECTION
 
@@ -509,6 +540,8 @@ def _request(rid: str, client_index: int | None = None, finished: bool = False) 
     if client_index is not None:
         request.client_index = client_index
     request.is_finished = lambda: request.finished
+    # 投递路径对每个 token 调 request.append_output_token_ids(...)
+    request.append_output_token_ids = lambda *a, **k: None
     return request
 
 
@@ -541,11 +574,18 @@ class TestPinTableLifecycle:
     """B: req -> client_index pin write and cleanup (output grouping key)."""
 
     def test_admit_registers_pin(self) -> None:
+        # Admission pins the route (the surviving pinned table); the
+        # frontend identity lives on request.client_index and delivery
+        # groups by it.
         sched = _make_sched()
-        sched.lwd_admit_request(_request("r1", client_index=2))
-        assert sched._lwd_req_id_to_client["r1"] == 2
-        sched.lwd_admit_request(_request("r2"))
-        assert sched._lwd_req_id_to_client["r2"] == 0
+        request = _request("r1", client_index=2)
+        sched.lwd_admit_request(request)
+        assert sched._lwd_route["r1"] == _CONNECTION
+        assert request.client_index == 2
+        legacy = _request("r2")
+        sched.lwd_admit_request(legacy)
+        assert sched._lwd_route["r2"] == _CONNECTION
+        assert getattr(legacy, "client_index", 0) == 0
 
     def test_abort_pops_pin(self) -> None:
         sched = _make_sched()
@@ -651,15 +691,16 @@ class TestOutputGrouping:
 
     def test_late_row_for_inflight_request_keeps_pin(self) -> None:
         # The attach window: a request already streaming (first token
-        # delivered, not finished) keeps its pin, so a late row still
-        # reaches the originating frontend's group.
+        # delivered, not finished) keeps its frontend identity
+        # (request.client_index), so a late row still reaches the
+        # originating frontend's group.
         sched = _make_sched()
         request = _request("r1", client_index=2)
         sched.requests["r1"] = request
         sched.lwd_admit_request(request)
         first = _unembed_step(sched, _notify(["r1"]), {"r1": [1]})
         assert set(first) == {2}
-        assert "r1" in sched._lwd_req_id_to_client
+        assert sched.requests["r1"].client_index == 2
         late = _unembed_step(sched, _notify(["r1"]), {"r1": [2]})
         assert set(late) == {2}
         assert [out.new_token_ids for out in late[2].outputs] == [[2]]

@@ -1,10 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """lwd_control 单测装载垫片。
 
 真实环境(Python >=3.10 且 torch 在)一切原生 import;无 torch 的
 轻量环境(如本机 3.9)以 stub 顶替 vllm/__init__(其 env_override
-依赖 torch),使纯逻辑模块(picker/ledger/inbox、包入口、公共面)
-仍可测试。依赖 vllm.logger/envs 完整链的用例(test_lwd_config)在
-此类环境模块级跳过,见各文件头部。
+依赖 torch)与 vllm/config/__init__(经子模块拉 torch),使纯逻辑
+模块(picker/ledger/dp_account、包入口、公共面)仍可测试。依赖
+vllm.logger/envs 完整链的用例(test_lwd_config)在此类环境模块级
+跳过,见各文件头部。
 """
 
 from __future__ import annotations
@@ -21,3 +24,9 @@ if importlib.util.find_spec("torch") is None and "vllm" not in sys.modules:
     stub = types.ModuleType("vllm")
     stub.__path__ = [str(VLLM_PKG_DIR)]
     sys.modules["vllm"] = stub
+    # vllm/config/__init__ 拉 torch(经各子模块);vllm.config.lwd 本身只依赖
+    # pydantic+yaml。把包入口垫成命名空间,使 dp_account 等纯逻辑模块
+    # (只 import vllm.config.lwd)在轻量环境可测。
+    config_stub = types.ModuleType("vllm.config")
+    config_stub.__path__ = [str(VLLM_PKG_DIR / "config")]
+    sys.modules["vllm.config"] = config_stub

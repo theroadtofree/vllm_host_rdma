@@ -144,6 +144,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_edge_share = lwd_config.topology.deployment.scene == "edge_share"
         connections = tuple(sorted(c.connection_id for c in lwd_config.connections))
         self._lwd_connections = connections
+        # Slot billing: max_num_seqs is the contract one cloud DP grants
+        # (force-equal across clouds, verified at HELLO), and the shared
+        # running queue serves several of them. The native running ceiling
+        # must be the grant times the served cloud DPs, and the gate/picker
+        # must bill occupancy per cloud DP -- billing the shared queue
+        # against one grant collapses an edge_share engine (4 frontends)
+        # to a single cloud's capacity while its own NPU sits idle.
+        self._lwd_cloud_slot_cap = self.scheduler_config.max_num_seqs
+        self._lwd_resize_slot_pool()
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
             connection_id: LwdCloudDpAccount(connection_id)
             for connection_id in connections
@@ -197,6 +206,23 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.prefix_use_eagle = params.prefix_use_eagle
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
+
+    def _lwd_slot_target(self, connection_id: LwdConnectionId) -> tuple[int, int]:
+        """The cloud DP that owns a connection's slot grant: links sharing
+        one cloud DP (cloud_share) split a single grant, links to distinct
+        clouds (edge_share) each carry their own."""
+        return (connection_id.cloud_id, connection_id.dp_idx)
+
+    def _lwd_resize_slot_pool(self) -> None:
+        """Set the native running ceiling to the grant times the served
+        cloud DPs. The native scheduler's own checks (waiting admission,
+        the post-schedule length assert) police this ceiling, so it must
+        cover what per-DP billing may legally admit; the gate and the
+        picker keep every cloud DP within its single grant. (When the
+        elastic runtime-connection port lands here, arming a connection
+        must call this too.)"""
+        served_dps = len({self._lwd_slot_target(c) for c in self._lwd_connections})
+        self.max_num_running_reqs = self._lwd_cloud_slot_cap * served_dps
 
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed dp_idx of an active request; unrouted ids are a bug."""
@@ -331,11 +357,43 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return out
         return self._lwd_schedule_unembed()
 
+    def _lwd_num_running_reqs(self, connection_id: LwdConnectionId) -> int:
+        """Native running-queue occupancy billed to one connection's cloud
+        DP. Every queue member is routed (the route pins at admission), so
+        the per-DP counts sum to the queue length and the per-DP caps sum
+        to the slot pool."""
+        target = self._lwd_slot_target(connection_id)
+        billed = 0
+        for request in self.running:
+            conn = self._lwd_route.get(request.request_id)
+            if conn is not None and self._lwd_slot_target(conn) == target:
+                billed += 1
+        return billed
+
     def _lwd_pick_serving_engine(self) -> LwdConnectionId | None:
         """Pick the next ungated connection with routed work in stable order."""
         routed = set(self._lwd_route.values())
         if not routed:
             return None
+        # Both gate inputs come from one pass over the running queue:
+        # billing the loop per connection would rescan the shared queue N
+        # times per step, and the scan cost grows with the frontend count.
+        # Counts key by cloud DP (the billing unit, matching
+        # _lwd_num_running_reqs); resume presence keys by connection
+        # (matching _lwd_has_prefill_chunk_inflight).
+        counts: dict[tuple[int, int], int] = {}
+        resumes: set[LwdConnectionId] = set()
+        for request in self.running:
+            conn = self._lwd_route.get(request.request_id)
+            if conn is None:
+                continue
+            target = self._lwd_slot_target(conn)
+            counts[target] = counts.get(target, 0) + 1
+            if (
+                not request.is_finished()
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                resumes.add(conn)
         connections = self._lwd_connections
         for offset in range(len(connections)):
             index = (self._lwd_last_engine + 1 + offset) % len(connections)
@@ -343,27 +401,44 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if connection_id not in routed:
                 continue
             account = self._lwd_accounts[connection_id]
-            if account.is_gated(
-                self.max_num_running_reqs,
-                self._lwd_has_prefill_chunk_inflight(connection_id),
-                num_running_reqs=len(self.running),
-            ):
-                self._lwd_log_gate_transition(account)
+            hold_reason = account.is_gated(
+                self._lwd_cloud_slot_cap,
+                connection_id in resumes,
+                num_running_reqs=counts.get(self._lwd_slot_target(connection_id), 0),
+            )
+            if hold_reason is not None:
+                self._lwd_log_gate_transition(account, hold_reason)
                 continue
+            if account.gate_held is not None:
+                # The release side of the transition: the picker only
+                # passes here after a previously gated connection, so
+                # this logs OPEN exactly once per hold episode.
+                self._lwd_log_gate_transition(account, None)
             self._lwd_last_engine = index
             return connection_id
         return None
 
-    def _lwd_log_gate_transition(self, account: LwdCloudDpAccount) -> None:
-        held = account.pending_chunks() >= account.max_pending_chunks
-        if held != account.gate_held:
-            account.gate_held = held
-            lwd_logger.info(
-                "[edge-sched] prefill gate %s: %s pending_chunks=%d",
-                "HOLD" if held else "OPEN",
-                account.connection_id,
-                account.pending_chunks(),
-            )
+    def _lwd_log_gate_transition(
+        self, account: LwdCloudDpAccount, hold_reason: str | None
+    ) -> None:
+        """Log every gate flip with its cause and occupancy. Both criteria
+        must log: a silent one is undebuggable (seen live: a 4-frontend
+        edge_share engine sat slots-gated on every connection with no HOLD
+        line, because the old logger only watched pending chunks)."""
+        if hold_reason == account.gate_held:
+            return
+        account.gate_held = hold_reason
+        running = self._lwd_num_running_reqs(account.connection_id)
+        state = "OPEN" if hold_reason is None else f"HOLD({hold_reason})"
+        lwd_logger.info(
+            "[edge-sched] prefill gate %s: %s running=%d/%d pending_chunks=%d/%d",
+            state,
+            account.connection_id,
+            running,
+            self._lwd_cloud_slot_cap,
+            account.pending_chunks(),
+            account.max_pending_chunks,
+        )
 
     def _lwd_embed_dispatchable(self) -> bool:
         """EMBED dispatchability: some engine has routed work and passes its
@@ -623,9 +698,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             for r in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)
         )
         cap = max(0, self.max_num_scheduled_tokens - decode_debt)
-        # Native edge slots are shared across DP routes. Waiting requests
-        # must not reserve slots before admission.
-        free_seq = self.max_num_running_reqs - len(self.running)
+        # Slots are billed to the connection's cloud DP (one grant per
+        # cloud, shared by its links): a full sibling link also fills
+        # this quota. Waiting requests must not reserve slots before
+        # admission.
+        free_seq = self._lwd_cloud_slot_cap - self._lwd_num_running_reqs(dp_idx)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
