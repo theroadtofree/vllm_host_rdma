@@ -47,6 +47,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_engine import (
     LwdBaseEngineCore,
 )
 from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import LwdEdgeControlPlane
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane_factory import lwd_ctrl_tos
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_SAMPLING_DEFAULTS,
@@ -137,7 +138,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_check_cloud_params(dp_idx, params)
         self._lwd_configure_prefix_cache()
         self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {
-            dp_idx: LwdCoordClient(dp_idx.dp_idx, params.dp_coordinator_addr)
+            dp_idx: LwdCoordClient(
+                dp_idx.dp_idx, params.dp_coordinator_addr, lwd_ctrl_tos(self.lwd_config)
+            )
             for dp_idx, params in self._lwd_cloud_params.items()
             if params.dp_coordinator_addr
         }

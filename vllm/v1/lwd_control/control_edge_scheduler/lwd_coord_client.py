@@ -35,7 +35,9 @@ _LWD_SHUTDOWN_JOIN_S = 1.0
 class LwdCoordClient:
     """One XSUB link to one cloud DP rank's coordinator stats endpoint."""
 
-    def __init__(self, dp_idx: int, stats_addr: str) -> None:
+    def __init__(
+        self, dp_idx: int, stats_addr: str, ctrl_tos: int | None = None
+    ) -> None:
         self._dp_idx = dp_idx
         self._closed = False
         # A zmq socket is not thread-safe: the stats thread recv and the
@@ -44,7 +46,7 @@ class LwdCoordClient:
         self._lock = threading.Lock()
         self._socket = zmq.Context.instance().socket(zmq.XSUB)
         # Inter-node control link: carry the topology's ctrl-plane DSCP.
-        lwd_apply_ctrl_qos(self._socket)
+        lwd_apply_ctrl_qos(self._socket, ctrl_tos)
         self._socket.connect(stats_addr)
         with self._lock:
             self._socket.send(b"\x01")  # subscribe to everything
