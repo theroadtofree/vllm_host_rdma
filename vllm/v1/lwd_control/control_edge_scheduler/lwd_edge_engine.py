@@ -59,6 +59,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_control_plane import (
     LwdEdgeControlPlane,
     LwdPeerNotRegisteredError,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_control_plane_factory import lwd_ctrl_tos
 from vllm.v1.lwd_control.lwd_comm.lwd_data_plane_hooks import (
     notify_data_plane_added,
 )
@@ -519,8 +520,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_clouds[connection] = peer
         self._lwd_heartbeat.note_adopted(connection)
         if params.dp_coordinator_addr:
+            tos = lwd_ctrl_tos(self.lwd_config)
             self._lwd_coord_clients[connection] = LwdCoordClient(
-                connection.dp_idx, params.dp_coordinator_addr
+                connection.dp_idx, params.dp_coordinator_addr, tos
             )
         if params.prefix_hash_block_size > 0:
             self._lwd_probe_manager._hash_sizes[

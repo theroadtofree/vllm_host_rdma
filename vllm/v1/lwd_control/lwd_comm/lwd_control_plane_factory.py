@@ -79,6 +79,25 @@ def _lwd_validate_dp(lwd_config: LwdConfig, dp_rank: int, dp_size: int) -> None:
         raise ValueError(f"[LWD] dp_rank {dp_rank} not in [0, {dp_size})")
 
 
+def lwd_ctrl_tos(lwd_config: LwdConfig) -> int | None:
+    """IP TOS byte of the control links from the topology's qos block.
+
+    The YAML carries a 6-bit DSCP, so the wire field is ``dscp << 2``;
+    an unset qos block or ctrl plane leaves the links unmarked. Derived
+    here from the immutable topology, never read from the vLLM config
+    global at socket-open time: control sockets open outside every
+    ``set_current_vllm_config`` context, where the global is always
+    None (reading it there made every configured DSCP silently never
+    reach a socket).
+    """
+    qos = lwd_config.topology.qos
+    ctrl_plane = qos.ctrl_plane if qos is not None else None
+    dscp = ctrl_plane.dscp if ctrl_plane is not None else None
+    if dscp is None:
+        return None
+    return (int(dscp) & 63) << 2
+
+
 def _lwd_cloud_spec(
     lwd_config: LwdConfig,
     dp_rank: int,
@@ -94,6 +113,7 @@ def _lwd_cloud_spec(
         dp_size=dp_size,
         bind_endpoint=make_zmq_path("tcp", bind_host, local.ctrl_port),
         config=lwd_config.topology.control_plane,
+        ctrl_tos=lwd_ctrl_tos(lwd_config),
         expected_edge_ids=tuple(
             sorted(
                 c.connection_id.edge_id
@@ -133,4 +153,5 @@ def _lwd_edge_spec(
         ),
         config=lwd_config.topology.control_plane,
         runner_kind=runner_kind,
+        ctrl_tos=lwd_ctrl_tos(lwd_config),
     )

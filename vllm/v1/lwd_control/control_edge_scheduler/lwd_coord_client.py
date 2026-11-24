@@ -54,9 +54,12 @@ _LWD_SHUTDOWN_JOIN_S = 1.0
 class LwdCoordClient:
     """One cloud DP rank's coordinator endpoint, one socket per thread."""
 
-    def __init__(self, dp_idx: int, stats_addr: str) -> None:
+    def __init__(
+        self, dp_idx: int, stats_addr: str, ctrl_tos: int | None = None
+    ) -> None:
         self._dp_idx = dp_idx
         self._stats_addr = stats_addr
+        self._ctrl_tos = ctrl_tos
         self._closed = False
         # Engine-thread socket. The lock covers it against shutdown closing
         # it underneath a send, and nothing else: both sides are
@@ -64,7 +67,7 @@ class LwdCoordClient:
         self._wake_lock = threading.Lock()
         self._wake_socket = zmq.Context.instance().socket(zmq.XSUB)
         # Inter-node control link: carry the topology's ctrl-plane DSCP.
-        lwd_apply_ctrl_qos(self._wake_socket)
+        lwd_apply_ctrl_qos(self._wake_socket, ctrl_tos)
         self._wake_socket.connect(stats_addr)
         self._thread = threading.Thread(
             target=self._stats_loop, name=f"lwd-coord-dp{dp_idx}", daemon=True
@@ -103,7 +106,7 @@ class LwdCoordClient:
         """
         socket = zmq.Context.instance().socket(zmq.XSUB)
         # Inter-node control link: carry the topology's ctrl-plane DSCP.
-        lwd_apply_ctrl_qos(socket)
+        lwd_apply_ctrl_qos(socket, self._ctrl_tos)
         socket.connect(self._stats_addr)
         socket.send(b"\x01")  # subscribe to everything
         try:

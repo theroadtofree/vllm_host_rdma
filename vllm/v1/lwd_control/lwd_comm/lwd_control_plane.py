@@ -28,7 +28,7 @@ import msgspec
 import zmq
 
 from vllm.config.lwd.topology import LwdConnectionId, LwdControlPlaneConfig
-from vllm.lwd_logger import init_lwd_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_handshake import (
     LwdCloudHandshake,
     LwdCloudHandshakeDecision,
@@ -57,8 +57,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_transport import (
     LwdEdgeTransport,
     LwdPeerUnreachableError,
 )
-
-logger = init_lwd_logger(__name__)
 
 # Upper bound of IO thread latency for hello retries and shutdown.
 _LWD_IO_POLL_TICK_MS = 100
@@ -120,12 +118,25 @@ class LwdControlPlaneSpec:
     `ParallelConfig.data_parallel_size` to 1."""
     config: LwdControlPlaneConfig = field(default_factory=LwdControlPlaneConfig)
     runner_kind: LwdRunnerKind = "v1"
+    ctrl_tos: int | None = None
+    """IP TOS byte of this plane's control links, derived from the
+    topology's ``qos.ctrl_plane.dscp`` (``dscp << 2``) when the spec is
+    built. None leaves the links unmarked. Carried on the spec, never
+    read from the vLLM config global at socket-open time: control
+    sockets open outside every ``set_current_vllm_config`` context,
+    where that global is always None."""
 
     def __post_init__(self) -> None:
         if self.instance_id < 0:
             raise ValueError(f"[LWD] instance_id {self.instance_id} must be >= 0")
         if not 0 <= self.dp_rank < self.dp_size:
             raise ValueError(f"[LWD] dp_rank {self.dp_rank} not in [0, {self.dp_size})")
+        if self.ctrl_tos is not None and not 0 <= self.ctrl_tos <= 255:
+            raise ValueError(
+                f"[LWD] ctrl_tos {self.ctrl_tos} not in [0, 255]: a TOS is "
+                "one byte, and the YAML dscp is masked to 6 bits at "
+                "derivation"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -349,7 +360,7 @@ class LwdControlPlane(ABC):
         if self._sender is not None:
             self._sender.close()
         if self._thread is not None and self._thread.is_alive():
-            logger.error(
+            lwd_logger.error(
                 "[LWD][control-plane] %s: IO thread still alive after %.1fs; "
                 "destroying its context",
                 self._label,
@@ -358,7 +369,7 @@ class LwdControlPlane(ABC):
             self._ctx.destroy(linger=0)
             return
         self._ctx.term()
-        logger.info("[LWD][control-plane] %s shut down", self._label)
+        lwd_logger.info("[LWD][control-plane] %s shut down", self._label)
 
     # ---------------------------------------------------------------- IO thread
 
@@ -370,11 +381,13 @@ class LwdControlPlane(ABC):
             self._opened.set()
             return
         self._opened.set()
-        logger.info("[LWD][control-plane] %s opened %s", self._label, self.endpoint)
+        lwd_logger.info("[LWD][control-plane] %s opened %s", self._label, self.endpoint)
         try:
             self._io_loop(transport, outbound)
         except Exception as e:
-            logger.exception("[LWD][control-plane] %s: IO thread crashed", self._label)
+            lwd_logger.exception(
+                "[LWD][control-plane] %s: IO thread crashed", self._label
+            )
             self._on_io_crash(f"IO thread crashed: {e!r}")
         finally:
             transport.close()
@@ -387,10 +400,18 @@ class LwdControlPlane(ABC):
             outbound.setsockopt(zmq.LINGER, 0)
             outbound.bind(_LWD_OUTBOUND_PATH)
             transport = self._create_transport()
-            transport.open(self._ctx)
+            transport.open(self._ctx, self.spec.ctrl_tos)
         except Exception:
             outbound.close(linger=0)
             raise
+        tos = self.spec.ctrl_tos
+        lwd_logger.info(
+            "[LWD][qos] %s ctrl_plane links %s",
+            self._label,
+            "unmarked"
+            if tos is None
+            else f"marked tos={tos} (dscp={tos >> 2} ecn={tos & 3})",
+        )
         return transport, outbound
 
     def _io_loop(self, transport: LwdControlTransport, outbound: zmq.Socket) -> None:
@@ -424,7 +445,7 @@ class LwdControlPlane(ABC):
         try:
             msg = lwd_decode_link_message(body)
         except (msgspec.DecodeError, msgspec.ValidationError) as e:
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: dropped malformed link frame from %r: %s",
                 self._label,
                 identity,
@@ -440,7 +461,7 @@ class LwdControlPlane(ABC):
         # identities. One convention per role keeps _inbound_peer simple.
         peer = self._inbound_peer(identity if link is None else str(link).encode())
         if peer is None:
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: dropped payload from unregistered %r",
                 self._label,
                 identity,
@@ -485,7 +506,7 @@ class LwdControlPlane(ABC):
     def _note_held(self, peer: LwdPeer) -> None:
         if peer not in self._held_since:
             self._held_since[peer] = time.monotonic()
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: link to %s is full or not connected; "
                 "holding outbound payloads",
                 self._label,
@@ -496,7 +517,7 @@ class LwdControlPlane(ABC):
         self._held.pop(peer, None)
         held_since = self._held_since.pop(peer, None)
         if held_since is not None:
-            logger.info(
+            lwd_logger.info(
                 "[LWD][control-plane] %s: link to %s drained after %.1fs",
                 self._label,
                 peer,
@@ -517,7 +538,7 @@ class LwdControlPlane(ABC):
             num_dropped = self._num_dropped.get(peer, 0) + 1
             self._num_dropped[peer] = num_dropped
             if num_dropped == 1:
-                logger.error(
+                lwd_logger.error(
                     "[LWD][control-plane] %s: %s unreachable (%s); dropping payloads "
                     "to it until it is reachable again",
                     self._label,
@@ -527,7 +548,7 @@ class LwdControlPlane(ABC):
             return True
         num_dropped = self._num_dropped.pop(peer, 0)
         if num_dropped:
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: %s reachable again; %d payloads were dropped",
                 self._label,
                 peer,
@@ -543,7 +564,7 @@ class LwdControlPlane(ABC):
         self._registered_peers.discard(peer)
         self._held.pop(peer, None)
         self._held_since.pop(peer, None)
-        logger.warning(
+        lwd_logger.warning(
             "[LWD][control-plane] %s: peer %s down: %s", self._label, peer, reason
         )
 
@@ -687,7 +708,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
         if pending.connection_id in self._handshakes:
             # Idempotent replay of an already-added link (a re-detected
             # topology increment): drop, do not disturb the live session.
-            logger.debug(
+            lwd_logger.debug(
                 "control plane %s: link for %s already exists; add ignored",
                 self._label,
                 pending.connection_id,
@@ -719,7 +740,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             self.spec.config.hello_retry_interval_s,
             self.spec.runner_kind,
         )
-        logger.info(
+        lwd_logger.info(
             "control plane %s: link %d added to %s (connection %s); handshake retrying",
             self._label,
             index,
@@ -819,7 +840,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
         clouds = self._accepted_peers()
         missing = self._missing_handshakes()
         if missing:
-            logger.warning(
+            lwd_logger.warning(
                 "control plane %s: proceeding with %d of %d accepted cloud "
                 "DP ranks (elastic partial start); missing connections %s "
                 "will serve once they start -- periodic HELLOs keep retrying "
@@ -872,7 +893,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 handshake.on_reply(msg)
             except LwdHandshakeError as e:
                 if handshake.completed:
-                    logger.error(
+                    lwd_logger.error(
                         "[LWD][control-plane] %s: ignored link message after the "
                         "handshake: %s",
                         self._label,
@@ -890,7 +911,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             cloud = handshake.cloud
             if cloud is None or cloud in self._registered_peers:
                 continue
-            logger.info(
+            lwd_logger.info(
                 "[LWD][control-plane] %s: accepted by cloud %s, session %s",
                 self._label,
                 cloud,
@@ -899,7 +920,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             self._register_peer(cloud)
 
     def _fail_handshake(self, reason: str) -> None:
-        logger.error(
+        lwd_logger.error(
             "[LWD][control-plane] %s: handshake failed: %s", self._label, reason
         )
         self._handshake_error = reason
@@ -958,7 +979,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             handshake.on_hello_sent(now)
             self._num_hellos_sent += 1
             if self._num_hellos_sent == 1:
-                logger.info(
+                lwd_logger.info(
                     "[LWD][control-plane] %s: hello sent to %s",
                     self._label,
                     self._endpoints,
@@ -1003,7 +1024,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         msg: LwdLinkMessage,
     ) -> None:
         if identity is None or not isinstance(msg, LwdLinkHello):
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: dropped unexpected %s from %r",
                 self._label,
                 type(msg).__name__,
@@ -1013,7 +1034,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         decision = self._handshake.on_hello(identity, msg)
         self._reply(transport, identity, decision)
         if decision.registered is not None:
-            logger.info(
+            lwd_logger.info(
                 "[LWD][control-plane] %s: registered edge %s, session %s",
                 self._label,
                 decision.registered,
@@ -1029,7 +1050,7 @@ class LwdCloudControlPlane(LwdControlPlane):
     ) -> None:
         reply = decision.reply
         if isinstance(reply, LwdLinkReject):
-            logger.error(
+            lwd_logger.error(
                 "[LWD][control-plane] %s: rejected hello from %r: %s",
                 self._label,
                 identity,
@@ -1042,7 +1063,7 @@ class LwdCloudControlPlane(LwdControlPlane):
         except LwdPeerUnreachableError:
             sent = False
         if not sent:
-            logger.warning(
+            lwd_logger.warning(
                 "[LWD][control-plane] %s: cannot answer %r; the edge resends its hello",
                 self._label,
                 identity,
