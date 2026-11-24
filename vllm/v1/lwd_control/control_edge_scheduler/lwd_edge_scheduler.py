@@ -423,6 +423,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         routed = set(self._lwd_route.values())
         if not routed:
             return None
+        # Both gate inputs come from one pass over the running queue:
+        # billing the loop per connection would rescan the shared queue N
+        # times per step, and the scan cost grows with the frontend count.
+        # Counts key by cloud DP (the billing unit, matching
+        # _lwd_num_running_reqs); resume presence keys by connection
+        # (matching _lwd_has_prefill_chunk_inflight).
+        counts: dict[tuple[int, int], int] = {}
+        resumes: set[LwdConnectionId] = set()
+        for request in self.running:
+            conn = self._lwd_route.get(request.request_id)
+            if conn is None:
+                continue
+            target = self._lwd_slot_target(conn)
+            counts[target] = counts.get(target, 0) + 1
+            if (
+                not request.is_finished()
+                and request.num_computed_tokens < request.num_prompt_tokens
+            ):
+                resumes.add(conn)
         connections = self._lwd_connections
         for offset in range(len(connections)):
             index = (self._lwd_last_engine + 1 + offset) % len(connections)
@@ -432,8 +451,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             account = self._lwd_accounts[connection_id]
             hold_reason = account.is_gated(
                 self._lwd_cloud_slot_cap,
-                self._lwd_has_prefill_chunk_inflight(connection_id),
-                num_running_reqs=self._lwd_num_running_reqs(connection_id),
+                connection_id in resumes,
+                num_running_reqs=counts.get(self._lwd_slot_target(connection_id), 0),
             )
             if hold_reason is not None:
                 self._lwd_log_gate_transition(account, hold_reason)
