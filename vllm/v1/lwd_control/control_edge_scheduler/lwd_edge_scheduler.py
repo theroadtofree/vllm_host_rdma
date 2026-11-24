@@ -170,6 +170,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             len(connections),
             self.max_num_running_reqs * len(connections),
         )
+        self._lwd_seat_cap = self.max_num_running_reqs
+        self._lwd_resize_seat_pool()
         # Prefix caching: manager-level hits must stay off (the edge holds
         # no KV cache -- a hit would skip embedding blocks never written);
         # the config-level flag stays on so the engine still builds the
@@ -370,7 +372,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if not self._lwd_has_prefill_work(connection_id):
                 continue
             if self._lwd_accounts[connection_id].is_gated(
-                self.max_num_running_reqs,
+                self._lwd_seat_cap,
                 self._lwd_has_prefill_chunk_inflight(connection_id),
                 num_running_reqs=self._lwd_running_on(connection_id),
             ):
@@ -645,9 +647,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     ) -> tuple[list[str], dict[str, int]]:
         """Pick routed candidates within the native token and seat budgets."""
         account = self._lwd_accounts[dp_idx]
-        # Native edge slots are shared across DP routes. Waiting requests
-        # must not reserve slots before admission.
-        free_seq = self.max_num_running_reqs - len(self.running)
+        # Seats are per connection: new starts draw only on this
+        # connection's free seats, so a sibling cloud at full occupancy
+        # does not block admission here (the gate bills the same way
+        # through _lwd_running_on; waiting requests never reserve seats).
+        free_seq = self._lwd_seat_cap - self._lwd_running_on(dp_idx)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
@@ -713,6 +717,19 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         by the worker itself; native rollback would break the chunk
         contract, so nothing is scheduled, consumed, or rolled back."""
         return [], num_new_tokens, encoder_compute_budget, []
+
+    def _lwd_resize_seat_pool(self) -> None:
+        """Set the native running ceiling to one connection's seats times
+        the connections this edge serves.
+
+        The native admission ceiling (the waiting queue and the
+        post-schedule assert) must cover what the per-connection gate may
+        legally admit; billing stays per connection (``is_gated`` and the
+        picker's ``free_seq`` bill ``_lwd_running_on`` against one
+        connection's cap), so an edge serving several cloud DPs runs at
+        the fleet's concurrency instead of one DP's.
+        """
+        self.max_num_running_reqs = self._lwd_seat_cap * len(self._lwd_connections)
 
     def _lwd_running_on(self, dp_idx: LwdConnectionId) -> int:
         """Native running requests routed to one connection.
