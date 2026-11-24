@@ -78,20 +78,21 @@ def test_pending_batches_release_on_watermark_and_request_settlement() -> None:
 
 def test_gate_blocks_on_slots_and_pending_chunks_but_not_resumes() -> None:
     account = LwdCloudDpAccount(0)
-    assert not account.is_gated(2, has_resume_inflight=False, num_running_reqs=0)
+    assert account.is_gated(2, has_resume_inflight=False, num_running_reqs=0) is None
 
-    # Slots full.
+    # Slots full: hold reason "slots" (per-cloud-DP billing is the caller's
+    # side of the contract; the account only compares against slot_cap).
     account.note_prefill_admitted("a")
     account.note_prefill_admitted("b")
-    assert account.is_gated(2, has_resume_inflight=False, num_running_reqs=2)
+    assert account.is_gated(2, has_resume_inflight=False, num_running_reqs=2) == "slots"
     # A resume in flight is exempt: finish in-flight chunks first.
-    assert not account.is_gated(2, has_resume_inflight=True, num_running_reqs=2)
+    assert account.is_gated(2, has_resume_inflight=True, num_running_reqs=2) is None
 
     # Pending chunks at the cap gate the engine even with free slots.
     other = LwdCloudDpAccount(1)
     for seqno in range(LWD_MAX_PENDING_CHUNKS):
         other.register_batch(seqno, {f"r{seqno}"})
-    assert other.is_gated(100, has_resume_inflight=False, num_running_reqs=0)
+    assert other.is_gated(100, has_resume_inflight=False, num_running_reqs=0) == "chunks"
 
 
 def test_gate_uses_account_pending_chunk_limit() -> None:
@@ -99,7 +100,7 @@ def test_gate_uses_account_pending_chunk_limit() -> None:
     account.register_batch(0, {"r"})
 
     assert account.max_pending_chunks == 1
-    assert account.is_gated(100, has_resume_inflight=False, num_running_reqs=0)
+    assert account.is_gated(100, has_resume_inflight=False, num_running_reqs=0) == "chunks"
 
 
 def test_score_matches_native_dp_balancer_weights() -> None:
@@ -116,9 +117,9 @@ def test_finished_requests_release_their_slot_under_load() -> None:
         account.note_prefill_admitted(f"r{i}")
         account.note_prefill_done(f"r{i}")  # first token
     assert account.load == 90
-    assert account.is_gated(90, has_resume_inflight=False, num_running_reqs=90)
+    assert account.is_gated(90, has_resume_inflight=False, num_running_reqs=90) == "slots"
 
     for i in range(90):
         account.note_request_settled(f"r{i}", was_awaiting=True)
     assert account.load == 0
-    assert not account.is_gated(90, has_resume_inflight=False, num_running_reqs=0)
+    assert account.is_gated(90, has_resume_inflight=False, num_running_reqs=0) is None
