@@ -43,31 +43,25 @@ class LwdPeerUnreachableError(RuntimeError):
     """The peer has no live connection to deliver a frame to."""
 
 
-def lwd_ctrl_tos() -> int | None:
-    """IP TOS byte of the control plane, or None when no DSCP is configured.
+def lwd_apply_ctrl_qos(sock: zmq.Socket, tos: int | None) -> None:
+    """Mark a control socket with the control plane's IP TOS byte.
 
-    ZMQ's TOS option maps straight to the socket's IP_TOS; the YAML carries a
-    6-bit DSCP, so the wire field is ``dscp << 2``. Read once per socket open:
-    control sockets outlive the config context, and the topology file is
-    immutable per deployment.
+    `tos` comes from the plane spec (derived from the topology at build
+    time), never from the vLLM config global: control sockets open
+    outside every `set_current_vllm_config` context, where that global
+    is always None -- reading it there once made every configured DSCP
+    silently never reach any socket. None leaves the socket unmarked by
+    design (device comm, or the qos block leaves the field unset); a
+    configured mark that cannot be applied raises instead of skipping
+    quietly.
     """
-    from vllm.config import get_current_vllm_config_or_none
-
-    config = get_current_vllm_config_or_none()
-    lwd_config = config.lwd_config if config is not None else None
-    topology = lwd_config.topology if lwd_config is not None else None
-    qos = topology.qos if topology is not None else None
-    ctrl_plane = qos.ctrl_plane if qos is not None else None
-    if ctrl_plane is None or ctrl_plane.dscp is None:
-        return None
-    return (int(ctrl_plane.dscp) & 63) << 2
-
-
-def lwd_apply_ctrl_qos(sock: zmq.Socket) -> None:
-    """Mark a control socket with the configured DSCP (no-op when unset)."""
-    tos = lwd_ctrl_tos()
-    if tos is None or not hasattr(zmq, "TOS"):
+    if tos is None:
         return
+    if not hasattr(zmq, "TOS"):
+        raise RuntimeError(
+            f"[LWD] ctrl-plane tos {tos} cannot be applied: this pyzmq "
+            "build has no ZMQ_TOS (needs libzmq >= 4.2)"
+        )
     sock.setsockopt(zmq.TOS, tos)
 
 
@@ -96,7 +90,7 @@ class LwdControlTransport(ABC):
         self.endpoint = endpoint
         self._socket: zmq.Socket | None = None
 
-    def open(self, ctx: zmq.Context) -> None:
+    def open(self, ctx: zmq.Context, ctrl_tos: int | None = None) -> None:
         """Create, configure and attach the sockets. Cleans up on failure."""
         sock = self._create_socket(ctx)
         try:
@@ -109,7 +103,7 @@ class LwdControlTransport(ABC):
             sock.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
             sock.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
             sock.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
-            lwd_apply_ctrl_qos(sock)
+            lwd_apply_ctrl_qos(sock, ctrl_tos)
             _, host, _ = split_zmq_path(self.endpoint)
             if is_valid_ipv6_address(host):
                 sock.setsockopt(zmq.IPV6, 1)
@@ -262,7 +256,7 @@ class LwdEdgeTransport(LwdControlTransport):
         self._identities = identities
         self._links: list[zmq.Socket] = []
 
-    def open(self, ctx: zmq.Context) -> None:
+    def open(self, ctx: zmq.Context, ctrl_tos: int | None = None) -> None:
         for endpoint, identity in zip(self._endpoints, self._identities):
             link = ctx.socket(self._SOCKET_TYPE)
             try:
@@ -273,7 +267,7 @@ class LwdEdgeTransport(LwdControlTransport):
                 link.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
                 link.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
                 link.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
-                lwd_apply_ctrl_qos(link)
+                lwd_apply_ctrl_qos(link, ctrl_tos)
                 _, host, _ = split_zmq_path(endpoint)
                 if is_valid_ipv6_address(host):
                     link.setsockopt(zmq.IPV6, 1)

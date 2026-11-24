@@ -105,12 +105,25 @@ class LwdControlPlaneSpec:
     """Global DP size. Read it before non-MoE engine processes reset
     `ParallelConfig.data_parallel_size` to 1."""
     config: LwdControlPlaneConfig = field(default_factory=LwdControlPlaneConfig)
+    ctrl_tos: int | None = None
+    """IP TOS byte of this plane's control links, derived from the
+    topology's ``qos.ctrl_plane.dscp`` (``dscp << 2``) when the spec is
+    built. None leaves the links unmarked. Carried on the spec, never
+    read from the vLLM config global at socket-open time: control
+    sockets open outside every ``set_current_vllm_config`` context,
+    where that global is always None."""
 
     def __post_init__(self) -> None:
         if self.instance_id < 0:
             raise ValueError(f"[LWD] instance_id {self.instance_id} must be >= 0")
         if not 0 <= self.dp_rank < self.dp_size:
             raise ValueError(f"[LWD] dp_rank {self.dp_rank} not in [0, {self.dp_size})")
+        if self.ctrl_tos is not None and not 0 <= self.ctrl_tos <= 255:
+            raise ValueError(
+                f"[LWD] ctrl_tos {self.ctrl_tos} not in [0, 255]: a TOS is "
+                "one byte, and the YAML dscp is masked to 6 bits at "
+                "derivation"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -359,10 +372,18 @@ class LwdControlPlane(ABC):
             outbound.setsockopt(zmq.LINGER, 0)
             outbound.bind(_LWD_OUTBOUND_PATH)
             transport = self._create_transport()
-            transport.open(self._ctx)
+            transport.open(self._ctx, self.spec.ctrl_tos)
         except Exception:
             outbound.close(linger=0)
             raise
+        tos = self.spec.ctrl_tos
+        logger.info(
+            "[LWD][qos] %s ctrl_plane links %s",
+            self._label,
+            "unmarked"
+            if tos is None
+            else f"marked tos={tos} (dscp={tos >> 2} ecn={tos & 3})",
+        )
         return transport, outbound
 
     def _io_loop(self, transport: LwdControlTransport, outbound: zmq.Socket) -> None:
