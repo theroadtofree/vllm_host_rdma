@@ -156,7 +156,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             # maximum once (see LWD_EDGE_HOST_MAX_INSTANCES); the queue
             # survives scale-out without re-assembly.
             self.batch_queue_size = (
-                LWD_EDGE_HOST_MAX_INSTANCES * LWD_EDGE_HOST_SLOTS_PER_INSTANCE
+                LWD_EDGE_HOST_MAX_INSTANCES // 4 * LWD_EDGE_HOST_SLOTS_PER_INSTANCE
             )
         else:
             self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
