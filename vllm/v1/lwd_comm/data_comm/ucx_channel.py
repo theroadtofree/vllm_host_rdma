@@ -202,6 +202,14 @@ class LwdUcxConfig:
     # acquire_staging/release_staging) and no
     # wildcard is posted -- one-way "send only"
     # channels.
+    hold_recv: bool = False  # True: receive frames are delivered as views of
+    # the receive block itself (zero copy-out) and
+    # the block is re-posted only after the consumer
+    # calls op.release_data(); early-parked frames
+    # still copy out. Embedded mode only: the
+    # consumer must release, or the pool drains and
+    # the sender stalls (a stuck-hold diagnostic
+    # logs from the IO loop).
 
 
 # tag bit layout: the low 61 bits belong to the application, the top 2 bits
@@ -388,6 +396,8 @@ class LwdUcxOp:
         "_ref",
         "_into_addr",
         "_into_cap",
+        "_blk",
+        "_chan",
     )
 
     def __init__(
@@ -400,13 +410,42 @@ class LwdUcxOp:
     ):
         self.tag = tag
         self.size = 0
-        self.data: bytes | None = None
+        self.data: bytes | memoryview | None = None
         self.error: BaseException | None = None
         self._ev = threading.Event()
         self._cb = cb
         self._ref = ref  # keeps the send source alive (e.g. bytes/bytearray)
         self._into_addr = into_addr
         self._into_cap = into_cap
+        # hold-recv delivery: the receive block backing op.data, and the
+        # owning channel for the deferred re-post.
+        self._blk: LwdUcxBlock | None = None
+        self._chan: LwdUcxChannel | None = None
+
+    def _hold(self, blk: LwdUcxBlock, chan: LwdUcxChannel) -> None:
+        """Attach a held receive block (library internal; the IO thread
+        calls this right before delivering the view)."""
+        self._blk = blk
+        self._chan = chan
+
+    def release_data(self) -> None:
+        """Return a held receive block to the library (hold-recv channels):
+        the IO thread re-posts it as a wildcard. No-op for standalone-bytes
+        deliveries (early frames, non-hold channels). Call once, after the
+        last read of op.data; idempotent.
+
+        The library-side view is dropped here, so the block's memory is
+        reusable once the re-post lands; the caller's own references are the
+        caller's responsibility (hold the view in the future's keepalive).
+        """
+        blk = self._blk
+        chan = self._chan
+        if blk is None or chan is None:
+            return
+        self._blk = None
+        self._chan = None
+        self.data = None
+        chan._recycle_block(blk)
 
     def _finish(
         self,
@@ -530,8 +569,16 @@ class LwdUcxChannel:
         # Phase-0 probe (IO occupancy per received frame; series pre-created
         # here so the hot path never constructs anything)
         self._probe = LwdProbeSet(self._name)
-        for _probe_series in ("recv_copyout", "recv_repost", "recv_total"):
+        for _probe_series in ("recv_copyout", "recv_repost", "recv_total", "recv_hold"):
             self._probe.series(_probe_series)
+        # hold-recv (block-held delivery): consumers release blocks via
+        # op.release_data(); the IO thread re-posts them from _recycle_q.
+        # Staging channels never receive -- force the mode off there.
+        self._hold_recv = bool(c.hold_recv) and not self._pool_staging
+        self._recycle_q: queue.Queue[LwdUcxBlock] = queue.Queue()
+        # held blocks: index -> (block, time.monotonic() of the hold); the
+        # IO loop's 10s tick reports any stuck past 5s
+        self._held: dict[int, tuple[LwdUcxBlock, float]] = {}
         # Owner attributes _UcxLink relies on (_pool/_block_bytes/_put_thresh)
         self._pool = LwdUcxBlockPool(self._n_blocks, self._block_bytes)
         if self._pool_staging:
@@ -1133,7 +1180,11 @@ class LwdUcxChannel:
                 # staging channels do not reset: in-flight staging blocks come back
                 # through the send completion callback, and a reset would push borrowed
                 # blocks back into the free queue (a double lend means data corruption)
-                self._pool.reset()
+                # hold-recv channels: blocks still held by consumers are excluded
+                # here -- a wholesale re-lend would hand the same block to a fresh
+                # wildcard while a copy is still reading it; each held block
+                # returns through _repost_block when its consumer releases.
+                self._pool.reset(exclude={b for b, _ in self._held.values()})
             # the early store dies with the old link: the new link brings a fresh
             # message stream, bytes stuck on the old one are stale (the peer never
             # replays) and would misalign the new tag sequence
@@ -1237,6 +1288,12 @@ class LwdUcxChannel:
                 link = self._linkq.get_nowait()
                 if link is not None:
                     self._adopt_link(link)
+            # released hold blocks second: every re-post widens the wildcard
+            # depth back, so drain before dispatching new work
+            if self._hold_recv:
+                with contextlib.suppress(queue.Empty):
+                    while True:
+                        self._repost_block(self._recycle_q.get_nowait())
             task = None
             # tasks stay off the queue until the first link arrives (FIFO, order
             # kept); only once ready does a break fail fast
@@ -1303,6 +1360,22 @@ class LwdUcxChannel:
                     self._early_count,
                     self._broken,
                 )
+                if self._hold_recv and self._held:
+                    _stuck = [
+                        idx
+                        for idx, (_b, held_t) in self._held.items()
+                        if now - held_t > 5.0
+                    ]
+                    if _stuck:
+                        logger.error(
+                            "[ucx-chan] %s held recv blocks stuck >5s: indexes=%s "
+                            "of %d -- the consumer must call op.release_data(); "
+                            "the wildcard pool drains and the sender stalls "
+                            "otherwise",
+                            self._name,
+                            sorted(_stuck),
+                            len(self._held),
+                        )
                 if _PROBE_ON:
                     for _probe_line in self._probe.take_lines():
                         logger.error("[lwd-probe] %s", _probe_line)
@@ -1534,8 +1607,17 @@ class LwdUcxChannel:
             tag, size = _DB.unpack_from(blk.buf, 0)
             self._on_doorbell(tag, size)
             return
-        # data (inline): the bytes sit in this receive block; copy out, then
-        # re-post
+        # data (inline): the bytes sit in this receive block
+        if self._hold_recv:
+            if _PROBE_ON:
+                _t0 = time.perf_counter()
+            self._deliver_hold(sender_tag & _TAG_USER_MAX, blk, length)
+            if _PROBE_ON:
+                self._probe.series("recv_hold").add(time.perf_counter() - _t0)
+                self._probe.count("recv_bytes", length)
+                self._probe.min_gauge("pool_free", self._pool.qsize())
+            return
+        # non-hold: copy out, then re-post
         if _PROBE_ON:
             _t0 = time.perf_counter()
         data = bytes(memoryview(blk.buf)[:length])
@@ -1590,6 +1672,58 @@ class LwdUcxChannel:
         if not self._expects:
             self._expects_t0 = time.monotonic()
         self._expects.setdefault(tag, deque()).append(op)
+
+    def _deliver_hold(self, tag: int, blk: LwdUcxBlock, length: int) -> None:
+        """hold-recv data path (IO thread): pair the frame as a zero-copy
+        view of the receive block, and hand the block to the consumer until
+        ``op.release_data()``; without a waiting pre-post park it as bytes
+        and re-post immediately (the early store is bounded and must never
+        pin pool blocks).
+
+        recv_into ops fall back to the copy-out path: their consumer owns a
+        caller buffer, and this delivery model is not used by the LWD
+        assembly layer.
+        """
+        q = self._expects.get(tag)
+        if not q:
+            data = bytes(memoryview(blk.buf)[:length])
+            self._post_data(blk)
+            self._deliver(tag, data)
+            return
+        op = q.popleft()
+        if not q:
+            del self._expects[tag]
+        if not self._expects:
+            self._expects_t0 = 0.0
+        if op._into_addr:
+            # recv_into: settle needs standalone bytes; copy out and re-post
+            data = bytes(memoryview(blk.buf)[:length])
+            self._post_data(blk)
+            self._settle(op, data)
+            return
+        op._hold(blk, self)
+        self._held[blk.index] = (blk, time.monotonic())
+        # zero-copy delivery: a view of the block buffer; the view (and the
+        # block memory behind it) stays valid until the consumer releases.
+        self._settle(op, memoryview(blk.buf)[:length])
+
+    def _recycle_block(self, blk: LwdUcxBlock) -> None:
+        """Consumer-side entry (any thread) for releasing a held block: the
+        queue hands it back to the IO thread, the only worker owner."""
+        self._recycle_q.put(blk)
+
+    def _repost_block(self, blk: LwdUcxBlock) -> None:
+        """IO-thread half of the release: re-post a held block as a data
+        wildcard. A block whose pool died with the old link (put-mode ctl
+        pool) is dropped; main-pool blocks survive every link of this
+        channel."""
+        self._held.pop(blk.index, None)
+        if self._stopped or self._pool_staging or self._link is None:
+            return  # no live link: the next adopt's reset() re-lends it
+        pool_blocks = self._ctl_pool if self._recv_ctl else self._pool.blocks
+        if blk not in pool_blocks:
+            return  # stale pool (link swap): drop, its pool was discarded
+        self._post_data(blk)
 
     def _deliver(self, tag: int, data: bytes) -> None:
         q = self._expects.get(tag)

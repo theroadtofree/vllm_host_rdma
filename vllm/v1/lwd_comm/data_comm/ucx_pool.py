@@ -128,9 +128,17 @@ class LwdUcxBlockPool:
         callbacks, failure paths and link-change fallback."""
         self._free.put(blk)
 
-    def reset(self) -> None:
-        """Link-change reset: refill the free pool with all blocks (the blocks
-        themselves are reused across links, never reallocated)."""
+    def reset(self, exclude: set[Any] | None = None) -> None:
+        """Link-change reset: refill the free pool with the blocks (the
+        blocks themselves are reused across links, never reallocated).
+
+        ``exclude``: blocks currently lent to a consumer under hold-recv
+        (block-held delivery). They are NOT re-lent wholesale here -- a
+        consumer may still be copying from them; each returns through the
+        channel's recycle path (re-post) when the consumer releases it.
+        """
         self._free = queue.Queue()
         for blk in self.blocks:
+            if exclude is not None and blk in exclude:
+                continue
             self._free.put(blk)

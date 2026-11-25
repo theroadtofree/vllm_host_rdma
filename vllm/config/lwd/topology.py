@@ -126,6 +126,24 @@ class LwdHostDataPlane:
     listeners and engines attach through the ctl socket + shm. Both peers
     of a link must match."""
 
+    landing: Literal["device", "host"] = "device"
+    """UP receive landing mode, consumed by the cloud's UP receive only
+    ("device" everywhere else). "device" = the frame H2Ds into a
+    2-slot device buffer, then D2H-stages into the per-request pinned
+    buffers. "host" = the frame lands directly in the pinned buffers
+    through a host copy pool (no PCIe round trip; requires
+    deployment: in_process, and scramble must stay off with it until
+    the descramble moves into the copy pool). Identical on both peers
+    by convention; the edge-side value is ignored."""
+
+    def __post_init__(self) -> None:
+        if self.landing == "host" and self.deployment == "sidecar":
+            raise ValueError(
+                "[LWD] data_plane_host.landing: host requires deployment: "
+                "in_process (the sidecar shm recycle path is a later "
+                "extension)"
+            )
+
 
 LWD_API_BIND_BASE_PORT_DEFAULT = 61000
 """Default ``deployment.api_bind_base_port``: the reserved edge_share

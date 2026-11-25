@@ -4,7 +4,9 @@
 implementation.
 
 The current implementation is UCX over host RoCE: ucx_channel.py (the UHC1
-protocol family, a tagged byte pipe); ucx_link.py carries the UCP link
+protocol family, a tagged byte pipe; with cfg.hold_recv the receive frames
+are delivered as zero-copy views of the receive block and the block returns
+through op.release_data()); ucx_link.py carries the UCP link
 lifecycle, ucx_ucp.py/ucx_pool.py/sock.py are shared primitives, and
 ucx_port.py provides the embedded/daemon dual-mode port, with
 ucx_daemon.py/ucx_shm.py covering daemon mode. lwd_probe.py holds the
