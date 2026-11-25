@@ -7,7 +7,9 @@ The current implementation is UCX over host RoCE: ucx_channel.py (the UHC1
 protocol family, a tagged byte pipe); ucx_link.py carries the UCP link
 lifecycle, ucx_ucp.py/ucx_pool.py/sock.py are shared primitives, and
 ucx_port.py provides the embedded/daemon dual-mode port, with
-ucx_daemon.py/ucx_shm.py covering daemon mode. Device copy (D2H/H2D)
+ucx_daemon.py/ucx_shm.py covering daemon mode. lwd_probe.py holds the
+Phase-0 baseline probes (hot-path sampling + interval flush, LWD_PROBE=0
+switch). Device copy (D2H/H2D)
 orchestration belongs to the caller: the NPU implementation lives in
 vllm_ascend (lwd_data_plane/host package), while the GPU/CPU edge sides
 implement the same interface in their own plugin repos.
