@@ -235,6 +235,11 @@ _HS_HEADER = struct.Struct(_HS_FMT)
 _HS_TOKEN_INDEX = 3
 _HS_SESSION = int.from_bytes(os.urandom(8), "little")
 
+# Hold-recv early parking: a frame parked holding its block demotes back to
+# the bytes form once its pre-post is this late (lost hint / aborted peer
+# must never pin pool blocks). Generous: healthy hints arrive in ms.
+_EARLY_HOLD_DEADLINE_S = 2.0
+
 _UCX_ENV_LOGGED = False
 _DEFAULT_HS_TIMEOUT_S = 5.0
 
@@ -1184,6 +1189,11 @@ class LwdUcxChannel:
                 # here -- a wholesale re-lend would hand the same block to a fresh
                 # wildcard while a copy is still reading it; each held block
                 # returns through _repost_block when its consumer releases.
+                # Held early-park entries die with the old link's stream: free
+                # them BEFORE the reset so it re-lends their blocks.
+                for _dq in self._early.values():
+                    for _entry in _dq:
+                        self._reclaim_early_entry(_entry, repost=False)
                 self._pool.reset(exclude={b for b, _ in self._held.values()})
             # the early store dies with the old link: the new link brings a fresh
             # message stream, bytes stuck on the old one are stale (the peer never
@@ -1360,6 +1370,18 @@ class LwdUcxChannel:
                     self._early_count,
                     self._broken,
                 )
+                if self._hold_recv and self._early:
+                    _demoted = self._demote_stale_early_holds(now)
+                    if _demoted:
+                        if _PROBE_ON:
+                            self._probe.count("early_demote", _demoted)
+                        logger.error(
+                            "[ucx-chan] %s demoted %d held early frame(s) "
+                            "past %.1fs to bytes (pre-post never came)",
+                            self._name,
+                            _demoted,
+                            _EARLY_HOLD_DEADLINE_S,
+                        )
                 if self._hold_recv and self._held:
                     _stuck = [
                         idx
@@ -1663,22 +1685,38 @@ class LwdUcxChannel:
     def _do_recv(self, tag: int, op: LwdUcxOp) -> None:
         q = self._early.get(tag)
         if q:
-            data = q.popleft()
+            entry = q.popleft()
             self._early_count -= 1
             if not q:
                 del self._early[tag]
-            self._settle(op, data)
+            self._settle_early_entry(op, entry)
             return
         if not self._expects:
             self._expects_t0 = time.monotonic()
         self._expects.setdefault(tag, deque()).append(op)
 
+    def _settle_early_entry(self, op: LwdUcxOp, entry: Any) -> None:
+        """Pair a pre-post with a parked early entry. Held entries deliver
+        the zero-copy view (the consumer releases the block); bytes entries
+        settle unchanged. recv_into consumers need standalone bytes: a held
+        entry copies out and re-posts for them."""
+        if not isinstance(entry, tuple):
+            self._settle(op, entry)
+            return
+        blk, length, _parked_at = entry
+        if op._into_addr:
+            data = bytes(memoryview(blk.buf)[:length])
+            self._repost_block(blk)
+            self._settle(op, data)
+            return
+        self._settle_held(op, blk, length)
+
     def _deliver_hold(self, tag: int, blk: LwdUcxBlock, length: int) -> None:
         """hold-recv data path (IO thread): pair the frame as a zero-copy
         view of the receive block, and hand the block to the consumer until
-        ``op.release_data()``; without a waiting pre-post park it as bytes
-        and re-post immediately (the early store is bounded and must never
-        pin pool blocks).
+        ``op.release_data()``; without a waiting pre-post park it through
+        ``_park_early_held`` (block-held when the pool has spare depth,
+        bytes fallback otherwise).
 
         recv_into ops fall back to the copy-out path: their consumer owns a
         caller buffer, and this delivery model is not used by the LWD
@@ -1686,9 +1724,7 @@ class LwdUcxChannel:
         """
         q = self._expects.get(tag)
         if not q:
-            data = bytes(memoryview(blk.buf)[:length])
-            self._post_data(blk)
-            self._deliver(tag, data)
+            self._park_early_held(tag, blk, length)
             return
         op = q.popleft()
         if not q:
@@ -1701,10 +1737,35 @@ class LwdUcxChannel:
             self._post_data(blk)
             self._settle(op, data)
             return
+        self._settle_held(op, blk, length)
+
+    def _park_early_held(self, tag: int, blk: LwdUcxBlock, length: int) -> None:
+        """hold-recv early path: park the frame holding its receive block
+        (zero copy) while the pool has spare depth, else fall back to the
+        copy-out form. The cap keeps at least two blocks in the wildcard
+        rotation so parking can never starve the wire; the IO loop's
+        deadline reaper demotes stragglers back to bytes (a hint that never
+        comes must not pin pool blocks forever)."""
+        if len(self._held) < self._n_blocks - 2:
+            if _PROBE_ON:
+                self._probe.count("early_hold")
+            self._held[blk.index] = (blk, time.monotonic())
+            self._park_early(tag, (blk, length, time.monotonic()))
+            return
+        if _PROBE_ON:
+            self._probe.count("early_copyout")
+        data = bytes(memoryview(blk.buf)[:length])
+        self._post_data(blk)
+        self._park_early(tag, data)
+
+    def _settle_held(self, op: LwdUcxOp, blk: LwdUcxBlock, length: int) -> None:
+        """Deliver a held block to a paired op as a zero-copy view (IO
+        thread); the held bookkeeping is (re)stamped to delivery time so the
+        stuck diagnostic measures delivery age, not park age."""
         op._hold(blk, self)
         self._held[blk.index] = (blk, time.monotonic())
-        # zero-copy delivery: a view of the block buffer; the view (and the
-        # block memory behind it) stays valid until the consumer releases.
+        # the view (and the block memory behind it) stays valid until the
+        # consumer releases.
         self._settle(op, memoryview(blk.buf)[:length])
 
     def _recycle_block(self, blk: LwdUcxBlock) -> None:
@@ -1735,10 +1796,19 @@ class LwdUcxChannel:
             if not self._expects:
                 self._expects_t0 = 0.0
             return
-        # arrived early: no pre-post to pair with, so park it per tag in FIFO
-        # order (symmetric with the pre-post queue; one tag sent repeatedly loses
-        # nothing); bounded by early_max, and on overflow the globally oldest
-        # entry is dropped with a warning
+        # no pre-post to pair with: park per tag (early store)
+        self._park_early(tag, data)
+
+    def _park_early(self, tag: int, entry: Any) -> None:
+        """Park an early frame (no pre-post waited for its tag): per-tag FIFO
+        (symmetric with the pre-post queue; one tag sent repeatedly loses
+        nothing), bounded by early_max; on overflow the globally oldest
+        entry is dropped with a warning.
+
+        ``entry`` is bytes, or -- hold-recv only, admitted by
+        ``_park_early_held`` -- a ``(blk, length, parked_at)`` tuple that
+        parks the frame holding its receive block (zero copy).
+        """
         if self._early_count >= self._early_max:
             old_tag = next(t for t, dq in self._early.items() if dq)
             logger.warning(
@@ -1749,12 +1819,51 @@ class LwdUcxChannel:
                 old_tag,
             )
             dq = self._early[old_tag]
-            dq.popleft()
+            old = dq.popleft()
+            self._reclaim_early_entry(old, repost=True)
             self._early_count -= 1
             if not dq:
                 del self._early[old_tag]
-        self._early.setdefault(tag, deque()).append(data)
+        self._early.setdefault(tag, deque()).append(entry)
         self._early_count += 1
+
+    def _reclaim_early_entry(self, entry: Any, *, repost: bool) -> None:
+        """Free a held early-park entry back to the pool (bytes entries are
+        GC-owned and pass through). ``repost=False`` keeps the block out of
+        the wildcard rotation -- link teardown: the next adopt's pool reset
+        re-lends it; posting on a dying link would be lost work."""
+        if not isinstance(entry, tuple):
+            return
+        blk = entry[0]
+        self._held.pop(blk.index, None)
+        if repost:
+            self._repost_block(blk)
+
+    def _demote_stale_early_holds(self, now: float) -> int:
+        """Deadline reaper (IO thread, 10s tick): held early-park entries
+        whose pre-post never came (lost hint, aborted peer) are demoted to
+        the bytes form and their blocks re-posted, so parking can never pin
+        the pool forever. The copy-out cost only ever hits a frame whose
+        hint is already seconds late."""
+        demoted = 0
+        for tag in list(self._early):
+            dq = self._early.get(tag)
+            if dq is None or not any(isinstance(e, tuple) for e in dq):
+                continue
+            kept: deque = deque()
+            while dq:
+                entry = dq.popleft()
+                if (
+                    isinstance(entry, tuple)
+                    and now - entry[2] > _EARLY_HOLD_DEADLINE_S
+                ):
+                    kept.append(bytes(memoryview(entry[0].buf)[: entry[1]]))
+                    self._reclaim_early_entry(entry, repost=True)
+                    demoted += 1
+                else:
+                    kept.append(entry)
+            self._early[tag] = kept
+        return demoted
 
     def _settle(self, op: LwdUcxOp, data: bytes) -> None:
         if op._into_addr:
@@ -1787,6 +1896,12 @@ class LwdUcxChannel:
                     op._finish(error=error)
         self._expects.clear()
         self._expects_t0 = 0.0
+        # held early-park entries die with the link: free their blocks
+        # (repost=False -- the broken link must not take new posts; the next
+        # adopt's pool reset re-lends them)
+        for dq in self._early.values():
+            for entry in dq:
+                self._reclaim_early_entry(entry, repost=False)
         self._early.clear()
         self._early_count = 0
         self._reset_put_state()
