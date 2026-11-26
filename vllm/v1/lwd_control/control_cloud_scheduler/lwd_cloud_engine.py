@@ -627,12 +627,19 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         assert isinstance(plane, LwdCloudControlPlane)
         # In lwd_cluster each cloud engine serves only its own instance's
         # connections (other cloud engines watch the same file and apply
-        # their own). In cloud_share this filter is a no-op (every new
-        # connection goes to the single shared cloud).
+        # their own). In cloud_share every new connection goes to the
+        # single shared cloud, but a shared cloud with multiple DP ranks
+        # runs one engine per DP: each engine must adopt only its own
+        # DP's connections (the same per-DP filter as __init__), or every
+        # engine extends worker state with the other DPs' connection ids
+        # and the runner's per-edge connection resolution loses
+        # uniqueness.
         my_connections = [
             connection
             for connection in increment.new_connections
             if connection.connection_id.cloud_id == self.lwd_config.instance_id
+            and connection.connection_id.dp_idx
+            == self.vllm_config.parallel_config.data_parallel_index
         ]
         for edge_id in increment.new_edge_ids:
             # Only admit edges that connect to THIS cloud.
