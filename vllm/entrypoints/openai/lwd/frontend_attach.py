@@ -180,7 +180,7 @@ def _canonical_additional_config(plan: FrontendAttachPlan) -> dict[str, Any]:
 def compute_attach_config_payload(
     args: Any, plan: FrontendAttachPlan | None = None
 ) -> dict[str, Any]:
-    from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
+    from vllm.entrypoints.common.startup import jsonify_non_default_args
 
     plan = plan or resolve_attach_plan(args)
     assert plan is not None
@@ -191,7 +191,7 @@ def compute_attach_config_payload(
 
 
 def compute_frontend_args_payload(args: Any) -> dict[str, Any]:
-    from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
+    from vllm.entrypoints.common.startup import jsonify_non_default_args
 
     payload = jsonify_non_default_args(args)
     return {
@@ -204,7 +204,7 @@ def apply_inherited_frontend_args(
 ) -> list[str]:
     if not frontend_args_payload:
         return []
-    from vllm.entrypoints.serve.utils.api_utils import get_non_default_args
+    from vllm.entrypoints.common.startup import get_non_default_args
 
     locally_set = set(get_non_default_args(args))
     inherited = []
