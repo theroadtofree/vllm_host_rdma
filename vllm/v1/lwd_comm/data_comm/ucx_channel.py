@@ -86,6 +86,7 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_comm.data_comm import sock as _sock
+from vllm.v1.lwd_comm.data_comm.lwd_probe import LwdProbeSet, probe_enabled
 from vllm.v1.lwd_comm.data_comm.ucx_link import (
     _UcxLink,
 )
@@ -101,6 +102,11 @@ from vllm.v1.lwd_comm.data_comm.ucx_ucp import (
 )
 
 logger = init_logger(__name__)
+
+# Phase-0 baseline probes (see lwd_probe.py): LWD_PROBE=0 switches sampling
+# off at the call sites (one global read per branch); flushes piggyback on
+# the IO loop's state-snapshot tick either way.
+_PROBE_ON = probe_enabled()
 
 
 class LwdHostDoneEvent:
@@ -527,6 +533,11 @@ class LwdUcxChannel:
         self._pool_staging = bool(c.pool_staging)
         self._name = name or "ucx-chan"
         self._role = ""  # "connect" / "serve" (for logging)
+        # Phase-0 probe (IO occupancy per received frame; series pre-created
+        # here so the hot path never constructs anything)
+        self._probe = LwdProbeSet(self._name)
+        for _probe_series in ("recv_copyout", "recv_repost", "recv_total"):
+            self._probe.series(_probe_series)
         # Owner attributes _UcxLink relies on (_pool/_block_bytes/_put_thresh)
         self._pool = LwdUcxBlockPool(self._n_blocks, self._block_bytes)
         if self._pool_staging:
@@ -1270,6 +1281,9 @@ class LwdUcxChannel:
             now = time.monotonic()
             if now - last_log >= _STATE_SNAPSHOT_S:
                 last_log = now
+                if _PROBE_ON:
+                    for _probe_line in self._probe.take_lines():
+                        logger.error("[lwd-probe] %s", _probe_line)
                 self._log_state(now)
 
     def _log_state(self, now: float) -> None:
@@ -1542,11 +1556,27 @@ class LwdUcxChannel:
             tag, size = _DB.unpack_from(blk.buf, 0)
             self._on_doorbell(tag, size)
             return
-        # data (inline): the bytes sit in this receive block; copy out, then
-        # re-post
+        # data (inline): the bytes sit in this receive block
+        if _PROBE_ON:
+            _t0 = time.perf_counter()
         data = bytes(memoryview(blk.buf)[:length])
+        if _PROBE_ON:
+            _t1 = time.perf_counter()
+            self._probe.series("recv_copyout").add(_t1 - _t0)
         self._post_data(blk)
+        if _PROBE_ON:
+            _t2 = time.perf_counter()
+            self._probe.series("recv_repost").add(_t2 - _t1)
+        # _deliver either pairs the frame with a pre-post (the user callback
+        # then runs inside this measurement) or parks it in the early store;
+        # recv_total therefore covers the whole per-frame IO occupancy.
         self._deliver(sender_tag & _TAG_USER_MAX, data)
+        if _PROBE_ON:
+            self._probe.series("recv_total").add(time.perf_counter() - _t0)
+            self._probe.count("recv_bytes", length)
+            # wildcard depth sample (backpressure signal): min over the
+            # interval; qsize takes the pool queue's (uncontended) lock.
+            self._probe.min_gauge("pool_free", self._pool.qsize())
 
     def _on_doorbell(self, tag: int, size: int) -> None:
         """Doorbell: the data is already in this side's slot
