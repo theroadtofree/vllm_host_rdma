@@ -911,10 +911,30 @@ def run_attach_api_server(args: Any) -> None:
         )
 
         listen_address, sock = setup_server(args, reuse_port=False)
-        bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
-        input_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.ROUTER)
+        # Deterministic engine IO ports (old-branch invariant): the ports
+        # come from the topology yaml's reserved band (single source:
+        # ``engine_io_addresses``, shared with the primary's elastic
+        # pre-seed). A late or restarted attach frontend rebinds the SAME
+        # port, so the running engine's retrying DEALER/PUSH reconnect
+        # transparently and the READY re-send completes this frontend's
+        # client handshake — an ephemeral port would leave the engine
+        # connected to the pre-seeded address that nobody ever binds.
+        # Bind-side conflict check: this command's own configured ports
+        # must stay out of the band it is about to bind.
+        _assert_ports_outside_engine_io_band(
+            plan.api_bind_base_port,
+            {
+                "api listen": _resolve_listen(args)[1],
+                "registration": parse_endpoint(plan.endpoint, "--api-server-attach")[1],
+            },
+            f"attach frontend {plan.client_index}",
+        )
+        input_address, output_address = engine_io_addresses(
+            plan.endpoint, plan.api_bind_base_port, plan.client_index
+        )
+        input_listener = make_zmq_listener(input_address, zmq.ROUTER)
         try:
-            output_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.PULL)
+            output_listener = make_zmq_listener(output_address, zmq.PULL)
         except BaseException:
             input_listener.close()
             raise
@@ -935,9 +955,10 @@ def run_attach_api_server(args: Any) -> None:
                 input_listener.address,
                 output_listener.address,
             )
-            # Report the ACTUAL dynamic listener addresses on every round,
-            # not the legacy deterministic port band: after a primary
-            # restart the new authority must learn these very addresses.
+            # The listeners bound the deterministic band ports, so the
+            # reported addresses are the actual endpoints AND the addresses
+            # the engine is already retrying toward; the watchdog re-reports
+            # the same pair, releasing a restarted primary's fresh barrier.
             _start_reregister_watchdog(
                 plan, input_listener.address, output_listener.address
             )
@@ -951,17 +972,11 @@ def _start_reregister_watchdog(
     input_address: str,
     output_address: str,
 ) -> None:
-    """Primary-restart self-healing: re-register on a fixed cadence with an
-    independent short connection per round. While the primary lives each
-    round is a silent no-op; after a primary restart the next round
-    re-attaches and re-reports, releasing the new primary's startup barrier.
-
-    ``input_address`` / ``output_address`` are the frontend's actual dynamic
-    ROUTER/PULL listener addresses (see run_attach_api_server), not the
-    legacy deterministic engine IO band. The resident authority publishes
-    them into the engine's address table, so a restarted primary converges
-    without restarting either the frontend or the engine.
-    Runs until the process exits (daemon)."""
+    """Primary-restart self-healing (old-branch invariant): re-register on
+    a fixed cadence with an independent short connection per round. While
+    the primary lives each round is a silent no-op; after a primary restart
+    the next round re-attaches and re-reports, releasing the new primary's
+    startup barrier. Runs until the process exits (daemon)."""
 
     def loop() -> None:
         while True:
@@ -1056,12 +1071,13 @@ def wait_for_attach_registrations(
     registered to their reported endpoints.
 
     The engine therefore starts with the FULL capacity frontend list and
-    serves with whichever frontends exist. On the new main the attach
-    frontends bind their ROUTER/PULL listeners on dynamic ports and report
-    the real addresses, so the deterministic pre-seed is only a capacity
-    placeholder: bind_engine_addresses() lets every ENDPOINTS report —
-    including those arriving after the barrier — overwrite it in place.
-    A cross-host attach frontend must register inside the grace window to
+    serves with whichever frontends exist; a frontend that starts later
+    binds the same deterministic address and the engine's DEALER/PUSH
+    reconnect transparently (the READY re-send completes its client
+    handshake). The seed derives the address from THIS host's route
+    toward the registration endpoint — exact for the same-host
+    edge_share deployment (one engine host, N API frontends); a
+    cross-host attach frontend must register inside the grace window to
     contribute its actual address."""
     registration_server.bind_engine_addresses(addresses)
     for client_index in range(1, registration_server.client_count):

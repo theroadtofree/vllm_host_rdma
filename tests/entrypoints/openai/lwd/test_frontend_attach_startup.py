@@ -81,8 +81,10 @@ def test_attach_payload_and_inherited_args_resolve_the_helpers(
 
 def test_late_endpoint_report_publishes_into_engine_addresses() -> None:
     """P1-1: an ENDPOINTS report arriving after the startup barrier must
-    publish the frontend's ACTUAL dynamic listener addresses into the
-    engine's address table, so a late frontend joins without a restart."""
+    publish the frontend's reported endpoints into the bound engine
+    address table, keeping the authority's view current (a late same-host
+    frontend joins through its deterministic band rebind; the engine's
+    DEALER reconnect plus the READY re-send complete its handshake)."""
     server: Any = object.__new__(FrontendAttachServer)
     server._accepted = {1}
     server._reported = {}
@@ -109,8 +111,10 @@ def test_late_endpoint_report_publishes_into_engine_addresses() -> None:
 
 
 def test_watchdog_reports_the_actual_listener_addresses() -> None:
-    """P1-2: the re-registration watchdog must be wired to the dynamic
-    ROUTER/PULL listeners, not the legacy deterministic port band."""
+    """P1-2: the re-registration watchdog must be wired to the bound
+    ROUTER/PULL listeners (the deterministic engine IO band ports), so a
+    restarted primary's fresh barrier learns exactly the addresses the
+    running engine is retrying toward."""
     tree = ast.parse(Path(frontend_attach.__file__).read_text(encoding="utf-8"))
     run_fn = next(
         node
