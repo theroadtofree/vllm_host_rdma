@@ -25,6 +25,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 _LWD_TEST_HOST = "127.0.0.1"
 _PORT_PLANNED = 15670
 _PORT_ADDED = 15671
+_PORT_V2_PLANNED = 15672
+_PORT_V2_ADDED = 15673
 _LWD_WAIT_S = 15.0
 
 
@@ -104,6 +106,61 @@ def test_added_link_registers_and_carries_payloads() -> None:
         _wait_for(lambda: len(edge.registered_peers()) == 2)
         assert sender.send(LwdPeer(1, 0), b"runtime-added-payload")
         _wait_for(lambda: recorder_added.payloads)
+    finally:
+        edge.shutdown()
+        cloud_planned.shutdown()
+        cloud_added.shutdown()
+
+
+def test_added_link_announces_the_engine_runner_kind() -> None:
+    """A runtime-added link must announce the engine's runner_kind. A V2
+    edge whose added HELLO defaulted to V1 was rejected by the V2 cloud
+    ("edge runner_kind v1 != cloud v2") and the link never registered."""
+    recorder_planned = _Recorder()
+    recorder_added = _Recorder()
+    cloud_planned = LwdCloudControlPlane(
+        LwdCloudControlPlaneSpec(
+            instance_id=0,
+            dp_rank=0,
+            dp_size=1,
+            bind_endpoint=f"tcp://{_LWD_TEST_HOST}:{_PORT_V2_PLANNED}",
+            runner_kind="v2",
+        )
+    )
+    cloud_added = LwdCloudControlPlane(
+        LwdCloudControlPlaneSpec(
+            instance_id=1,
+            dp_rank=0,
+            dp_size=1,
+            bind_endpoint=f"tcp://{_LWD_TEST_HOST}:{_PORT_V2_ADDED}",
+            runner_kind="v2",
+        )
+    )
+    edge: Any = LwdEdgeControlPlane(
+        LwdEdgeControlPlaneSpec(
+            instance_id=0,
+            dp_rank=0,
+            dp_size=1,
+            cloud_endpoints=(f"tcp://{_LWD_TEST_HOST}:{_PORT_V2_PLANNED}",),
+            runner_kind="v2",
+        )
+    )
+    try:
+        edge.start(recorder_planned)
+        cloud_planned.start(recorder_planned)
+        cloud_added.start(recorder_added)
+        _wait_for(lambda: len(edge.registered_peers()) == 1)
+
+        done = threading.Event()
+        edge.add_link(
+            f"tcp://{_LWD_TEST_HOST}:{_PORT_V2_ADDED}",
+            LwdConnectionId(0, 1, 0),
+            1,
+            done=done,
+        )
+        assert done.wait(_LWD_WAIT_S), "the IO thread never applied add_link"
+
+        _wait_for(lambda: len(edge.registered_peers()) == 2)
     finally:
         edge.shutdown()
         cloud_planned.shutdown()

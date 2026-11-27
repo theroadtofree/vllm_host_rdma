@@ -714,8 +714,10 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 dp_rank=pending.connection_id.dp_idx,
                 dp_size=pending.cloud_dp_size,
                 session_id=self._session_id,
+                runner_kind=self.spec.runner_kind,
             ),
             self.spec.config.hello_retry_interval_s,
+            self.spec.runner_kind,
         )
         logger.info(
             "control plane %s: link %d added to %s (connection %s); handshake retrying",
