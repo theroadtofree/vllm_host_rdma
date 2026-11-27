@@ -90,3 +90,23 @@ tests/v1/lwd_control/test_lwd_edge_probe.py  # pre-existing LWD suite not wired 
 tests/v1/lwd_control/test_lwd_edge_route_rotation.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_edge_scheduler.py  # pre-existing LWD suite not wired into CI
 tests/v1/lwd_control/test_lwd_frontend_routing.py  # pre-existing LWD suite not wired into CI
+
+# LWD fast-lane unit tests ported to the new main in #117. These are CPU-only
+# module tests exercised by the LWD Fast workflow and local pytest; no
+# Buildkite directory-level job collects these paths (same as the LWD suites
+# already listed above). Wire them into Buildkite before removing an entry.
+tests/config/lwd/test_topology_update.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_frontend_attach_reregister.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_lwd_async_client.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_comm/test_lwd_ucx_listener.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_cloud_engine_retire.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_control_plane_add_link.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_edge_cloud_adoption.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_edge_hello_reregister.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_handshake_allow_edge.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_heartbeat.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_liveness.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_topology_watch.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_transfer_containment.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/v1/lwd_control/test_lwd_liveness_gateway.py  # LWD fast-lane UT; no Buildkite job collects this path
+tests/entrypoints/openai/lwd/test_frontend_attach_startup.py  # LWD fast-lane UT; no Buildkite job collects this path

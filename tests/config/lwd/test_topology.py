@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from pathlib import Path
+from typing import Any
 
 import pytest
-from lwd_config_under_test import LwdTopology
+from lwd_config_under_test import LwdConnectionId, LwdTopology
 from sample_topologies import PAYLOADS, topology_payload
 
 
@@ -44,6 +45,83 @@ def test_colocated_edges_keep_distinct_ranks_and_share_cloud(dp_count: int) -> N
         assert [
             c.connection_id.cloud_id for c in topology.connections("edge", edge.id)
         ] == [0] * dp_count
+
+
+def minimal_edge_share_payload() -> dict:
+    """One-pair edge_share in host comm: the degenerate form of the
+    shared-edge pipeline, so a deployment can verify the whole attach
+    machinery with a single instance and grow by extending the plan."""
+    return {
+        "deployment": {
+            "mode": 0,
+            "scene": "edge_share",
+            "edges_num": 1,
+            "clouds_num": 1,
+            "data_plane_comm": "host",
+        },
+        "feature_ctrl": {
+            "enable_early_recv": False,
+            "scramble": {"enable": False, "device_id": None, "custom_factor": None},
+        },
+        "edges": [{"id": 0, "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}]}],
+        "clouds": [
+            {
+                "id": 0,
+                "dp": [
+                    {
+                        "dp_idx": 0,
+                        "addr": "16.32.2.2",
+                        "ctrl_port": 5550,
+                        "data_port": 5560,
+                    }
+                ],
+            }
+        ],
+        "instance_links": [{"edge": 0, "cloud": 0}],
+    }
+
+
+def test_single_pair_edge_share_is_the_degenerate_pipeline_form() -> None:
+    topology = LwdTopology.from_dict(minimal_edge_share_payload())
+    assert topology.deployment.scene == "edge_share"
+    (connection,) = topology.connections("edge", 0)
+    assert connection.connection_id == LwdConnectionId(0, 0, 0)
+    # The cloud sees the same single connection from its own side.
+    assert topology.connections("cloud", 0) == (connection,)
+
+
+def test_edge_share_still_requires_equal_instance_counts() -> None:
+    raw = minimal_edge_share_payload()
+    raw["deployment"]["edges_num"] = 2
+    raw["edges"].append({"id": 1, "dp": [{"dp_idx": 0, "addr": "135.150.2.2"}]})
+    with pytest.raises(ValueError, match="equal edge/cloud instance IDs"):
+        LwdTopology.from_dict(raw)
+
+
+def test_single_edge_cloud_share_is_the_degenerate_pipeline_form() -> None:
+    """Regression (1-edge cloud_share drill): a one-edge, one-cloud
+    cloud_share deployment is the degenerate form of the shared-cloud
+    pipeline and must load — the validator used to demand >= 2 edges and
+    the whole deployment was rejected at config parse time."""
+    raw = minimal_edge_share_payload()
+    raw["deployment"]["scene"] = "cloud_share"
+    # cloud_share still requires an enabled coordination block per instance.
+    for instance in ("edges", "clouds"):
+        for entry in raw[instance]:
+            entry["coordination"] = {"enabled": True}
+    raw["edges"][0]["coordination"].update(
+        tenant_key_file="/home/w00505434/edge-cloud-tenant-key",
+        consumer_id="enterprise-a-edge0",
+        connect_timeout=5.0,
+    )
+    raw["clouds"][0]["coordination"]["listen_host"] = "16.32.2.2"
+    raw["clouds"][0]["dp"][0].update(coord_port=9133, coord_url="http://16.32.2.2:9133")
+    topology = LwdTopology.from_dict(raw)
+    assert topology.deployment.scene == "cloud_share"
+    (connection,) = topology.connections("edge", 0)
+    assert connection.connection_id == LwdConnectionId(0, 0, 0)
+    # The cloud sees the same single connection from its own side.
+    assert topology.connections("cloud", 0) == (connection,)
 
 
 @pytest.mark.parametrize(
@@ -489,7 +567,7 @@ def test_gateway_requires_url_and_rejects_legacy_urls_and_path() -> None:
 
 
 def test_probe_poll_budget_yaml_config() -> None:
-    raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw = cloud_reuse(1)
     coordination = raw["clouds"][0]["coordination"]
     assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 32
     coordination["probe_poll_budget"] = 2
@@ -578,7 +656,7 @@ def test_enabled_edge_requires_complete_linked_cloud_endpoints() -> None:
 @pytest.mark.parametrize("field", ["control_url", "control_url_map", "listen_port"])
 def test_retired_instance_coordination_fields_are_rejected(field: str) -> None:
     raw = cloud_reuse(1)
-    value = "http://10.1.0.1:8100" if field == "control_url" else 8100
+    value: Any = "http://10.1.0.1:8100" if field == "control_url" else 8100
     if field == "control_url_map":
         value = {0: "http://10.1.0.1:8100"}
     raw["edges"][0]["coordination"][field] = value
@@ -609,4 +687,27 @@ def test_coord_port_cannot_collide_with_host_data_port() -> None:
     dp["coord_port"] = dp["data_port"]
     dp["coord_url"] = f"http://{dp['addr']}:{dp['coord_port']}"
     with pytest.raises(ValueError, match="coord_port conflicts with data_port"):
+        LwdTopology.from_dict(raw)
+
+
+def test_api_bind_base_port_defaults_to_the_reserved_band() -> None:
+    """The edge_share engine IO band base defaults to 61000 (16 reserved
+    ports, two per frontend, for up to 8 frontends)."""
+    topology = LwdTopology.from_dict(topology_payload("s2_edge_share_2dp.yaml"))
+    assert topology.deployment.api_bind_base_port == 61000
+
+
+def test_api_bind_base_port_is_configurable_in_edge_share() -> None:
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    raw["deployment"]["api_bind_base_port"] = 62000
+    topology = LwdTopology.from_dict(raw)
+    assert topology.deployment.api_bind_base_port == 62000
+
+
+def test_api_bind_base_port_rejected_outside_edge_share() -> None:
+    """Only edge_share may configure the band base: any other scene gets a
+    loud config error instead of silently ignoring it."""
+    raw = topology_payload("s3_cloud_share_2dp.yaml")
+    raw["deployment"]["api_bind_base_port"] = 62000
+    with pytest.raises(ValueError, match="edge_share setting"):
         LwdTopology.from_dict(raw)

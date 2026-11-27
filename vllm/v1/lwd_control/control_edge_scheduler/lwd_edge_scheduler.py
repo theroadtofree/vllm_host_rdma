@@ -146,6 +146,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_edge_share = lwd_config.topology.deployment.scene == "edge_share"
         connections = tuple(sorted(c.connection_id for c in lwd_config.connections))
         self._lwd_connections = connections
+        # Liveness verdict of the engine's sweep (frozen snapshot,
+        # atomically swapped in via lwd_update_silent_routes): a route the
+        # sweep declared dead stays out of the routing candidates while
+        # its siblings are alive.
+        self._lwd_silent_routes: frozenset[LwdConnectionId] = frozenset()
         self._lwd_accounts: dict[LwdConnectionId, LwdCloudDpAccount] = {
             connection_id: LwdCloudDpAccount(connection_id)
             for connection_id in connections
@@ -208,6 +213,34 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         account.prefix_use_eagle = params.prefix_use_eagle
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
+
+    def lwd_add_runtime_connection(self, connection_id: LwdConnectionId) -> None:
+        """Seed a runtime-added connection's bookkeeping BEFORE its link
+        opens: the cloud's limits can arrive on the IO thread within one
+        hello-retry of registration and `lwd_update_cloud_params`
+        subscripts these maps. Idempotent. The connection deliberately
+        does NOT join the routing candidates — the admission gate keeps
+        rejecting it until its data-plane link exists (a later phase),
+        and routing an unservable connection is worse than refusing it."""
+        if connection_id not in self._lwd_accounts:
+            self._lwd_accounts[connection_id] = LwdCloudDpAccount(connection_id)
+        self._lwd_aborted_req_ids.setdefault(connection_id, [])
+
+    def lwd_update_silent_routes(self, silent: frozenset[LwdConnectionId]) -> None:
+        """Engine thread: the liveness sweep's frozen verdict (a cloud DP
+        went silent, or its heartbeat resumed). One atomic frozenset swap;
+        routing reads it on the same thread."""
+        self._lwd_silent_routes = silent
+
+    def lwd_add_runtime_route(self, connection_id: LwdConnectionId) -> None:
+        """Open a runtime connection for service: it joins the routing
+        candidates (sorted, so the round-robin order stays stable).
+        Idempotent. Legacy int-indexed send watermarks
+        (`_lwd_connections[dp_idx]`) predate runtime additions and keep
+        meaning link indices of the startup plan."""
+        if connection_id in self._lwd_connections:
+            return
+        self._lwd_connections = tuple(sorted((*self._lwd_connections, connection_id)))
 
     def _lwd_dp_of(self, request_id: str) -> LwdConnectionId:
         """Routed dp_idx of an active request; unrouted ids are a bug."""
@@ -277,6 +310,37 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             raise RuntimeError(
                 f"[LWD] no cloud connection for edge_id={edge_id} "
                 f"(request {request_id})"
+            )
+        # Liveness: a route the sweep declared silent is not a candidate —
+        # round-robin must not keep sending requests to a dead cloud while
+        # a sibling route is alive (partial silence: the gate admits, so
+        # the dead cloud would otherwise eat every other request). Fail
+        # open when every candidate is silent: the gate already rejects
+        # the fully-silent case at admission, so this covers only the
+        # admit/route race, and the transfer containment owns whatever
+        # still slips through.
+        healthy = {
+            connection_id: account
+            for connection_id, account in candidates.items()
+            if connection_id not in self._lwd_silent_routes
+        }
+        if healthy:
+            candidates = healthy
+        if preferred is not None and preferred not in candidates:
+            # The probe produced a preference the router cannot honor: the
+            # connection is not a serviceable routing candidate (data-plane
+            # build refused) or the liveness sweep declared it silent. The
+            # request silently falls back — this log is the elastic
+            # scale-out diagnosis cue.
+            lwd_logger.error(
+                "[LWD] preferred %s is not a routing candidate for "
+                "edge_id=%d (request %s): candidates=%s silent=%s; "
+                "falling back to score/round-robin",
+                preferred,
+                edge_id,
+                request_id,
+                [cid for cid in candidates],
+                sorted(self._lwd_silent_routes),
             )
         if preferred is not None and preferred in candidates:
             best = candidates[preferred]
@@ -758,7 +822,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_request_active(self, request_id: str) -> bool:
         if request_id in self._lwd_route or request_id in self.requests:
             return True
-        announced = getattr(self, "_lwd_announced_refills", set())
+        announced: set[tuple[LwdConnectionId, int]] = getattr(
+            self, "_lwd_announced_refills", set()
+        )
         return any(
             (account.connection_id, seqno) in announced and request_id in request_ids
             for account in self._lwd_accounts.values()
@@ -1026,6 +1092,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             self.lwd_model_family.release(request_id)
             self._lwd_settle_request(request_id)
         return routed_aborts
+
+    def lwd_edge_up_batch_request_ids(
+        self, connection: LwdConnectionId, seqnos: list[int]
+    ) -> list[str]:
+        """Requests whose UP send failed mid-flight (containment input): the
+        batch entries still sit in the account's pending bookkeeping and
+        release through the abort path that follows this lookup."""
+        account = self._lwd_accounts.get(connection)
+        if account is None:
+            return []
+        request_ids: set[str] = set()
+        for seqno in seqnos:
+            request_ids.update(account.pending_batches.get(seqno, ()))
+        return sorted(request_ids)
 
     def lwd_edge_deliver_tokens(
         self, request_id: str, token_ids: list[int], finished: bool
