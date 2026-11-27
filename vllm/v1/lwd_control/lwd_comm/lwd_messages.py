@@ -291,6 +291,20 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     """Generation of each request row, aligned with req_ids."""
 
 
+class LwdCloudHeartbeat(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
+    """Cloud -> edge. Liveness keepalive of one cloud DP rank.
+
+    The edge keeps per-connection liveness accounts: no beat within the
+    silent threshold (the edge engine's ``LWD_HELLO_SILENT_S``) is a
+    silent verdict (the edge
+    tears the data-plane
+    links down and gates new requests until the next beat), and a
+    ``boot_id`` change is a cloud restart verdict. The boot id is random
+    per cloud process launch, i.e. the epoch of this DP rank."""
+
+    boot_id: str
+
+
 LwdEdgeToCloudMessage: TypeAlias = (
     LwdRequestNotify
     | LwdRangeNotify
@@ -299,7 +313,11 @@ LwdEdgeToCloudMessage: TypeAlias = (
     | LwdFinishNotify
 )
 LwdCloudToEdgeMessage: TypeAlias = (
-    LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
+    LwdCloudParamsNotify
+    | LwdCloudHeartbeat
+    | LwdC2eNotify
+    | LwdPrefixReadyNotify
+    | LwdRefillNotify
 )
 LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
 

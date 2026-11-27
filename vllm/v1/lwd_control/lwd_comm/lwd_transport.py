@@ -158,6 +158,8 @@ class LwdControlTransport(ABC):
         """Send one message without blocking.
 
         Args:
+            kind: The frame kind to send.
+            body: The encoded message payload.
             identity: The ROUTER routing identity on the cloud; the link
                 index, as decimal bytes, on the edge.
 
@@ -168,6 +170,7 @@ class LwdControlTransport(ABC):
         Raises:
             LwdPeerUnreachableError: The cloud has no connection to
                 `identity`.
+
         """
         try:
             self._send(kind.value, body, identity)
@@ -262,32 +265,49 @@ class LwdEdgeTransport(LwdControlTransport):
         self._identities = identities
         self._links: list[zmq.Socket] = []
 
+    def _new_link(self, ctx: zmq.Context, endpoint: str, identity: bytes) -> zmq.Socket:
+        link = ctx.socket(self._SOCKET_TYPE)
+        try:
+            link.setsockopt(zmq.LINGER, 0)
+            link.setsockopt(zmq.SNDHWM, _LWD_LINK_HWM)
+            link.setsockopt(zmq.RCVHWM, _LWD_LINK_HWM)
+            link.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            link.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
+            link.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
+            link.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
+            lwd_apply_ctrl_qos(link)
+            _, host, _ = split_zmq_path(endpoint)
+            if is_valid_ipv6_address(host):
+                link.setsockopt(zmq.IPV6, 1)
+            link.setsockopt(zmq.IDENTITY, identity)
+            # Never queue frames for a link that is not established:
+            # sends report a full link (EAGAIN) instead of piling up
+            # until the cloud appears.
+            link.setsockopt(zmq.IMMEDIATE, 1)
+            link.connect(endpoint)
+        except Exception:
+            link.close(linger=0)
+            raise
+        return link
+
     def open(self, ctx: zmq.Context) -> None:
         for endpoint, identity in zip(self._endpoints, self._identities):
-            link = ctx.socket(self._SOCKET_TYPE)
             try:
-                link.setsockopt(zmq.LINGER, 0)
-                link.setsockopt(zmq.SNDHWM, _LWD_LINK_HWM)
-                link.setsockopt(zmq.RCVHWM, _LWD_LINK_HWM)
-                link.setsockopt(zmq.TCP_KEEPALIVE, 1)
-                link.setsockopt(zmq.TCP_KEEPALIVE_IDLE, _LWD_TCP_KEEPALIVE_IDLE_S)
-                link.setsockopt(zmq.TCP_KEEPALIVE_INTVL, _LWD_TCP_KEEPALIVE_INTVL_S)
-                link.setsockopt(zmq.TCP_KEEPALIVE_CNT, _LWD_TCP_KEEPALIVE_CNT)
-                lwd_apply_ctrl_qos(link)
-                _, host, _ = split_zmq_path(endpoint)
-                if is_valid_ipv6_address(host):
-                    link.setsockopt(zmq.IPV6, 1)
-                link.setsockopt(zmq.IDENTITY, identity)
-                # Never queue frames for a link that is not established:
-                # sends report a full link (EAGAIN) instead of piling up
-                # until the cloud appears.
-                link.setsockopt(zmq.IMMEDIATE, 1)
-                link.connect(endpoint)
+                link = self._new_link(ctx, endpoint, identity)
             except Exception:
-                link.close(linger=0)
                 self.close()
                 raise
             self._links.append(link)
+
+    def open_link(self, ctx: zmq.Context, endpoint: str, identity: bytes) -> zmq.Socket:
+        """Open one more DEALER mid-run (a runtime topology increment).
+        Only the plane's IO thread calls this and owns the new socket's
+        poller registration. IMMEDIATE keeps a send to a cloud that has
+        not started at EAGAIN, so the HELLO retry keeps ticking until it
+        does."""
+        link = self._new_link(ctx, endpoint, identity)
+        self._links.append(link)
+        return link
 
     @property
     def socket(self) -> zmq.Socket:

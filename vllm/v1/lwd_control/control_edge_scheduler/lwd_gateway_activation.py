@@ -56,6 +56,11 @@ class LwdGatewayActivationManager:
         self._hash_sizes: dict[tuple[int, int], int] = {}
         self._processor_fingerprint: bytes | None = None
         self._tenant_key: bytes | None = None
+        # Cloud-grained liveness verdict cached from the heartbeat monitor.
+        # One atomic frozenset swap; the monitor re-pushes the empty set on
+        # recovery. See set_silent_clouds for why this does not filter the
+        # gateway targets.
+        self._silent_clouds: frozenset[int] = frozenset()
         self._targets = tuple(
             connection.connection_id
             for connection in vllm_config.lwd_config.connections
@@ -118,7 +123,43 @@ class LwdGatewayActivationManager:
         self._clients[key] = client
         return client
 
+    @property
+    def silent_clouds(self) -> frozenset[int]:
+        """The cached cloud-grained liveness verdict (diagnostic surface)."""
+        return self._silent_clouds
+
+    def set_silent_clouds(self, cloud_ids: frozenset[int]) -> None:
+        """Verdict subscriber for the gateway coordination mode.
+
+        The gateway service, not the edge, chooses the Cloud/DP, so the edge
+        cannot drop a silent cloud from the probe targets the way the direct
+        probe manager does: filtering ``_visible_targets`` here would turn a
+        legal gateway response into "unconfigured Cloud" and fail the request
+        instead of falling back. The admission gate already rejects requests
+        while every route is silent, so the verdict is cached here as the
+        single source of truth for diagnostics and for any future gateway
+        protocol field carrying excluded clouds.
+        """
+        self._silent_clouds = cloud_ids
+
+    def register_connection(self, connection_id: LwdConnectionId, url: str) -> None:
+        """Elastic scale-out: add a runtime-adopted connection to the visible
+        target set. The gateway service owns Cloud selection, so the
+        per-cloud coordination URL is not used here — only the connection id
+        matters for ``_visible_targets``. Idempotent, like the direct probe
+        manager's registration.
+        """
+        del url
+        if connection_id not in self._targets:
+            self._targets = (*self._targets, connection_id)
+
+    def rotation(self) -> tuple[tuple[int, int], ...]:
+        """Visible Cloud-DP ids (diagnostics, mirrors the direct manager)."""
+        return tuple((target.cloud_id, target.dp_idx) for target in self._targets)
+
     def _visible_targets(self, edge_id: int) -> tuple[LwdConnectionId, ...]:
+        # Deliberately unfiltered: see set_silent_clouds. The gateway owns
+        # Cloud selection; the admission gate owns the fully-silent verdict.
         return tuple(target for target in self._targets if target.edge_id == edge_id)
 
     def _uses_prefix_hit(self, request: Any) -> bool:

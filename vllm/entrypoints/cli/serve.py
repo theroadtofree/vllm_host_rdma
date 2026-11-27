@@ -155,7 +155,15 @@ class ServeSubcommand(CLISubcommand):
             run_dp_supervisor(args)
         elif args.api_server_count < 1:
             run_headless(args)
-        elif args.api_server_count > 1 or rust_frontend_path:
+        elif (
+            args.api_server_count > 1
+            or rust_frontend_path
+            # An LWD attach primary must run the attach pipeline (its
+            # registration server) even with a single planned frontend;
+            # the single in-process path leaves --api-server-rpc-port
+            # unbound and attach frontends hang on it.
+            or getattr(args, "lwd_attach_primary", False)
+        ):
             run_multi_api_server(args)
         else:
             # Single API server (this process).

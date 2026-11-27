@@ -493,3 +493,67 @@ def test_gateway_submit_failure_returns_failed_and_cleans_inflight() -> None:
     assert manager.submit(_request()) is LwdProbeSubmission.FAILED
     assert not manager._inflight
     manager.close()
+
+
+def test_gateway_registration_widens_probe_targeting() -> None:
+    """Elastic scale-out: a runtime-adopted connection widens the gateway's
+    visible target set and rotation, idempotently.
+
+    Rewritten for the gateway interface: there is no per-cloud coordination
+    URL to register. The gateway service owns Cloud selection, so only the
+    connection id matters for _visible_targets.
+    """
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    added = LwdConnectionId(0, 1, 0)
+    startup = manager._visible_targets(0)
+    assert startup == (
+        LwdConnectionId(0, 0, 0),
+        LwdConnectionId(0, 0, 1),
+    )
+    manager.register_connection(added, "http://unused-by-gateway")
+    assert manager._visible_targets(0) == (*startup, added)
+    assert (1, 0) in manager.rotation()
+    manager.register_connection(added, "http://unused-by-gateway")
+    assert manager._visible_targets(0) == (*startup, added)
+    manager.close()
+
+
+def test_gateway_registration_alone_enables_probing() -> None:
+    """A gateway manager with no startup targets has nothing to resolve;
+    one runtime registration makes the Cloud/DP visible.
+
+    Unlike the direct probe manager, ``enabled`` is a configuration property
+    (gateway URL + coordination), not a function of registered targets —
+    that is the semantic difference this rewrite captures.
+    """
+    config = _gateway_config()
+    config.lwd_config.connections = []
+    manager = LwdGatewayActivationManager(config, lambda: None)
+    assert manager._visible_targets(0) == ()
+    assert manager.rotation() == ()
+    target = LwdConnectionId(0, 5, 0)
+    manager.register_connection(target, "http://runtime:8100")
+    assert manager._visible_targets(0) == (target,)
+    assert manager.rotation() == ((5, 0),)
+    manager.close()
+
+
+def test_gateway_silent_verdict_cached_until_recovered() -> None:
+    """Cloud-grained liveness verdict is cached and cleared on recovery.
+
+    Rewritten for the gateway interface: the gateway service chooses the
+    Cloud/DP, so the edge does NOT drop silent clouds from
+    _visible_targets — that would turn a legal gateway response into
+    "unconfigured Cloud" and fail the request instead of falling back.
+    The admission gate owns the fully-silent steady state.
+    """
+    manager = LwdGatewayActivationManager(_gateway_config(), lambda: None)
+    visible = manager._visible_targets(0)
+    manager.set_silent_clouds(frozenset({0}))
+    assert manager.silent_clouds == frozenset({0})
+    assert manager._visible_targets(0) == visible
+    manager.set_silent_clouds(frozenset())
+    assert manager.silent_clouds == frozenset()
+    manager.set_silent_clouds(frozenset({0, 1}))
+    assert manager.silent_clouds == frozenset({0, 1})
+    manager.close()
