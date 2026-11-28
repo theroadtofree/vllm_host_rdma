@@ -173,6 +173,11 @@ _VENDORED_MODULE_OWNERSHIP: dict[str, frozenset[str]] = {
     "model.layers": frozenset({"cloud"}),
     "model.norm": frozenset({"cloud"}),
     "visual": frozenset({"edge"}),
+    "vision": frozenset({"edge"}),
+    "aligner": frozenset({"edge"}),
+    "image_start": frozenset({"edge"}),
+    "image_end": frozenset({"edge"}),
+    "image_newline": frozenset({"edge"}),
     "model.mtp": frozenset({"cloud"}),
 }
 
@@ -189,11 +194,9 @@ _EDGE_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
 # Tensor-level special case for BOTH roles: DeepSeek-V4's hyper-connection
 # head collapses the hc multi-stream residual at the top of the trunk
 # forward, right before the final norm. Its three tensors are FLAT
-# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary),
-# so no ownership-table row can express them and the load-time filter never
-# skips them. Both roles construct the parameters (there is no module to
-# prune at build time), so both slices keep them; only the cloud runs the
-# kernel.
+# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary).
+# There is no module to prune at build time and the load-time filter never
+# skips them, so both slices keep them; only the cloud runs the kernel.
 _BOTH_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:model\.)?hc_head_(?:fn|base|scale)(?:\.weight)?$"),
 )
@@ -229,6 +232,7 @@ def load_module_ownership() -> tuple[dict[str, frozenset[str]], bool]:
     Returns:
         (table, live_import) -- ``live_import`` is True when the table was
         imported from the vllm package.
+
     """
     try:
         from vllm.model_executor.models.utils import LWD_MODULE_OWNERSHIP
@@ -301,6 +305,7 @@ def classify_all(
         (keep, drop, uncovered, attribution): ``uncovered`` lists tensors
         matched by no rule at all (the caller must fail fast on them);
         ``attribution`` maps a rule label to its tensor names.
+
     """
     keep: set[str] = set()
     drop: set[str] = set()
@@ -404,6 +409,7 @@ def read_shard_header(path: str) -> tuple[dict[str, TensorInfo], dict | None, in
     Returns:
         (tensor name -> TensorInfo, ``__metadata__`` or None, absolute
         offset where the data area starts)
+
     """
     with open(path, "rb") as handle:
         raw = handle.read(8)
@@ -553,6 +559,7 @@ def classify_safetensors(
 
     Returns:
         (weight shard file names, companion safetensors file names)
+
     """
     files = list_safetensors(src)
     if index_name is not None:
@@ -575,13 +582,20 @@ def classify_safetensors(
 
 
 def collect_tensor_info(
-    src: str, keep: set[str], weight_files: set[str]
+    src: str,
+    keep: set[str],
+    weight_files: set[str],
+    weight_map: Mapping[str, str] | None,
 ) -> tuple[dict[str, TensorInfo], dict | None, int]:
     """Read headers of source shards and collect info for kept tensors.
+
+    With an index, only collect each tensor from its authoritative shard.
+    Without one, duplicate names remain an error.
 
     Returns:
         (name -> TensorInfo, first shard's ``__metadata__`` or None, payload
         bytes the output must write)
+
     """
     info: dict[str, TensorInfo] = {}
     metadata: dict | None = None
@@ -591,15 +605,18 @@ def collect_tensor_info(
         if shard_metadata is not None and metadata is None:
             metadata = shard_metadata
         for name, tensor in tensors.items():
-            if name in keep:
-                if name in info:
-                    raise SourceError(f"tensor {name!r} appears in multiple shards")
-                # TensorInfo from the parser holds offsets relative to the
-                # data area; make them absolute for the copy step.
-                info[name] = TensorInfo(
-                    tensor.dtype, tensor.shape, base + tensor.start, base + tensor.end
-                )
-                total += tensor.end - tensor.start
+            if name not in keep:
+                continue
+            if weight_map is not None and shard != weight_map[name]:
+                continue
+            if name in info:
+                raise SourceError(f"tensor {name!r} appears in multiple shards")
+            # TensorInfo from the parser holds offsets relative to the
+            # data area; make them absolute for the copy step.
+            info[name] = TensorInfo(
+                tensor.dtype, tensor.shape, base + tensor.start, base + tensor.end
+            )
+            total += tensor.end - tensor.start
     missing = sorted(keep - set(info))
     if missing:
         suffix = "..." if len(missing) > 5 else ""
@@ -618,6 +635,7 @@ def plan_shards(
 
     Returns:
         list of (temp shard name, tensor names)
+
     """
     wanted: dict[str, list[str]] = {}
     cur_name = "model-00001-of-XXXXX.safetensors"
@@ -1161,7 +1179,9 @@ def _run(argv: list[str] | None = None) -> int:
     if not keep:
         raise RuleCoverageError("no tensors matched the keep rules for this role")
 
-    info, shard_metadata, payload_bytes = collect_tensor_info(src, keep, weight_files)
+    info, shard_metadata, payload_bytes = collect_tensor_info(
+        src, keep, weight_files, weight_map if index_name is not None else None
+    )
     entries = plan_shards(info, int(args.max_shard_gb * (1 << 30)))
     print(
         f"[plan] {args.role} output: {len(entries)} shard(s), "

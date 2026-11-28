@@ -651,14 +651,61 @@ def test_uncovered_tensor_fails_fast(tmp_path: Path, capsys) -> None:
 
 
 @pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_deepseek_v41_vision_weights_belong_to_edge(role: str, tmp_path: Path) -> None:
+    vision_names = {
+        "aligner.w1.bias",
+        "aligner.w1.weight",
+        "aligner.w2.bias",
+        "aligner.w2.weight",
+        "image_end",
+        "image_newline",
+        "image_start",
+        "vision.blocks.0.attn.wo.bias",
+        "vision.blocks.0.attn.wo.weight",
+        "vision.blocks.0.attn.wqkv.bias",
+        "vision.blocks.0.attn.wqkv.weight",
+        "vision.blocks.0.mlp.w1.weight",
+        "vision.blocks.0.mlp.w2.weight",
+        "vision.blocks.0.norm1.weight",
+        "vision.blocks.0.norm2.weight",
+    }
+    shard_names = sorted(vision_names | {"lm_head.weight", "model.norm.weight"})
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_checkpoint(
+        src,
+        shards={"model-00001-of-00001.safetensors": shard_names},
+    )
+
+    table, _ = script.load_module_ownership()
+    weight_map = {name: "model-00001-of-00001.safetensors" for name in shard_names}
+    keep, drop, uncovered, _ = script.classify_all(weight_map, role, table)
+    expected_keep = (
+        vision_names | {"lm_head.weight"}
+        if role == "edge"
+        else {
+            "lm_head.weight",
+            "model.norm.weight",
+        }
+    )
+    assert uncovered == []
+    assert keep == expected_keep
+    assert drop == set(weight_map) - expected_keep
+
+    dst = tmp_path / "out"
+    assert _split(src, dst, role) == 0
+    tensors, _ = _output_tensors(dst)
+    assert set(tensors) == expected_keep
+
+
+@pytest.mark.parametrize("role", ["edge", "cloud"])
 def test_deepseek_v4_hc_head_kept_for_both_roles(
     role: str, tmp_path: Path, capsys
 ) -> None:
     """Regression: DeepSeek-V4-Flash ships ``hc_head_{fn,base,scale}`` as FLAT
-    parameters (no dot boundary), so no ownership row can match them and the
-    coverage check failed with exit code 3. They must classify without CLI
-    flags: both roles keep them (the load-time filter skips them for neither
-    and both roles construct the parameters; only the cloud runs the kernel).
+    parameters with no module-construction guard. They must classify without
+    CLI flags: both roles keep them (the load-time filter skips them for
+    neither; only the cloud runs the kernel).
     """
     src = tmp_path / "src"
     src.mkdir()
@@ -815,6 +862,56 @@ def test_no_index_fallback_skips_companion_tensors(tmp_path: Path) -> None:
     assert (dst / "rot.safetensors").is_file()
     # single shard + companion -> the rebuilt index is mandatory here too
     assert (dst / "model.safetensors.index.json").is_file()
+
+
+def test_indexed_duplicate_tensor_uses_authoritative_shard(tmp_path: Path) -> None:
+    """Redundant copies outside weight_map do not block or poison the split."""
+    src = tmp_path / "src"
+    src.mkdir()
+    name = "layers.1.engram.wkv.weight"
+    numbered = "quant_model_weights-00042-of-00081.safetensors"
+    extra = "quant_model_weights-engram-extra-1.safetensors"
+    _write_safetensors(
+        src / numbered,
+        {
+            name: ("F32", [1], b"old!"),
+            "model.norm.weight": _tensor_spec("model.norm.weight"),
+        },
+        metadata={"format": "pt"},
+    )
+    _write_safetensors(
+        src / extra,
+        {name: ("F32", [1], b"new!")},
+        metadata={"format": "pt"},
+    )
+    weight_map = {name: extra, "model.norm.weight": numbered}
+    (src / "quant_model_weights.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8"
+    )
+
+    dst = tmp_path / "out"
+    assert _split(src, dst, "cloud") == 0
+    tensors, _ = _output_tensors(dst)
+    assert set(tensors) == {name, "model.norm.weight"}
+    assert tensors[name] == b"new!"
+
+
+def test_unindexed_duplicate_tensor_fails_fast(tmp_path: Path, capsys) -> None:
+    """Without an index there is no authoritative copy to select."""
+    src = tmp_path / "src"
+    src.mkdir()
+    name = "layers.1.engram.wkv.weight"
+    _write_checkpoint(
+        src,
+        shards={
+            "model-00001-of-00002.safetensors": [name],
+            "model-00002-of-00002.safetensors": [name],
+        },
+        index_name=None,
+    )
+
+    assert _split(src, tmp_path / "out", "cloud") == 2
+    assert "appears in multiple shards" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

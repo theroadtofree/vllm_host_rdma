@@ -50,9 +50,10 @@ flowchart LR
 | `layers.*` | 丢弃 | 保留 | 与 `make_layers` LWD 分支镜像 |
 | `norm.*` | 丢弃 | 保留 | D2 定案: 边裁 norm (云 forward 末 norm, 下行 hidden 已 post-norm); 证据链见 F1 §3.5 |
 | `visual.*` | 保留 | 丢弃 | D3 定案: 多模态编码只在边 (F1 归属表 `visual → edge`) |
+| `vision.*` / `aligner.*` / `image_{start,end,newline}` | 保留 | 丢弃 | DeepSeek-V4/V4.1 原生多模态命名；与 `visual.*` 一样只在边编码 |
 | `mtp.*` / draft | 丢弃 | 保留 | drafter 在云 |
 | `tid2eid` | 保留 (正则特例) | layers 规则覆盖 | 边虽不建层, vllm-ascend 按路径直接读 (Hash MoE 路由表) |
-| `hc_head_{fn,base,scale}` | 保留 (正则特例) | 保留 (正则特例) | DeepSeek-V4 hyper-connection 头: 模型上的**扁平参数** (无点边界, 归属表无法表达; 加载过滤器两侧均不跳过), 两侧都构造参数, 双侧各留一份; 仅云在 trunk forward 末尾真正执行 kernel |
+| `hc_head_{fn,base,scale}` | 保留 (正则特例) | 保留 (正则特例) | DeepSeek-V4 hyper-connection 头: 模型上的**扁平参数**, 构建期无模块可裁且加载过滤器两侧均不跳过, 双侧各留一份; 仅云在 trunk forward 末尾真正执行 kernel |
 | 其余 | **报错** | **报错** | fail-fast: 规则未覆盖的张量必须显式归类后才能放行 |
 
 **镜像纪律 (方案 A 定案)**: ROLE_RULES 不再手抄——由 F1 的 `LWD_MODULE_OWNERSHIP` 表 (PR1 落 `models/utils.py`) 推导: 表内每行 (后缀, 归属集) 展开为两侧的张量名规则, 加上张量级特例 `tid2eid` (edge 保留) 与 `hc_head_{fn,base,scale}` (双角色保留) (正则, 张量名≠模块点路径, 特例显式登记). 脚本 `import vllm.model_executor.models.utils` 拿到同一对象 (允许脚本依赖 vllm 包; 无 vllm 环境的离线主机可退回 vendored 副本, 但单测断言两份等价, 禁止静默漂移).

@@ -106,9 +106,40 @@ class LwdEdgeProbeManager:
             edge_id=vllm_config.lwd_config.instance_id,
         )
 
+    def set_silent_clouds(self, cloud_ids: frozenset[int]) -> None:
+        """Verdict subscriber: mirror the cloud-grained liveness verdict
+        into the health rotation. Called from the heartbeat monitor's single
+        event exit point, on whichever thread detected the transition.
+        Cloud ids expand to ``(cloud_id, dp_idx)`` here so the tracker stays
+        keyed by cloud DP; ``candidates()`` then owns the exclusion and its
+        fail-open, and no second liveness set has to be kept in sync. The
+        monitor re-pushes the empty set on recovery."""
+        self._health.set_silent(
+            frozenset(
+                target for target in self._health.targets if target[0] in cloud_ids
+            )
+        )
+
+    def rotation(self) -> tuple[tuple[int, int], ...]:
+        """Cloud-DP ids the health rotation may target (diagnostics)."""
+        return self._health.targets
+
+    def register_connection(self, connection_id: LwdConnectionId, url: str) -> None:
+        """Teach the manager a runtime-adopted connection's coordination
+        URL and open it for probe targeting (elastic scale-out: the
+        rotation widens without restarting, so probes — and the routing
+        preference they produce — spread over all adopted clouds). First
+        registration wins; replays only confirm the health-rotation
+        membership (idempotent)."""
+        self._targets.setdefault(connection_id, url.rstrip("/"))
+        self._health.add_target((connection_id.cloud_id, connection_id.dp_idx))
+
     @property
     def enabled(self) -> bool:
         coordination = self._vllm_config.lwd_config.coordination
+        # Runtime-adopted connections count too: register_connection adds
+        # to _targets, so elastic scale-out widens probing without a
+        # restart.
         return bool(coordination and coordination.enabled and self._targets)
 
     @property
@@ -187,7 +218,11 @@ class LwdEdgeProbeManager:
     ) -> tuple[LwdConnectionId, ...]:
         visible = self._visible_targets(edge_id)
         allowed = {(target.cloud_id, target.dp_idx): target for target in visible}
-        healthy = self._health.candidates()
+        # Cooling-down DPs, this edge's visibility and the liveness verdict
+        # are all resolved inside the health tracker now (in that order),
+        # including the probe-side fail-open. No second liveness set is
+        # kept here, and next() keeps its original rotation semantics.
+        healthy = self._health.candidates(scope=frozenset(allowed), exclude_silent=True)
         targets = tuple(allowed[key] for key in healthy if key in allowed)
         if self._uses_prefix_hit(request):
             return targets
@@ -403,7 +438,20 @@ class LwdEdgeProbeManager:
             for target, result, chain, build_size, error in outcome:
                 dp_id = (target.cloud_id, target.dp_idx)
                 if error is not None or result is None:
-                    self._health.record_failure(dp_id)
+                    if self._health.record_failure(dp_id):
+                        # The rotation skips this cloud DP until its cooldown
+                        # expires (or a probe succeeds after it) — the
+                        # "all requests stayed on the other cloud"
+                        # signature when the target is a runtime-adopted
+                        # cloud whose HTTP endpoint is not answering.
+                        logger.error(
+                            "[LWD] probe target cloud=%d dp=%d entered cooldown "
+                            "after repeated failures (url=%s); it re-enters "
+                            "the rotation once a probe succeeds",
+                            target.cloud_id,
+                            target.dp_idx,
+                            self._targets.get(target),
+                        )
                     failed.append(target)
                     continue
                 self._health.record_success(dp_id)

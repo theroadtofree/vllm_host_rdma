@@ -48,6 +48,8 @@ qos:
 | `dp[].data_port` | Cloud-only, required on every cloud DP in host mode; the edge never listens |
 | `deployment.hccl_world_size`, `dp[].ranks` | Must be omitted in host mode |
 
+`submit_wait_ready_s` is not a YAML field. The bounded submit-time reconnect wait is fixed by the code constant `LWD_SUBMIT_WAIT_READY_S = 5.0` in the vllm-ascend host-channel wiring and passed only to the internal `LwdNpuUcxChannelIoConfig`.
+
 `LwdTopology.validate_layout` dispatches to `_validate_host_layout`, which fails startup when ranks or `hccl_world_size` are present, when an edge declares `data_port`, when a cloud DP lacks it, or when one address repeats a `data_port`. The DP layout follows the role on both data planes: the engine dispatch requires `data_parallel_size == 1` for the edge (one process serves every DP connection) and `data_parallel_size == len(instance.dp)` for the cloud, and the control plane re-checks it with the launched DP size. Host mode does not support tensor parallelism on the edge: only edge TP rank 0 holds the host links and there is no cross-TP aggregation path, so a TP>1 edge fails at its first UP submit with a missing-IO error. Cloud tensor parallelism is unaffected.
 
 ## Link model
@@ -75,7 +77,7 @@ flowchart LR
 
 Handshake: the edge sends a fixed header (`magic, addr_len, max_msg, session, token, n_slots, caps_len, put_thresh`) followed by its worker address; the token is `blake2b-8` over `"edge_id:cloud_id:dp_idx:channel"` truncated to 64 bits, so a connection that carries the wrong identity is rejected by the listener's token router instead of being accepted by the wrong channel.
 
-Warmup is asymmetric by design: the cloud starts first and only reports the listener bound, adopting each edge asynchronously; the edge waits for every local link with a bounded `wait_ready` (handshake timeout + 5 s). There is no cross-world barrier to join.
+Warmup is asymmetric by design: the cloud starts first and only reports the listener bound, adopting each edge asynchronously. On the edge, the first local link gets the long handshake window (the 600 s transport handshake timeout plus 5 s); remaining links then share a 60 s straggler grace, after which the edge proceeds with the ready subset. No ready link at all fails startup. There is no cross-world barrier to join.
 
 ## Transport
 
@@ -111,7 +113,7 @@ Block size is per direction and must match on both peers; it is verified at hand
 - An explicit value wins; if it is below the derived requirement, startup logs a warning and the frame that does not fit fails later at submit.
 - Unknown model type → fallback 128 MiB with a warning.
 
-Initialization also enforces a per-rank host memory budget (`_HOST_MEM_BUDGET_MB = 12 GiB`): `pools × 4 × (up + down)` must fit, otherwise startup fails with the computed numbers rather than exhausting host memory at runtime.
+Initialization also enforces a per-rank host memory budget (`_HOST_MEM_BUDGET_MB = 12 GiB`, sized for the multi-instance scenes): `pools × 4 × (up + down)` must fit, otherwise startup fails with the computed numbers rather than exhausting host memory at runtime.
 
 ## QoS
 
@@ -130,7 +132,7 @@ Host comm ships one QoS policy: `LwdTopology` fills every plane the topology omi
 ## Failure model
 
 - Startup fails fast: topology validation, missing `data_port`, a frame larger than the block, an exceeded memory budget, a handshake timeout.
-- There is no peer-restart recovery: `on_peer_restart` is not wired and seqnos are not reset, so a restarted peer means restarting the whole deployment.
+- Peer-restart recovery (embedded transport) follows [lwd_peer_restart_recovery.md](lwd_peer_restart_recovery.md): Phase 1 re-baselines the affected FIFOs on a session-fingerprint change (first frame wins), drops the cloud's early-recv ledger for that connection, and waits out a bounded reconnect window at submit (the 5 s code constant `LWD_SUBMIT_WAIT_READY_S`). Phase 2 adds control-plane liveness, linked teardown and the availability gate; Phase 3 adds frontend/primary-edge restart self-healing. In sidecar (daemon) mode the restart event does not cross the ctl protocol, so a restarted peer still means restarting the whole deployment.
 - A broken link surfaces as channel error; the request fails instead of hanging.
 
 ## Code map
@@ -154,8 +156,11 @@ Host comm ships one QoS policy: `LwdTopology` fills every plane the topology omi
 | `tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py` | One shared listener per cloud DP, reused by every edge of that DP; edges and sidecar engines build none |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_block_policy.py` | Block derivation, explicit override, fallback, invalid inputs |
 | `tests/ut/distributed/lwd_data_plane/test_lwd_ucx_frame_guard.py` | Submit-time rejection of an oversized frame |
+| `tests/ut/distributed/lwd_data_plane/test_lwd_host_channels.py` | Registry layout per scene: one shared listener per cloud DP across edges, sidecar attach, endpoint filtering and the data_port failure branch |
+| `tests/ut/distributed/lwd_data_plane/test_lwd_peer_restart_queue.py` | Lazy seqno baseline, reset vs stale holds and skip holes, reset MISS, connection stays submittable |
+| `tests/ut/worker/test_lwd_cloud_worker_restart.py` | Early-recv ledger drop scoped to the restarted connection, module-hook MISS |
 
-Anything that needs libucp, RoCE hardware or an NPU is verified on the real deployment; see the runbooks in the RFC issue.
+Anything that needs libucp, RoCE hardware or an NPU requires verification on the real deployment; historical results from another branch do not establish acceptance on this branch. See the runbooks in the RFC issue.
 
 ## Multi-edge and multi-cloud
 
@@ -170,5 +175,5 @@ See [lwd_host_multi_edge_cloud.md](lwd_host_multi_edge_cloud.md) for the design,
 
 ## Out of scope
 
-- Peer-restart recovery, seqno replay and dynamic link re-planning.
+- Sidecar/daemon peer-restart recovery: restart events do not cross the ctl protocol; this mode keeps the whole-deployment-restart semantics described above.
 - GPU-side and CPU-side assemblies of the same transport.

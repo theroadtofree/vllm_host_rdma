@@ -684,7 +684,11 @@ class LwdUcxChannel:
         ch = cls(c, name=f"srv:{listener.port}:{c.token:x}")
         ch._role = "serve"
         ch._listener = listener
-        listener.register(ch._token, ch, name=ch._name)
+        try:
+            listener.register(ch._token, ch, name=ch._name)
+        except Exception:
+            ch.close()
+            raise
         return ch
 
     # ------------------------------------------------------------------ #
@@ -870,6 +874,8 @@ class LwdUcxChannel:
         unfinished ops with ERROR (without firing on_broken -- an orderly
         shutdown is not a broken link)."""
         self._stopped = True
+        if self._listener is not None:
+            self._listener.unregister(self._token, self)
         self._ready.set()
         self._broken_event.set()  # wake the supervisor/accept threads to exit
         with contextlib.suppress(queue.Full):
@@ -1195,8 +1201,14 @@ class LwdUcxChannel:
                 "" if not restart else " (on_peer_restart fired)",
             )
             if restart and self._restart_cb is not None:
-                with contextlib.suppress(Exception):
+                try:
                     self._restart_cb()
+                except Exception as exc:  # noqa: BLE001 - a swallowed reset is a silent hang
+                    logger.error(
+                        "[ucx-chan] %s on_peer_restart callback failed: %r",
+                        self._name,
+                        exc,
+                    )
             if self._gen > 1:
                 logger.error(
                     "[ucx-chan] %s link REPLACED gen=%d peer_session=%016x"
@@ -1722,6 +1734,13 @@ class LwdUcxListener:
                     f"{self._host}:{self.port} ({name})"
                 )
             self._routes[token] = channel
+
+    def unregister(self, token: int, channel: LwdUcxChannel) -> None:
+        """Remove one channel's route without disturbing a replacement."""
+        token = int(token)
+        with self._lock:
+            if self._routes.get(token) is channel:
+                del self._routes[token]
 
     def start(self) -> None:
         if self._thread is not None:

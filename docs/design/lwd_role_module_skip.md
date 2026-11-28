@@ -67,7 +67,7 @@ flowchart TD
 # vllm/model_executor/models/utils.py
 LwdRole = Literal["edge", "cloud"]
 
-#: 模块点路径后缀 → 归属角色集。三个消费方共用（单一事实源）：
+#: 模块点路径后缀或扁平参数名 → 归属角色集。三个消费方共用（单一事实源）：
 #:   1. 构建期：make_layers 分支 + §3.4 模型守卫
 #:   2. 装载期：model_loader/lwd_weight_filter.py（§4）
 #:   3. 离线切分：scripts/lwd/split_lwd_checkpoint.py 的 ROLE_RULES（F2 §6）
@@ -79,6 +79,11 @@ LWD_MODULE_OWNERSHIP: dict[str, frozenset[LwdRole]] = {
     "model.layers": frozenset(("cloud",)),  # 构建期由 make_layers 执行；此行供装载期/F2 推导
     "model.norm": frozenset(("cloud",)),    # D2 定案（§3.5）
     "visual": frozenset(("edge",)),         # D3 定案（§5）
+    "vision": frozenset(("edge",)),         # DeepSeek-V4/V4.1 原生多模态命名
+    "aligner": frozenset(("edge",)),
+    "image_start": frozenset(("edge",)),
+    "image_end": frozenset(("edge",)),
+    "image_newline": frozenset(("edge",)),
     "model.mtp": frozenset(("cloud",)),
 }
 

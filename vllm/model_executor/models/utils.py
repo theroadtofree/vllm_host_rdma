@@ -885,8 +885,8 @@ def spec_decode_needs_target_embed(
 
 LwdRole = Literal["edge", "cloud"]
 
-#: Module dot-path suffix -> owning roles. Single source of truth shared by
-#: three consumers (docs/design/lwd_role_module_skip.md):
+#: Module dot-path suffix or flat parameter name -> owning roles. Single source
+#: of truth shared by three consumers (docs/design/lwd_role_module_skip.md):
 #:   1. Build time: make_layers LWD branch + model construction guards
 #:   2. Load time: model_loader/lwd_weight_filter.py skip keys
 #:   3. Offline split: scripts/lwd/split_lwd_checkpoint.py ROLE_RULES
@@ -902,6 +902,12 @@ LWD_MODULE_OWNERSHIP: dict[str, frozenset[LwdRole]] = {
     # edge feeds them straight into compute_logits (no norm there).
     "model.norm": frozenset(("cloud",)),
     "visual": frozenset(("edge",)),
+    # DeepSeek V4/V4.1 uses native top-level multimodal names.
+    "vision": frozenset(("edge",)),
+    "aligner": frozenset(("edge",)),
+    "image_start": frozenset(("edge",)),
+    "image_end": frozenset(("edge",)),
+    "image_newline": frozenset(("edge",)),
     "model.mtp": frozenset(("cloud",)),
 }
 

@@ -6,9 +6,12 @@
 The primary edge owns the engines and frontend client index zero. Every other
 edge starts one ordinary API-server child, binds its native ROUTER/PULL engine
 endpoints, and supplies those endpoints to the primary. The primary holds the
-``launch_core_engines`` startup barrier until all indices are present, so the
-existing engine handshake and ``request.client_index`` output grouping need no
-LWD-specific engine changes.
+``launch_core_engines`` startup barrier for a bounded grace window, then
+proceeds with whichever frontends registered (elastic partial start: the
+engine's frontend list is pre-seeded with the deterministic attach addresses,
+so a frontend that starts later binds the same address and joins through the
+transparent reconnection), so the existing engine handshake and
+``request.client_index`` output grouping need no LWD-specific engine changes.
 
 Wire messages are msgpack dictionaries over ZMQ ROUTER/DEALER:
 
@@ -23,10 +26,11 @@ import json
 import os
 import signal
 import socket
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 import msgspec
 import zmq
@@ -34,7 +38,12 @@ import zmq
 import vllm.envs as envs
 from vllm.config.lwd import LwdAPIConfig, resolve_lwd_config
 from vllm.config.lwd.api import parse_endpoint
+from vllm.config.lwd.topology import (
+    LWD_API_BIND_BASE_PORT_DEFAULT,
+    LWD_API_MAX_FRONTENDS,
+)
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.utils.network_utils import (
     get_ip,
     get_tcp_uri,
@@ -50,6 +59,22 @@ _MSG_ENDPOINTS = "LWD_FRONTEND_ENDPOINTS"
 _MSG_BARRIER = "LWD_FRONTEND_BARRIER"
 _MSG_ERROR = "LWD_FRONTEND_ERROR"
 _POLL_INTERVAL_S = 1.0
+# Re-register watchdog cadence: while the primary lives each round is a
+# silent no-op; after a primary restart the next round releases its startup
+# barrier (old-branch invariant: barrier for startup, resident rounds for
+# runtime).
+_REREGISTER_INTERVAL_S = 10.0
+_REREGISTER_TIMEOUT_S = 5.0
+# Startup grace window for attach frontends (elastic partial start). The
+# engine processes are already loading while the barrier waits, and a
+# model load takes minutes, so this window normally costs no wall-clock
+# time; after it the primary proceeds with the registered subset and a
+# late-starting frontend joins via its deterministic engine IO address.
+_ATTACH_GRACE_S = 60.0
+# Captured by run_attach_api_server for the re-register watchdog: the args
+# namespace and listen address are stable for the process lifetime.
+_WATCHDOG_ARGS: Any = None
+_WATCHDOG_LISTEN: tuple[str, int] = ("0.0.0.0", 0)
 
 # Engine-affecting options explicitly set by an attach command must agree with
 # the primary. Listen, HTTP transport, attachment plumbing, and unused engine
@@ -127,8 +152,19 @@ class FrontendAttachPlan:
     client_index: int
     client_count: int
     endpoint: str
+    api_bind_base_port: int
     topology_digest: str
+    """Full topology digest, observability only (the authority logs it)."""
+    frontend_digest: str
+    """The compared digest: stable across elastic additions (it covers
+    everything except the instance inventory), so a frontend launched
+    with the grown yaml still attaches to the running primary."""
     additional_config: dict[str, Any]
+    host_comm: bool
+    """Whether the primary must run the attach pipeline: the serve
+    dispatch routes an attach primary through ``run_multi_api_server``
+    for host comm even at ``client_count == 1``; device-comm deployments
+    keep the native single-server path."""
 
 
 def _additional_config_dict(args: Any) -> dict[str, Any]:
@@ -149,10 +185,17 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
     assert lwd is not None
     count = len(lwd.topology.edges)
     requested_count = getattr(args, "api_server_count", None)
-    if requested_count is not None and requested_count != count:
+    # The host-comm primary sets the reserved band capacity
+    # programmatically (lwd_dispatch_attach_frontend): that value is
+    # not a user override, and the later re-resolves (the registration
+    # authority, the attach watchdog) must accept it.
+    capacity_value = (
+        lwd.topology.is_host_comm and requested_count == LWD_API_MAX_FRONTENDS
+    )
+    if requested_count is not None and requested_count != count and not capacity_value:
         raise ValueError(
-            f"[LWD] --api-server-count ({requested_count}) must equal the "
-            f"edge_share frontend count ({count})"
+            f"[LWD] --api-server-count ({requested_count}) must equal "
+            f"the edge_share frontend count ({count})"
         )
     mode = "primary" if api.api_server_rpc_port is not None else "attach"
     endpoint = api.api_server_rpc_port or api.api_server_attach
@@ -162,8 +205,11 @@ def resolve_attach_plan(args: Any) -> FrontendAttachPlan | None:
         client_index=lwd.instance_id,
         client_count=count,
         endpoint=endpoint,
+        api_bind_base_port=lwd.topology.deployment.api_bind_base_port,
         topology_digest=lwd.topology.digest,
+        frontend_digest=lwd.topology.frontend_digest,
         additional_config=_additional_config_dict(args),
+        host_comm=lwd.topology.is_host_comm,
     )
 
 
@@ -185,7 +231,7 @@ def compute_attach_config_payload(
     plan = plan or resolve_attach_plan(args)
     assert plan is not None
     payload = jsonify_non_default_args(args, exclude=set(_ATTACH_CONFIG_EXCLUDE_KEYS))
-    payload["lwd_topology_digest"] = plan.topology_digest
+    payload["lwd_frontend_digest"] = plan.frontend_digest
     payload["lwd_additional_config"] = _canonical_additional_config(plan)
     return payload
 
@@ -256,6 +302,67 @@ def get_route_ip(target_ip: str) -> str:
     return get_ip()
 
 
+def engine_io_addresses(
+    endpoint: str, base_port: int, client_index: int
+) -> tuple[str, str]:
+    """Deterministic native engine IO endpoints of one attach frontend:
+    ``api_bind_base_port + 2*idx`` (input ROUTER) and ``+1`` (output
+    PULL) from the topology yaml's reserved band, on the route IP toward
+    the registration endpoint (the same-host edge_share model).
+
+    Single source of truth for both sides: the attach command binds
+    these, and the primary pre-seeds the engine's frontend list with
+    them for an elastic partial start, so the two derivations can never
+    drift. A frontend that starts after the engine handshakes binds the
+    same address and the engine's DEALER/PUSH reconnect transparently.
+
+    The band capacity check lives HERE — where ports are actually
+    occupied — not at config time: the bind side, the pre-seed and the
+    registration authority all derive through this function, so an
+    oversized plan fails loudly at startup instead of silently running
+    past the reserved band."""
+    if client_index >= LWD_API_MAX_FRONTENDS:
+        band = _engine_io_port_band(base_port)
+        raise ValueError(
+            f"[LWD] attach frontend {client_index} has no reserved engine "
+            f"IO port in the band {band.start}-{band.stop - 1} "
+            f"(deployment.api_bind_base_port={base_port} holds at most "
+            f"{LWD_API_MAX_FRONTENDS} frontends)"
+        )
+    bind_ip = get_route_ip(parse_endpoint(endpoint, "--api-server-attach")[0])
+    engine_io_base = base_port + 2 * client_index
+    return (
+        get_tcp_uri(bind_ip, engine_io_base),
+        get_tcp_uri(bind_ip, engine_io_base + 1),
+    )
+
+
+def _engine_io_port_band(base_port: int) -> range:
+    """The reserved engine IO band: two ports per frontend, for up to
+    LWD_API_MAX_FRONTENDS frontends — the spec reserves the whole band,
+    not just the configured slice."""
+    return range(base_port, base_port + 2 * LWD_API_MAX_FRONTENDS)
+
+
+def _assert_ports_outside_engine_io_band(
+    base_port: int, ports: dict[str, int], owner: str
+) -> None:
+    """Startup side of the bidirectional conflict check: this command's
+    own configured ports must stay out of the reserved engine IO band the
+    frontends bind into (a collision is at best an EADDRINUSE crash, at
+    worst a wrong-service connection). The authority side re-checks every
+    registration's listen port."""
+    band = _engine_io_port_band(base_port)
+    hits = {name: port for name, port in ports.items() if port in band}
+    if hits:
+        raise ValueError(
+            f"[LWD] {owner} port(s) {hits} fall inside the reserved engine "
+            f"IO band {band.start}-{band.stop - 1} "
+            f"(deployment.api_bind_base_port={base_port}); move the "
+            "conflicting port or the base"
+        )
+
+
 def _resolve_listen(args: Any) -> tuple[str, int]:
     return getattr(args, "host", None) or "0.0.0.0", args.port
 
@@ -270,7 +377,7 @@ def _listen_addresses_conflict(
     return host_a == host_b
 
 
-def _valid_zmq_address(value: object) -> bool:
+def _valid_zmq_address(value: object) -> TypeGuard[str]:
     return (
         isinstance(value, str)
         and value.startswith(("tcp://", "ipc://"))
@@ -288,33 +395,96 @@ class FrontendAttachServer:
         config_payload: dict[str, Any],
         main_listen: tuple[str, int],
         frontend_args: dict[str, Any] | None = None,
+        api_bind_base_port: int = LWD_API_BIND_BASE_PORT_DEFAULT,
+        expected_attaches: int | None = None,
     ) -> None:
         host, port = parse_endpoint(endpoint, "--api-server-rpc-port")
         self.endpoint = get_tcp_uri(host, port)
+        # Raw "host:port" form: the elastic pre-seed derives every attach
+        # frontend's deterministic engine IO addresses from it.
+        self.raw_endpoint = endpoint
+        # Reserved engine IO band base (deployment.api_bind_base_port): the
+        # pre-seed and the bidirectional registration-side conflict check
+        # derive from the same value the attach frontends bind.
+        self.api_bind_base_port = api_bind_base_port
+        # Capacity, not the yaml plan: the number of frontend slots the
+        # primary provisions (registration index bounds, pre-seeded engine
+        # IO addresses). The yaml plan governs which instances the engine
+        # routes; the barrier waits only for the planned remote frontends.
         self.client_count = client_count
+        self.expected_attaches = (
+            client_count - 1 if expected_attaches is None else expected_attaches
+        )
         self.config_payload = config_payload
         self.frontend_args_payload = frontend_args or {}
         self.stats_update_address: str | None = None
         self._listen_addresses = {0: main_listen}
         self._accepted: set[int] = set()
+        # client_index -> pid of the live attached process: distinguishes a
+        # restarted frontend (new pid -> reset stale state) from the
+        # watchdog's routine re-registration (same pid -> silent no-op).
+        self._accepted_pids: dict[int, Any] = {}
         self._reported: dict[int, tuple[str, str]] = {}
+        # The engine's resolved frontend address table. The resident service
+        # publishes every ENDPOINTS report into it, including reports that
+        # arrive after the startup barrier (a late frontend or a watchdog
+        # round after a primary restart). None until wait_for_attach_
+        # registrations binds it; the startup path also consumes _reported.
+        self._engine_addresses: Any = None
+        self._addresses_lock = threading.Lock()
         self._ctx = zmq.Context()
         self._socket = make_zmq_socket(
             self._ctx, self.endpoint, zmq.ROUTER, bind=True, linger=0
         )
         self._closed = False
 
-    @property
-    def expected_attaches(self) -> int:
-        return self.client_count - 1
+    def bind_engine_addresses(self, addresses: Any) -> None:
+        """Give the resident service the engine's resolved address table.
+
+        Must be called before the startup barrier: ENDPOINTS messages handled
+        inside ``wait_for_registrations`` then reach the engine too, and the
+        same path serves every registration that arrives afterwards.
+        """
+        self._engine_addresses = addresses
+
+    def _publish_endpoints(
+        self, index: int, input_address: str, output_address: str
+    ) -> None:
+        """Record and publish one frontend's actual ZMQ endpoints.
+
+        ``EngineZmqAddresses.inputs`` / ``outputs`` are lists whose item
+        assignment is atomic under the GIL, so the engine reading the same
+        table cannot observe a torn reference. A late or restarted frontend
+        therefore updates the engine in place instead of requiring a restart.
+        """
+        with self._addresses_lock:
+            self._reported[index] = (input_address, output_address)
+            addresses = self._engine_addresses
+            if addresses is not None:
+                addresses.inputs[index] = input_address
+                addresses.outputs[index] = output_address
 
     def wait_for_registrations(
         self, engine_manager: Any = None, timeout: float | None = None
     ) -> dict[int, tuple[str, str]]:
-        timeout = envs.VLLM_ENGINE_READY_TIMEOUT_S if timeout is None else timeout
+        """Soft startup barrier: collect endpoint reports for up to
+        ``timeout`` seconds (the grace window), then proceed with whoever
+        reported.
+
+        Elastic partial start: the primary must serve with the frontends
+        that exist — the engine's frontend list is pre-seeded with the
+        deterministic attach addresses (see
+        ``wait_for_attach_registrations``), so an index that never starts
+        costs nothing, and one that starts later binds the same address
+        and joins through the transparent reconnection. A registration
+        that lands inside the window still upgrades the seed to the
+        frontend's actual endpoints. Engine process death during the
+        window remains a startup failure."""
+        timeout = _ATTACH_GRACE_S if timeout is None else timeout
         deadline = time.monotonic() + timeout
         logger.info(
-            "[LWD][frontend-attach] waiting for %d frontend(s) at %s",
+            "[LWD][frontend-attach] waiting up to %.0fs for %d frontend(s) at %s",
+            timeout,
             self.expected_attaches,
             self.endpoint,
         )
@@ -322,10 +492,20 @@ class FrontendAttachServer:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 missing = sorted(set(range(1, self.client_count)) - set(self._reported))
-                raise RuntimeError(
-                    f"Timed out waiting for LWD attach frontends; missing "
-                    f"client indices: {missing}"
+                logger.warning(
+                    "[LWD][frontend-attach] grace window elapsed; proceeding "
+                    "with the registered frontends (elastic partial start). "
+                    "Missing client indices %s will serve once they start and "
+                    "bind their deterministic engine IO addresses: %s",
+                    missing,
+                    {
+                        index: engine_io_addresses(
+                            self.raw_endpoint, self.api_bind_base_port, index
+                        )
+                        for index in missing
+                    },
                 )
+                return dict(self._reported)
             events = self._socket.poll(min(_POLL_INTERVAL_S, remaining) * 1000)
             while events:
                 identity, payload = self._socket.recv_multipart()
@@ -342,9 +522,19 @@ class FrontendAttachServer:
         )
         return dict(self._reported)
 
-    def _handle_message(self, identity: bytes, payload: bytes) -> None:
-        def reply(message: dict[str, Any]) -> None:
-            self._socket.send_multipart([identity, msgspec.msgpack.encode(message)])
+    def _handle_message(
+        self,
+        identity: bytes,
+        payload: bytes,
+        reply: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        """Handle one decoded attach-protocol message. ``reply`` is
+        injectable so tests can drive the handler against a server built
+        with ``object.__new__`` (no real socket)."""
+        if reply is None:
+
+            def reply(message: dict[str, Any]) -> None:
+                self._socket.send_multipart([identity, msgspec.msgpack.encode(message)])
 
         try:
             message = msgspec.msgpack.decode(payload)
@@ -386,13 +576,32 @@ class FrontendAttachServer:
             )
             return
         if index in self._accepted:
-            reply(
-                {
-                    "type": _MSG_ERROR,
-                    "reason": f"client_index {index} is already attached",
-                }
+            if message.get("pid") == self._accepted_pids.get(index):
+                # Routine watchdog round from the same live process: the
+                # primary is healthy, nothing changed — silent no-op.
+                reply(
+                    {
+                        "type": _MSG_ACCEPT,
+                        "client_count": self.client_count,
+                        "stats_update_address": self.stats_update_address,
+                        "frontend_args": self.frontend_args_payload,
+                    }
+                )
+                return
+            # A restarted attach frontend re-registers with the same index:
+            # the old process is gone, so reset its stale state instead of
+            # starving the re-registration (its listen address and reported
+            # endpoints belonged to the dead process).
+            lwd_logger.info(
+                "LWD attach frontend %d restarted (pid %s -> %s); "
+                "resetting prior state",
+                index,
+                self._accepted_pids.get(index),
+                message.get("pid"),
             )
-            return
+            self._accepted.discard(index)
+            self._reported.pop(index, None)
+            self._listen_addresses.pop(index, None)
         remote_payload = message.get("config_payload")
         if not isinstance(remote_payload, dict):
             reply({"type": _MSG_ERROR, "reason": "missing config_payload"})
@@ -414,6 +623,23 @@ class FrontendAttachServer:
         ):
             reply({"type": _MSG_ERROR, "reason": "invalid API listen address"})
             return
+        if listen_port in _engine_io_port_band(self.api_bind_base_port):
+            # Bidirectional conflict check, authority side: a registered
+            # frontend's HTTP listen must stay out of the band its engine
+            # IO pair binds into.
+            band = _engine_io_port_band(self.api_bind_base_port)
+            reply(
+                {
+                    "type": _MSG_ERROR,
+                    "reason": (
+                        f"API listen port {listen_port} for client {index} "
+                        f"falls inside the reserved engine IO band "
+                        f"{band.start}-{band.stop - 1}; move --port or "
+                        "deployment.api_bind_base_port"
+                    ),
+                }
+            )
+            return
         for other_index, (other_host, other_port) in self._listen_addresses.items():
             if _listen_addresses_conflict(
                 listen_host, listen_port, other_host, other_port
@@ -427,6 +653,7 @@ class FrontendAttachServer:
                 return
         self._listen_addresses[index] = (listen_host, listen_port)
         self._accepted.add(index)
+        self._accepted_pids[index] = message.get("pid")
         logger.info(
             "[LWD][frontend-attach] accepted frontend %d (pid %s)",
             index,
@@ -447,12 +674,22 @@ class FrontendAttachServer:
         reply: Callable[[dict[str, Any]], None],
     ) -> None:
         index = message.get("client_index")
-        if index not in self._accepted:
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index not in self._accepted
+        ):
             reply({"type": _MSG_ERROR, "reason": "frontend has not attached"})
             return
         if index in self._reported:
-            reply({"type": _MSG_ERROR, "reason": "endpoints already supplied"})
-            return
+            # Re-report from a live frontend (a restarted primary's fresh
+            # barrier is repopulated by this): replace the stale entry
+            # instead of rejecting — the endpoints are stable while the
+            # frontend lives.
+            logger.debug(
+                "LWD attach frontend %d re-reported endpoints; replacing",
+                index,
+            )
         input_address = message.get("input_address")
         output_address = message.get("output_address")
         if not _valid_zmq_address(input_address) or not _valid_zmq_address(
@@ -460,8 +697,34 @@ class FrontendAttachServer:
         ):
             reply({"type": _MSG_ERROR, "reason": "invalid native ZMQ endpoints"})
             return
-        self._reported[index] = (input_address, output_address)
+        self._publish_endpoints(index, input_address, output_address)
         reply({"type": _MSG_BARRIER, "client_index": index})
+
+    def serve_background(self) -> None:
+        """Answer (re)registrations for the rest of the process lifetime.
+
+        The startup barrier only covers launch: an attach frontend
+        restarted at runtime must be able to re-register, which a closed
+        server would starve (barrier for startup, resident service for
+        runtime)."""
+        if self._closed:
+            return
+        threading.Thread(
+            target=self._serve_forever,
+            name="lwd-frontend-attach-server",
+            daemon=True,
+        ).start()
+
+    def _serve_forever(self) -> None:
+        while not self._closed:
+            try:
+                events = self._socket.poll(_POLL_INTERVAL_S * 1000)
+            except zmq.ZMQError:
+                return  # closed at shutdown
+            while events:
+                identity, payload = self._socket.recv_multipart()
+                self._handle_message(identity, payload)
+                events = self._socket.poll(0)
 
     def close(self) -> None:
         if self._closed:
@@ -482,16 +745,19 @@ class FrontendAttachServer:
 class FrontendAttachClient:
     """Non-primary frontend's half of the native endpoint barrier."""
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, recv_timeout_s: float | None = None) -> None:
         host, port = parse_endpoint(endpoint, "--api-server-attach")
         self.main_address = get_tcp_uri(host, port)
         self._ctx = zmq.Context()
         self._socket = make_zmq_socket(
             self._ctx, self.main_address, zmq.DEALER, bind=False, linger=0
         )
-        self._socket.setsockopt(
-            zmq.RCVTIMEO, int(envs.VLLM_ENGINE_READY_TIMEOUT_S * 1000)
-        )
+        timeout: float
+        if recv_timeout_s is None:
+            timeout = envs.VLLM_ENGINE_READY_TIMEOUT_S
+        else:
+            timeout = recv_timeout_s
+        self._socket.setsockopt(zmq.RCVTIMEO, int(timeout * 1000))
         self._closed = False
 
     def _roundtrip(self, message: dict[str, Any]) -> dict[str, Any]:
@@ -566,14 +832,39 @@ def create_frontend_registration_server(
 ) -> FrontendAttachServer:
     plan = resolve_attach_plan(args)
     assert plan is not None and plan.mode == "primary"
-    if client_count != plan.client_count:
-        raise ValueError("[LWD] API server count does not match edge_share topology")
+    # client_count is the reserved frontend capacity: it must cover the
+    # yaml plan and stay within the engine IO band. Frontends beyond the
+    # plan attach into the spare capacity; only the planned remote
+    # frontends gate the startup barrier.
+    if not plan.client_count <= client_count <= LWD_API_MAX_FRONTENDS:
+        raise ValueError(
+            f"[LWD] API server count ({client_count}) must cover the "
+            f"edge_share frontend plan ({plan.client_count}) and stay "
+            f"within the reserved engine IO band ({LWD_API_MAX_FRONTENDS})"
+        )
+    # Bidirectional conflict check, authority side: the primary's own
+    # configured ports must stay out of the band its frontends bind into.
+    ports = {
+        "api listen": _resolve_listen(args)[1],
+        "registration": parse_endpoint(plan.endpoint, "--api-server-rpc-port")[1],
+    }
+    for name in ("master_port", "data_parallel_rpc_port"):
+        if (value := getattr(args, name, None)) is not None:
+            ports[name] = int(value)
+    _assert_ports_outside_engine_io_band(plan.api_bind_base_port, ports, "primary")
+    lwd_logger.info(
+        "LWD registration authority: frontend digest %s (topology %s)",
+        plan.frontend_digest,
+        plan.topology_digest,
+    )
     return FrontendAttachServer(
         endpoint=plan.endpoint,
         client_count=client_count,
         config_payload=compute_attach_config_payload(args, plan),
         main_listen=_resolve_listen(args),
         frontend_args=compute_frontend_args_payload(args),
+        api_bind_base_port=plan.api_bind_base_port,
+        expected_attaches=plan.client_count - 1,
     )
 
 
@@ -581,6 +872,12 @@ def run_attach_api_server(args: Any) -> None:
     """Run one non-primary API frontend without launching local engines."""
     plan = resolve_attach_plan(args)
     assert plan is not None and plan.mode == "attach"
+    # Watchdog rounds run after this function's scope: capture the config
+    # payload and listen address now (both are stable for the process
+    # lifetime — the payload derives from CLI args, the listen from args).
+    global _WATCHDOG_ARGS, _WATCHDOG_LISTEN
+    _WATCHDOG_ARGS = args
+    _WATCHDOG_LISTEN = _resolve_listen(args)
     with FrontendAttachClient(plan.endpoint) as client:
         accepted = client.attach(
             plan.client_index,
@@ -614,10 +911,30 @@ def run_attach_api_server(args: Any) -> None:
         )
 
         listen_address, sock = setup_server(args, reuse_port=False)
-        bind_ip = get_route_ip(parse_endpoint(plan.endpoint, "--api-server-attach")[0])
-        input_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.ROUTER)
+        # Deterministic engine IO ports (old-branch invariant): the ports
+        # come from the topology yaml's reserved band (single source:
+        # ``engine_io_addresses``, shared with the primary's elastic
+        # pre-seed). A late or restarted attach frontend rebinds the SAME
+        # port, so the running engine's retrying DEALER/PUSH reconnect
+        # transparently and the READY re-send completes this frontend's
+        # client handshake — an ephemeral port would leave the engine
+        # connected to the pre-seeded address that nobody ever binds.
+        # Bind-side conflict check: this command's own configured ports
+        # must stay out of the band it is about to bind.
+        _assert_ports_outside_engine_io_band(
+            plan.api_bind_base_port,
+            {
+                "api listen": _resolve_listen(args)[1],
+                "registration": parse_endpoint(plan.endpoint, "--api-server-attach")[1],
+            },
+            f"attach frontend {plan.client_index}",
+        )
+        input_address, output_address = engine_io_addresses(
+            plan.endpoint, plan.api_bind_base_port, plan.client_index
+        )
+        input_listener = make_zmq_listener(input_address, zmq.ROUTER)
         try:
-            output_listener = make_zmq_listener(get_tcp_uri(bind_ip, 0), zmq.PULL)
+            output_listener = make_zmq_listener(output_address, zmq.PULL)
         except BaseException:
             input_listener.close()
             raise
@@ -638,9 +955,60 @@ def run_attach_api_server(args: Any) -> None:
                 input_listener.address,
                 output_listener.address,
             )
+            # The listeners bound the deterministic band ports, so the
+            # reported addresses are the actual endpoints AND the addresses
+            # the engine is already retrying toward; the watchdog re-reports
+            # the same pair, releasing a restarted primary's fresh barrier.
+            _start_reregister_watchdog(
+                plan, input_listener.address, output_listener.address
+            )
             wait_for_completion_or_failure(api_server_manager=manager)
         finally:
             manager.shutdown()
+
+
+def _start_reregister_watchdog(
+    plan: FrontendAttachPlan,
+    input_address: str,
+    output_address: str,
+) -> None:
+    """Primary-restart self-healing (old-branch invariant): re-register on
+    a fixed cadence with an independent short connection per round. While
+    the primary lives each round is a silent no-op; after a primary restart
+    the next round re-attaches and re-reports, releasing the new primary's
+    startup barrier. Runs until the process exits (daemon)."""
+
+    def loop() -> None:
+        while True:
+            time.sleep(_REREGISTER_INTERVAL_S)
+            try:
+                with FrontendAttachClient(
+                    plan.endpoint, recv_timeout_s=_REREGISTER_TIMEOUT_S
+                ) as client:
+                    client.attach(
+                        plan.client_index,
+                        compute_attach_config_payload(_resolve_watchdog_args(), plan),
+                        _resolve_watchdog_listen(),
+                    )
+                    client.report_endpoints(
+                        plan.client_index, input_address, output_address
+                    )
+            except Exception:
+                logger.debug(
+                    "LWD attach re-registration round failed (primary down?); "
+                    "retrying next tick",
+                    exc_info=True,
+                )
+
+    threading.Thread(target=loop, name="lwd-attach-reregister", daemon=True).start()
+
+
+def _resolve_watchdog_args() -> Any:
+    return _WATCHDOG_ARGS
+
+
+def _resolve_watchdog_listen() -> tuple[str, int]:
+    return _WATCHDOG_LISTEN
 
 
 def lwd_dispatch_attach_frontend(args: Any) -> bool:
@@ -651,7 +1019,19 @@ def lwd_dispatch_attach_frontend(args: Any) -> bool:
     if plan.mode == "attach":
         run_attach_api_server(args)
         return True
-    args.api_server_count = plan.client_count
+    # Frontend capacity is the reserved engine IO band, not the yaml
+    # plan: a host-comm primary provisions all frontend slots up front,
+    # so a frontend beyond the current yaml plan can attach without a
+    # primary restart (its requests stay gate-rejected until the plan
+    # that launched the engine includes its instance). The capacity
+    # count also routes the primary through run_multi_api_server, home
+    # of the registration server the single in-process path never
+    # builds; device-comm primaries keep the plan count and may take
+    # the native single-server path.
+    args.api_server_count = (
+        LWD_API_MAX_FRONTENDS if plan.host_comm else plan.client_count
+    )
+    args.lwd_attach_primary = plan.host_comm
     return False
 
 
@@ -685,13 +1065,50 @@ def wait_for_attach_registrations(
     addresses: Any,
     engine_manager: Any,
 ) -> None:
+    """Elastic partial start: seed every capacity slot of the reserved
+    engine IO band with its deterministic address, then let the
+    grace-window barrier upgrade the planned slots that actually
+    registered to their reported endpoints.
+
+    The engine therefore starts with the FULL capacity frontend list and
+    serves with whichever frontends exist; a frontend that starts later
+    binds the same deterministic address and the engine's DEALER/PUSH
+    reconnect transparently (the READY re-send completes its client
+    handshake). The seed derives the address from THIS host's route
+    toward the registration endpoint — exact for the same-host
+    edge_share deployment (one engine host, N API frontends); a
+    cross-host attach frontend must register inside the grace window to
+    contribute its actual address."""
+    registration_server.bind_engine_addresses(addresses)
+    for client_index in range(1, registration_server.client_count):
+        seeded_input, seeded_output = engine_io_addresses(
+            registration_server.raw_endpoint,
+            registration_server.api_bind_base_port,
+            client_index,
+        )
+        addresses.inputs[client_index] = seeded_input
+        addresses.outputs[client_index] = seeded_output
     reported = registration_server.wait_for_registrations(engine_manager)
+    # Idempotent: ENDPOINTS handled inside the barrier already published
+    # through _publish_endpoints. This loop also serves deployments that call
+    # wait_for_registrations() without a bound address table.
     for client_index, (input_address, output_address) in reported.items():
         addresses.inputs[client_index] = input_address
         addresses.outputs[client_index] = output_address
+    # The barrier covered startup; runtime re-registrations (a restarted
+    # attach frontend, or a restarted primary's watchdog rounds) are served
+    # by the resident thread.
+    registration_server.serve_background()
 
 
 def attach_scope(registration_server: FrontendAttachServer | None) -> Any:
-    if registration_server is None:
-        return contextlib.nullcontext()
-    return registration_server
+    """The registration server outlives the STARTUP with-block: the scope's
+    exit runs as soon as the startup barrier collects (the serve loop runs
+    outside the with), and closing there left nothing listening on the
+    registration endpoint — an attach frontend restarted at runtime hung
+    forever on its ATTACH reply. The resident `serve_background` thread
+    owns the socket for the rest of the process lifetime (old-branch
+    invariant: barrier for startup, resident service for runtime; the
+    daemon thread and process exit release it)."""
+    del registration_server
+    return contextlib.nullcontext()

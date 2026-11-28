@@ -20,6 +20,7 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
     Qwen3VLVisionConfig,
 )
+from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Model
@@ -32,7 +33,6 @@ from vllm.model_executor.models.utils import (
     lwd_role_of,
     lwd_skips_module,
 )
-from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
 
 def _lwd_config(role: str | None) -> SimpleNamespace | None:
@@ -88,6 +88,12 @@ def _param_names(model: torch.nn.Module) -> set[str]:
         ("language_model.visual", "cloud", True),
         ("visual.merger.proj", "cloud", False),
         ("visual", "edge", False),
+        # DeepSeek V4/V4.1 multimodal modules also belong to the edge.
+        ("vision", "cloud", True),
+        ("model.vision", "cloud", True),
+        ("aligner", "cloud", True),
+        ("vision", "edge", False),
+        ("aligner", "edge", False),
         # Other towers are not covered by the rule.
         ("vision_tower", "cloud", False),
         # Both-role modules.

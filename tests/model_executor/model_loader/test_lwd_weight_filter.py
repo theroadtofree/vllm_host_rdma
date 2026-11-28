@@ -25,7 +25,16 @@ class TestParseSkipKeys:
         )
 
     def test_cloud_skips_edge_owned_modules(self):
-        assert parse_skip_keys("cloud") == frozenset({"visual"})
+        assert parse_skip_keys("cloud") == frozenset(
+            {
+                "visual",
+                "vision",
+                "aligner",
+                "image_start",
+                "image_end",
+                "image_newline",
+            }
+        )
 
 
 class TestLwdShouldSkipWeightEdge:
@@ -74,7 +83,7 @@ class TestLwdShouldSkipWeightEdge:
 
 
 class TestLwdShouldSkipWeightCloud:
-    """The cloud owns layers/norm/mtp and skips the visual tower."""
+    """The cloud owns layers/norm/mtp and skips multimodal weights."""
 
     @pytest.mark.parametrize(
         "name",
@@ -85,6 +94,12 @@ class TestLwdShouldSkipWeightCloud:
             # nested Qwen multimodal tower names
             "model.visual.blocks.0.attn.qkv.weight",
             "model.visual.merger.deepstack_merger_list.0.fc.weight",
+            # native DeepSeek V4/V4.1 multimodal names
+            "vision.blocks.0.attn.wo.weight",
+            "aligner.w1.weight",
+            "image_start",
+            "image_end",
+            "image_newline",
         ],
     )
     def test_skips(self, name):

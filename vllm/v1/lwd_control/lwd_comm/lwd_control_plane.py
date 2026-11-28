@@ -20,6 +20,8 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass, field
+from queue import Empty as QueueEmpty
+from queue import SimpleQueue
 from typing import Protocol
 
 import msgspec
@@ -60,6 +62,17 @@ logger = init_lwd_logger(__name__)
 
 # Upper bound of IO thread latency for hello retries and shutdown.
 _LWD_IO_POLL_TICK_MS = 100
+
+# Elastic partial start (cloud side): once the FIRST cloud accepted the
+# handshake, the remaining planned clouds get this grace window to show
+# up, then the edge proceeds with the accepted subset (the yaml may plan
+# more clouds than are launched). The first-accept window stays the long
+# ``handshake_timeout_s`` — a co-started cloud needs its whole model load
+# before it can accept. A missing cloud keeps receiving periodic HELLOs
+# and is adopted by the engine at runtime when it finally accepts
+# (the edge engine's params handler); zero accepts still fails fast.
+_LWD_STRAGGLER_GRACE_S = 60.0
+_LWD_STRAGGLER_POLL_S = 0.1
 _LWD_STARTUP_TIMEOUT_S = 30.0
 _LWD_SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 # The inproc pipe capacity is SNDHWM + RCVHWM, so the IO side stays minimal
@@ -244,6 +257,17 @@ class LwdControlSender:
         self._socket = None
 
 
+@dataclass(frozen=True)
+class _LwdPendingLink:
+    """One queued runtime link addition: the engine thread enqueues, the
+    IO thread opens the DEALER and registers it with its poller."""
+
+    endpoint: str
+    connection_id: LwdConnectionId
+    cloud_dp_size: int
+    done: threading.Event | None
+
+
 class LwdControlPlane(ABC):
     """Common IO thread, framing, outbound queue and shutdown.
 
@@ -382,6 +406,7 @@ class LwdControlPlane(ABC):
             if self._stop.is_set():
                 return
             self._drain_outbound(transport, outbound)
+            self._drain_pending(transport, poller)
             self._on_tick(transport, time.monotonic())
 
     def _drain_inbound(self, transport: LwdControlTransport) -> None:
@@ -558,6 +583,16 @@ class LwdControlPlane(ABC):
         # idle periods never invalidate an established peer.
         return None
 
+    def _drain_pending(
+        self, transport: LwdControlTransport, poller: zmq.Poller
+    ) -> None:
+        """Role hook, IO thread: apply queued runtime link additions at a
+        poll-gap so the poller registration and every grown structure stay
+        single-writer on this thread. The default is nothing — a plane
+        that receives no additions never allocates a queue (device-comm
+        deployments are untouched by construction)."""
+        return None
+
 
 class LwdEdgeControlPlane(LwdControlPlane):
     """Edge side: DEALERs that register with every cloud DP rank it serves.
@@ -579,7 +614,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
             connection_id: index
             for index, connection_id in enumerate(self._connection_ids)
         }
-        session_id = uuid.uuid4().hex
+        self._session_id = uuid.uuid4().hex
         # Each DEALER registers with one explicit (edge, cloud, engine) link.
         self._handshakes: dict[LwdConnectionId, LwdEdgeHandshake] = {
             connection_id: LwdEdgeHandshake(
@@ -589,7 +624,7 @@ class LwdEdgeControlPlane(LwdControlPlane):
                     instance_id=connection_id.edge_id,
                     dp_rank=connection_id.dp_idx,
                     dp_size=cloud_dp_size,
-                    session_id=session_id,
+                    session_id=self._session_id,
                     runner_kind=spec.runner_kind,
                 ),
                 spec.config.hello_retry_interval_s,
@@ -602,6 +637,97 @@ class LwdEdgeControlPlane(LwdControlPlane):
         self._settled = threading.Event()  # Every handshake settled, or a failure.
         self._handshake_error: str | None = None
         self._num_hellos_sent = 0
+        # Runtime link additions (elastic scale-out): the engine thread
+        # enqueues, the IO thread executes. Empty in every deployment that
+        # never adds links at runtime (device comm included), so the drain
+        # hook stays a no-op there.
+        self._pending_links: SimpleQueue[_LwdPendingLink] = SimpleQueue()
+
+    def add_link(
+        self,
+        endpoint: str,
+        connection_id: LwdConnectionId,
+        cloud_dp_size: int,
+        *,
+        done: threading.Event | None = None,
+    ) -> None:
+        """Queue one cloud link for the IO thread to open at the next poll
+        gap (within one IO tick). Any thread may call this; the handshake
+        (same session id) starts with the next HELLO retry. Idempotent:
+        a duplicate connection id is dropped with a log. `done`, when
+        given, is set once the command is applied (or refused), for
+        callers that need to synchronize; the engine path is
+        fire-and-forget."""
+        if not endpoint or cloud_dp_size < 1:
+            raise ValueError(
+                f"[LWD] cannot add link {connection_id}: endpoint={endpoint!r} "
+                f"cloud_dp_size={cloud_dp_size}"
+            )
+        self._pending_links.put(
+            _LwdPendingLink(endpoint, connection_id, cloud_dp_size, done)
+        )
+
+    def _drain_pending(
+        self, transport: LwdControlTransport, poller: zmq.Poller
+    ) -> None:
+        assert isinstance(transport, LwdEdgeTransport)
+        while True:
+            try:
+                pending = self._pending_links.get_nowait()
+            except QueueEmpty:
+                return
+            self._open_pending_link(transport, poller, pending)
+
+    def _open_pending_link(
+        self,
+        transport: LwdEdgeTransport,
+        poller: zmq.Poller,
+        pending: "_LwdPendingLink",
+    ) -> None:
+        if pending.connection_id in self._handshakes:
+            # Idempotent replay of an already-added link (a re-detected
+            # topology increment): drop, do not disturb the live session.
+            logger.debug(
+                "control plane %s: link for %s already exists; add ignored",
+                self._label,
+                pending.connection_id,
+            )
+            if pending.done is not None:
+                pending.done.set()
+            return
+        index = len(self._connection_ids)
+        identity = lwd_edge_identity(
+            pending.connection_id.edge_id,
+            pending.connection_id.dp_idx,
+            self._session_id,
+        )
+        link = transport.open_link(self._ctx, pending.endpoint, identity)
+        poller.register(link, zmq.POLLIN)
+        self._endpoints = (*self._endpoints, pending.endpoint)
+        self._connection_ids = (*self._connection_ids, pending.connection_id)
+        self._link_indices[pending.connection_id] = index
+        self._handshakes[pending.connection_id] = LwdEdgeHandshake(
+            LwdLinkHello(
+                link_version=LWD_LINK_PROTOCOL_VERSION,
+                message_version=LWD_MESSAGE_VERSION,
+                instance_id=pending.connection_id.edge_id,
+                dp_rank=pending.connection_id.dp_idx,
+                dp_size=pending.cloud_dp_size,
+                session_id=self._session_id,
+                runner_kind=self.spec.runner_kind,
+            ),
+            self.spec.config.hello_retry_interval_s,
+            self.spec.runner_kind,
+        )
+        logger.info(
+            "control plane %s: link %d added to %s (connection %s); handshake retrying",
+            self._label,
+            index,
+            pending.endpoint,
+            pending.connection_id,
+        )
+        if pending.done is not None:
+            pending.done.set()
 
     def _create_transport(self) -> LwdControlTransport:
         identities = tuple(
@@ -619,7 +745,16 @@ class LwdEdgeControlPlane(LwdControlPlane):
     def wait_until_ready(
         self, timeout_s: float | None = None
     ) -> dict[LwdConnectionId, LwdPeer]:
-        """Block until every cloud DP rank accepted; shuts down on failure.
+        """Block until the clouds accepted, then return the accepted subset.
+
+        Elastic partial start: the yaml may plan more clouds than are
+        launched. The FIRST accept is given the full ``timeout_s`` (a
+        co-started cloud accepts only after its model load); every
+        remaining handshake then gets a short straggler grace and the
+        edge proceeds with whoever accepted. A cloud that never shows
+        keeps getting periodic HELLOs and is adopted by the engine at
+        runtime when its scheduling limits arrive. Zero accepts is a
+        deployment error and still fails fast.
 
         Must run on the thread that called `start()`.
 
@@ -627,7 +762,8 @@ class LwdEdgeControlPlane(LwdControlPlane):
             timeout_s: Defaults to the configured `handshake_timeout_s`.
 
         Returns:
-            The cloud peers by dp_rank to send to.
+            The cloud peers by connection to send to (the accepted
+            subset).
 
         Raises:
             LwdHandshakeError: Timeout, rejection, or IO thread failure.
@@ -635,7 +771,35 @@ class LwdEdgeControlPlane(LwdControlPlane):
         """
         if timeout_s is None:
             timeout_s = self.spec.config.handshake_timeout_s
-        if not self._settled.wait(timeout_s):
+
+        def _fail_or_wait(deadline: float) -> bool:
+            """One poll slice toward ``deadline``: True while the window is
+            still open (keep waiting -- the caller's loop condition
+            re-checks settling and accepts after every slice), raising on
+            failure. False ONLY when the whole window elapsed -- a single
+            expired slice without a settle is not it (an accept routinely
+            needs several slices: DEALER connect + HELLO + the cloud's
+            reply)."""
+            if self._handshake_error is not None:
+                self.shutdown()
+                raise LwdHandshakeError(self._handshake_error)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            self._settled.wait(min(_LWD_STRAGGLER_POLL_S, remaining))
+            return True
+
+        # Phase A: the first accept (the long window covers a cloud that
+        # is still loading its model).
+        first_deadline = time.monotonic() + timeout_s
+        while not self._settled.is_set() and not self._accepted_peers():
+            if not _fail_or_wait(first_deadline):
+                break
+        clouds = self._accepted_peers()
+        if self._handshake_error is not None:
+            self.shutdown()
+            raise LwdHandshakeError(self._handshake_error)
+        if not clouds:
             missing = self._missing_handshakes()
             self.shutdown()
             raise LwdHandshakeError(
@@ -644,15 +808,35 @@ class LwdEdgeControlPlane(LwdControlPlane):
                 f"({self._num_hellos_sent} hellos delivered); missing connections "
                 f"{sorted(missing)}"
             )
+        # Phase B: straggler grace for the remaining planned clouds.
+        grace_deadline = time.monotonic() + _LWD_STRAGGLER_GRACE_S
+        while not self._settled.is_set():
+            if not _fail_or_wait(grace_deadline):
+                break
         if self._handshake_error is not None:
             self.shutdown()
             raise LwdHandshakeError(self._handshake_error)
-        clouds: dict[LwdConnectionId, LwdPeer] = {}
-        for connection_id, handshake in self._handshakes.items():
-            cloud = handshake.cloud
-            assert cloud is not None, "settled without every cloud accepted"
-            clouds[connection_id] = cloud
+        clouds = self._accepted_peers()
+        missing = self._missing_handshakes()
+        if missing:
+            logger.warning(
+                "control plane %s: proceeding with %d of %d accepted cloud "
+                "DP ranks (elastic partial start); missing connections %s "
+                "will serve once they start -- periodic HELLOs keep retrying "
+                "and the engine adopts them at runtime",
+                self._label,
+                len(clouds),
+                len(self._handshakes),
+                sorted(missing),
+            )
         return clouds
+
+    def _accepted_peers(self) -> dict[LwdConnectionId, LwdPeer]:
+        return {
+            connection_id: handshake.cloud
+            for connection_id, handshake in self._handshakes.items()
+            if handshake.cloud is not None
+        }
 
     def _missing_handshakes(self) -> set[LwdConnectionId]:
         return {
@@ -758,7 +942,14 @@ class LwdEdgeControlPlane(LwdControlPlane):
 
     def _on_tick(self, transport: LwdControlTransport, now: float) -> None:
         for connection_id, handshake in self._handshakes.items():
-            if handshake.completed or not handshake.should_send_hello(now):
+            # The periodic HELLO never stops at a completed handshake: it
+            # doubles as re-registration. A restarted cloud's ROUTER holds
+            # no session until the next HELLO arrives — a completed-forever
+            # gate left the edge registered only in its own view while the
+            # cloud never learned the edge again (no heartbeat, no business
+            # routing, a permanent admission gate). The cloud dedupes
+            # same-session retries (refresh + re-accept, registered=False).
+            if not handshake.should_send_hello(now):
                 continue
             hello = lwd_encode_link_message(handshake.hello)
             link_index = self._link_indices[connection_id]
@@ -794,6 +985,13 @@ class LwdCloudControlPlane(LwdControlPlane):
             spec.expected_edge_ids,
             spec.runner_kind,
         )
+
+    def allow_edge(self, edge_id: int) -> None:
+        """Admit one more edge id to the handshake allowlist (elastic
+        scale-out: a late edge's HELLO must not bounce off the startup
+        plan). The swap is atomic; the IO thread's check sees either the
+        old or the new set."""
+        self._handshake.allow_edge(edge_id)
 
     def _create_transport(self) -> LwdControlTransport:
         return LwdCloudTransport(self.endpoint)
